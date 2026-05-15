@@ -2,7 +2,7 @@
 
 An experimental AI-powered Pingora application gateway and load balancer generator.
 
-This project turns natural-language infrastructure instructions into a working Rust/Pingora reverse proxy with route generation, live updates, blue/green deployment experiments, security policy enforcement, runtime repair, deployment repair, and optional LangSmith tracing.
+This project turns natural-language infrastructure instructions into a working Rust/Pingora reverse proxy with route generation, local update experiments, security policy enforcement, and optional tracing.
 
 > **Status:** Developer preview. Generated infrastructure should be reviewed before any production use.
 
@@ -89,7 +89,7 @@ orchestration graph
    +--> security agent
    +--> project writer
    +--> runtime/debug agent
-   +--> deployment repair agent
+   +--> deployment diagnostics
    +--> blue/green deploy workflow
    |
    v
@@ -113,7 +113,7 @@ pingora-generator/
 │   ├── control_plane_repair_agent.py
 │   ├── debug_agent.py
 │   ├── deployment_repair_agent.py
-│   ├── reliability_agent.py
+│   ├── diagnostic helpers
 │   ├── runtime_agent.py
 │   └── security_agent.py
 ├── ai/
@@ -225,15 +225,15 @@ Example:
 failed to resolve source metadata for docker.io/library/rust:1-bookworm
 ```
 
-The deployment repair agent is intended to classify this as an infrastructure/network issue rather than a prompt/config issue.
+The diagnostics layer is intended to classify this as an infrastructure/network issue rather than a prompt/config issue.
 
 ### `debug_agent.py`
 
 Helps inspect and explain failures during generation or deployment.
 
-### `reliability_agent.py`
+### Diagnostic helpers
 
-Contains early reliability-related tracing/check logic for future policy and MTTR workflows.
+Contains early reliability-related tracing/check logic for future diagnostic workflows.
 
 ---
 
@@ -243,8 +243,8 @@ Contains early reliability-related tracing/check logic for future policy and MTT
 - Rust toolchain
 - Docker
 - Docker Compose
-- OpenAI API key
-- Optional LangSmith API key
+- API key configured through environment variables
+- Optional tracing key configured through environment variables
 
 ---
 
@@ -613,7 +613,7 @@ docker pull rust:1-bookworm
 
 Then rerun the create or update command.
 
-The deployment repair agent is intended to classify these failures and avoid misleading prompt/config suggestions.
+The diagnostics layer is intended to classify these failures and avoid misleading prompt/config suggestions.
 
 ---
 
@@ -798,7 +798,7 @@ Planned direction:
 - Rollback command hardening
 - Policy diff preview
 - Config validation report
-- Better deployment repair
+- Better deployment diagnostics
 - Richer LangSmith traces
 - UI control plane
 - API control plane
