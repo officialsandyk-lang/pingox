@@ -44,3 +44,19 @@ logs.jsonl
 bluegreen_failure_evidence.txt
 bluegreen_deployer_failure_evidence.txt
 bluegreen_deployer_entered.txt
+
+# Local/runtime/generated artifacts
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+target/
+generated-pingora-proxy/target/
+generated-projects/
+.runtime/
+runtime/
+tmp/
+data/
+logs.jsonl
+*.log
+200

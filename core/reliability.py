@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from agents.root_cause_agent import (
+    classify_root_cause_object,
     RootCauseClassification,
     classify_failure,
     format_reliability_report,

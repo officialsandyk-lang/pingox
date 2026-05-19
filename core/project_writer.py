@@ -171,14 +171,14 @@ def normalize_static_route(route: dict[str, Any]) -> dict[str, Any]:
         or "public"
     )
     fixed["index"] = str(route.get("index") or "index.html")
-    fixed["balancing"] = "round_robin"
-    fixed["upstreams"] = []
 
     for key in (
         "upstream",
         "backend",
+        "upstreams",
         "backends",
         "backend_upstreams",
+        "balancing",
         "load_balance",
         "algorithm",
         "lb_algorithm",
@@ -605,7 +605,7 @@ def get_route_upstream(route: dict[str, Any]) -> str:
 
 def get_route_upstreams_display(route: dict[str, Any]) -> str:
     if is_static_route(route):
-        return f"static:{route.get('root', 'public')}"
+        return f"static:{route.get('root', 'public')}/{route.get('index', 'index.html')}"
 
     addresses = route_upstream_addresses(route)
 
@@ -613,6 +613,47 @@ def get_route_upstreams_display(route: dict[str, Any]) -> str:
         return "127.0.0.1:3000"
 
     return ", ".join(addresses)
+
+
+def route_algorithm_display(route: dict[str, Any]) -> str:
+    if is_static_route(route):
+        return "static webserver"
+
+    algorithm = route.get("balancing")
+
+    if not algorithm:
+        return "single backend"
+
+    return str(algorithm)
+
+
+def route_upstreams_html(route: dict[str, Any]) -> str:
+    if is_static_route(route):
+        root = html.escape(str(route.get("root") or "public"))
+        index = html.escape(str(route.get("index") or "index.html"))
+        return f"<code>{root}/{index}</code>"
+
+    upstreams = route.get("upstreams")
+
+    if not isinstance(upstreams, list) or not upstreams:
+        upstream = html.escape(str(route.get("upstream") or route.get("backend") or ""))
+        return f"<code>{upstream}</code>"
+
+    parts: list[str] = []
+
+    for upstream in upstreams:
+        if isinstance(upstream, dict):
+            address = html.escape(str(upstream.get("address") or ""))
+            weight = int(upstream.get("weight", 1) or 1)
+
+            if weight != 1:
+                parts.append(f"<code>{address}</code> <span class='weight'>weight {weight}</span>")
+            else:
+                parts.append(f"<code>{address}</code>")
+        else:
+            parts.append(f"<code>{html.escape(str(upstream))}</code>")
+
+    return "<br>".join(parts)
 
 
 def demo_backend_settings(config: dict[str, Any]) -> dict[str, Any]:
@@ -631,6 +672,365 @@ def demo_backend_settings(config: dict[str, Any]) -> dict[str, Any]:
     settings["overwrite_existing"] = bool(settings.get("overwrite_existing", False))
 
     return settings
+
+
+def render_live_route_directory_html(
+    *,
+    config: dict[str, Any],
+    port: int,
+    project_name: str = "AI Pingora Gateway",
+) -> str:
+    safe_project = html.escape(project_name)
+    routes = config.get("routes") or []
+
+    route_cards: list[str] = []
+
+    if isinstance(routes, list):
+        for route in routes:
+            if not isinstance(route, dict):
+                continue
+
+            route_path = normalize_path(
+                route.get("path")
+                or route.get("prefix")
+                or route.get("route")
+                or "/"
+            )
+
+            href = route_path if route_path.endswith("/") else f"{route_path}/"
+            full_url = f"http://127.0.0.1:{port}{href}"
+            safe_route = html.escape(route_path)
+            safe_href = html.escape(href)
+            safe_full_url = html.escape(full_url)
+            algorithm = html.escape(route_algorithm_display(route))
+            upstreams = route_upstreams_html(route)
+
+            if is_static_route(route):
+                badge = "STATIC"
+                badge_class = "static"
+                description = "Served directly by the generated Pingora webserver."
+            else:
+                badge = "PROXY"
+                badge_class = "proxy"
+                description = "Forwarded by Pingora to backend service(s)."
+
+            route_cards.append(
+                f"""
+                <section class="route-card">
+                  <div class="route-header">
+                    <div>
+                      <span class="badge {badge_class}">{badge}</span>
+                      <h2><a href="{safe_href}"><code>{safe_route}</code></a></h2>
+                    </div>
+                    <a class="open-link" href="{safe_href}">Open route →</a>
+                  </div>
+
+                  <p class="description">{html.escape(description)}</p>
+
+                  <div class="meta-grid">
+                    <div>
+                      <span class="label">Live URL</span>
+                      <code>{safe_full_url}</code>
+                    </div>
+
+                    <div>
+                      <span class="label">Mode / Algorithm</span>
+                      <code>{algorithm}</code>
+                    </div>
+
+                    <div>
+                      <span class="label">Target</span>
+                      <div class="upstreams">{upstreams}</div>
+                    </div>
+
+                    <div>
+                      <span class="label">Test command</span>
+                      <code>curl -i {safe_full_url}</code>
+                    </div>
+                  </div>
+                </section>
+                """
+            )
+
+    route_cards_html = "\n".join(route_cards) if route_cards else """
+    <section class="route-card">
+      <h2>No routes generated yet.</h2>
+      <p>Create routes using your natural-language gateway prompt.</p>
+    </section>
+    """
+
+    security = config.get("security") or {}
+    blocked_paths = security.get("blocked_paths", [])
+    allowed_methods = security.get("allowed_methods", [])
+
+    blocked_html = ""
+    if isinstance(blocked_paths, list) and blocked_paths:
+        blocked_items = "\n".join(
+            f"<code>{html.escape(str(path))}</code>"
+            for path in blocked_paths
+        )
+
+        blocked_html = f"""
+        <section class="security-card">
+          <h2>Security blocked paths</h2>
+          <div class="blocked-list">
+            {blocked_items}
+          </div>
+        </section>
+        """
+
+    methods_html = ""
+    if isinstance(allowed_methods, list) and allowed_methods:
+        method_items = "\n".join(
+            f"<code>{html.escape(str(method))}</code>"
+            for method in allowed_methods
+        )
+
+        methods_html = f"""
+        <section class="security-card">
+          <h2>Allowed methods</h2>
+          <div class="blocked-list">
+            {method_items}
+          </div>
+        </section>
+        """
+
+    route_count = len(routes) if isinstance(routes, list) else 0
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{safe_project} - Route Directory</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f8fafc;
+      --card: #ffffff;
+      --border: #e5e7eb;
+      --text: #0f172a;
+      --muted: #64748b;
+      --code-bg: #f1f5f9;
+      --blue: #2563eb;
+      --green: #047857;
+      --purple: #7c3aed;
+      --shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
+    }}
+
+    * {{
+      box-sizing: border-box;
+    }}
+
+    body {{
+      margin: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }}
+
+    main {{
+      max-width: 1180px;
+      margin: 48px auto;
+      padding: 0 24px 48px;
+    }}
+
+    .hero {{
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      padding: 32px;
+      box-shadow: var(--shadow);
+      margin-bottom: 28px;
+    }}
+
+    .hero h1 {{
+      margin: 0 0 10px;
+      font-size: clamp(30px, 4vw, 46px);
+      letter-spacing: -0.04em;
+    }}
+
+    .hero p {{
+      margin: 8px 0;
+      color: var(--muted);
+      font-size: 18px;
+    }}
+
+    .summary {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 22px;
+    }}
+
+    .summary span {{
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      padding: 8px 12px;
+      border-radius: 999px;
+      font-weight: 700;
+      color: var(--text);
+    }}
+
+    .route-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+      gap: 20px;
+    }}
+
+    .route-card,
+    .security-card {{
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 22px;
+      padding: 24px;
+      box-shadow: var(--shadow);
+    }}
+
+    .route-header {{
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: flex-start;
+    }}
+
+    .route-card h2 {{
+      margin: 10px 0 0;
+      font-size: 26px;
+    }}
+
+    .route-card h2 a {{
+      color: var(--text);
+      text-decoration: none;
+    }}
+
+    .route-card h2 a:hover {{
+      color: var(--blue);
+    }}
+
+    .open-link {{
+      color: var(--blue);
+      text-decoration: none;
+      font-weight: 800;
+      white-space: nowrap;
+      margin-top: 4px;
+    }}
+
+    .open-link:hover {{
+      text-decoration: underline;
+    }}
+
+    .badge {{
+      display: inline-block;
+      font-size: 12px;
+      font-weight: 900;
+      letter-spacing: 0.08em;
+      padding: 5px 9px;
+      border-radius: 999px;
+      color: white;
+    }}
+
+    .badge.static {{
+      background: var(--green);
+    }}
+
+    .badge.proxy {{
+      background: var(--purple);
+    }}
+
+    .description {{
+      color: var(--muted);
+      margin: 14px 0 18px;
+    }}
+
+    .meta-grid {{
+      display: grid;
+      gap: 14px;
+    }}
+
+    .label {{
+      display: block;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-weight: 900;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }}
+
+    code {{
+      display: inline-block;
+      background: var(--code-bg);
+      padding: 3px 7px;
+      border-radius: 8px;
+      color: var(--text);
+      word-break: break-all;
+    }}
+
+    .upstreams {{
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+      align-items: flex-start;
+    }}
+
+    .weight {{
+      color: var(--muted);
+      font-weight: 700;
+      margin-left: 6px;
+    }}
+
+    .security-card {{
+      margin-top: 24px;
+    }}
+
+    .security-card h2 {{
+      margin-top: 0;
+    }}
+
+    .blocked-list {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }}
+
+    footer {{
+      color: var(--muted);
+      margin-top: 28px;
+      text-align: center;
+      font-size: 14px;
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <section class="hero">
+      <h1>✅ {safe_project} is running</h1>
+      <p>This page is served directly by the generated Pingora webserver.</p>
+      <p>Use this route directory to test every generated URL.</p>
+
+      <div class="summary">
+        <span>Live: <code>http://127.0.0.1:{port}/</code></span>
+        <span>Routes: {route_count}</span>
+        <span>Static + Proxy + Load Balancing</span>
+      </div>
+    </section>
+
+    <section class="route-grid">
+      {route_cards_html}
+    </section>
+
+    {blocked_html}
+    {methods_html}
+
+    <footer>
+      Generated by AI Pingora Gateway route directory.
+    </footer>
+  </main>
+</body>
+</html>
+"""
 
 
 def render_demo_route_index_html(
@@ -669,52 +1069,11 @@ def render_demo_home_index_html(
     port: int,
     project_name: str = "AI Pingora Gateway",
 ) -> str:
-    safe_project = html.escape(project_name)
-
-    links = []
-
-    for route in config.get("routes", []):
-        if not isinstance(route, dict):
-            continue
-
-        route_path = normalize_path(route.get("path") or route.get("prefix") or route.get("route"))
-
-        if route_path == "/":
-            continue
-
-        href = route_path if route_path.endswith("/") else f"{route_path}/"
-        safe_href = html.escape(href)
-        safe_route = html.escape(route_path)
-        upstream = html.escape(get_route_upstreams_display(route))
-
-        links.append(
-            f"""
-            <li>
-              <a href="{safe_href}"><code>{safe_route}</code></a>
-              <span>→ <code>{upstream}</code></span>
-            </li>
-            """
-        )
-
-    links_html = "\n".join(links) if links else "<li>No extra routes generated yet.</li>"
-
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>{safe_project}</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-</head>
-<body>
-  <main>
-    <h1>✅ AI Pingora Gateway is running</h1>
-    <p>Live URL: <code>http://127.0.0.1:{port}</code></p>
-    <h2>Available routes</h2>
-    <ul>{links_html}</ul>
-  </main>
-</body>
-</html>
-"""
+    return render_live_route_directory_html(
+        config=config,
+        port=port,
+        project_name=project_name,
+    )
 
 
 def write_text_if_allowed(path: Path, content: str, *, overwrite: bool) -> bool:
@@ -745,6 +1104,8 @@ def write_default_public_files(project_path: Path, config: dict[str, Any]) -> No
     if not any(isinstance(route, dict) and is_static_route(route) for route in routes):
         return
 
+    port = int(config.get("port") or 8090)
+
     for route in routes:
         if not isinstance(route, dict) or not is_static_route(route):
             continue
@@ -757,49 +1118,13 @@ def write_default_public_files(project_path: Path, config: dict[str, Any]) -> No
 
         index_path = public_dir / index
 
-        if index_path.exists():
-            continue
-
-        port = int(config.get("port") or 8090)
-
+        # Always refresh homepage so it shows the latest route directory.
         index_path.write_text(
-            f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>AI Pingora Webserver</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>
-    body {{
-      font-family: system-ui, sans-serif;
-      margin: 40px;
-      background: #f9fafb;
-      color: #111827;
-    }}
-    main {{
-      max-width: 800px;
-      background: white;
-      border: 1px solid #e5e7eb;
-      border-radius: 16px;
-      padding: 32px;
-      box-shadow: 0 10px 25px rgba(0,0,0,0.06);
-    }}
-    code {{
-      background: #f3f4f6;
-      padding: 2px 6px;
-      border-radius: 6px;
-    }}
-  </style>
-</head>
-<body>
-  <main>
-    <h1>✅ AI Pingora Webserver is running</h1>
-    <p>This page is served directly by the generated Pingora webserver.</p>
-    <p>Live URL: <code>http://127.0.0.1:{port}/</code></p>
-  </main>
-</body>
-</html>
-""",
+            render_live_route_directory_html(
+                config=config,
+                port=port,
+                project_name="AI Pingora Gateway",
+            ),
             encoding="utf-8",
         )
 

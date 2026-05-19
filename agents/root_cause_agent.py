@@ -42,6 +42,22 @@ class RootCauseReport:
     db_path: str | None = None
 
 
+
+@dataclass
+class RootCauseClassification:
+    root_cause: str
+    confidence: float
+    severity: str
+    safe_to_retry: bool
+    traffic_switched: bool
+    rollback_required: bool
+    summary: str
+    repair_hint: str
+    evidence: list[str]
+    stage: str = "unknown"
+    incident_id: str | None = None
+
+
 # ---------------------------------------------------------------------
 # Text helpers
 # ---------------------------------------------------------------------
@@ -1701,6 +1717,46 @@ def classify_root_cause(
     )
 
 
+
+def classify_root_cause_object(*args: Any, **kwargs: Any) -> RootCauseClassification:
+    report = classify_root_cause(*args, **kwargs)
+
+    if isinstance(report, RootCauseClassification):
+        return report
+
+    if not isinstance(report, dict):
+        report = {
+            "root_cause": "unknown_failure",
+            "confidence": 0.5,
+            "severity": "medium",
+            "safe_to_retry": False,
+            "traffic_switched": False,
+            "rollback_required": False,
+            "summary": str(report),
+            "repair_hint": "Inspect raw failure output.",
+            "evidence": [],
+            "stage": "unknown",
+        }
+
+    return RootCauseClassification(
+        root_cause=str(report.get("root_cause", "unknown_failure")),
+        confidence=float(report.get("confidence", 0.5)),
+        severity=str(report.get("severity", "medium")),
+        safe_to_retry=bool(report.get("safe_to_retry", False)),
+        traffic_switched=bool(report.get("traffic_switched", False)),
+        rollback_required=bool(report.get("rollback_required", False)),
+        summary=str(report.get("summary", "")),
+        repair_hint=str(report.get("repair_hint", "")),
+        evidence=list(report.get("evidence") or []),
+        stage=str(report.get("stage", "unknown")),
+        incident_id=report.get("incident_id"),
+    )
+
+
+def classify_failure_root_cause(*args: Any, **kwargs: Any) -> RootCauseClassification:
+    return classify_root_cause_object(*args, **kwargs)
+
+
 # ---------------------------------------------------------------------
 # Formatting
 # ---------------------------------------------------------------------
@@ -1790,3 +1846,76 @@ def run_root_cause_agent(*args: Any, **kwargs: Any) -> dict[str, Any]:
 
 def root_cause_agent(*args: Any, **kwargs: Any) -> dict[str, Any]:
     return classify_root_cause(*args, **kwargs)
+
+
+# ---------------------------------------------------------------------
+# Backward compatibility for core.reliability.py
+# ---------------------------------------------------------------------
+
+def _classification_from_report(report: Any) -> RootCauseClassification:
+    if isinstance(report, RootCauseClassification):
+        return report
+
+    if not isinstance(report, dict):
+        report = {
+            "root_cause": "unknown_failure",
+            "confidence": 0.5,
+            "severity": "medium",
+            "safe_to_retry": False,
+            "traffic_switched": False,
+            "rollback_required": False,
+            "summary": str(report),
+            "repair_hint": "Inspect raw failure output.",
+            "evidence": [],
+            "stage": "unknown",
+        }
+
+    return RootCauseClassification(
+        root_cause=str(report.get("root_cause", "unknown_failure")),
+        confidence=float(report.get("confidence", 0.5)),
+        severity=str(report.get("severity", "medium")),
+        safe_to_retry=bool(report.get("safe_to_retry", False)),
+        traffic_switched=bool(report.get("traffic_switched", False)),
+        rollback_required=bool(report.get("rollback_required", False)),
+        summary=str(report.get("summary", "")),
+        repair_hint=str(report.get("repair_hint", "")),
+        evidence=list(report.get("evidence") or []),
+        stage=str(report.get("stage", "unknown")),
+        incident_id=report.get("incident_id"),
+    )
+
+
+def classify_root_cause_object(*args: Any, **kwargs: Any) -> RootCauseClassification:
+    return _classification_from_report(classify_root_cause(*args, **kwargs))
+
+
+def classify_failure_root_cause(*args: Any, **kwargs: Any) -> RootCauseClassification:
+    return classify_root_cause_object(*args, **kwargs)
+
+
+def format_reliability_report(report: Any) -> str:
+    if isinstance(report, RootCauseClassification):
+        report = {
+            "root_cause": report.root_cause,
+            "confidence": report.confidence,
+            "severity": report.severity,
+            "safe_to_retry": report.safe_to_retry,
+            "traffic_switched": report.traffic_switched,
+            "rollback_required": report.rollback_required,
+            "summary": report.summary,
+            "repair_hint": report.repair_hint,
+            "evidence": report.evidence,
+            "stage": report.stage,
+            "incident_id": report.incident_id,
+        }
+
+    return format_root_cause_report(report)
+
+
+def format_classification_report(report: Any) -> str:
+    return format_reliability_report(report)
+
+
+def root_cause_report_to_text(report: Any) -> str:
+    return format_reliability_report(report)
+
