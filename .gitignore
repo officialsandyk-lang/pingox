@@ -70,3 +70,7 @@ data/**/*.sqlite3
 data/update_backups/
 data/stable_snapshots/
 data/audit/
+
+# local patch backups
+*.bak*
+*.py.bak*
