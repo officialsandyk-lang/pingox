@@ -6,34 +6,25 @@ import signal
 import socket
 import subprocess
 import sys
-import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-RUNTIME_DIR = PROJECT_ROOT / ".runtime" / "demo-backends"
 LOG_DIR = PROJECT_ROOT / "tmp" / "logs"
 
 
-def normalize_upstream_address(value: Any) -> str | None:
-    if value is None:
-        return None
+def is_port_open(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=0.4):
+            return True
+    except OSError:
+        return False
 
-    if isinstance(value, dict):
-        value = (
-            value.get("address")
-            or value.get("upstream")
-            or value.get("backend")
-            or value.get("target")
-            or value.get("url")
-        )
 
-    if value is None:
-        return None
-
-    text = str(value).strip()
+def parse_port(address: Any) -> int | None:
+    text = str(address or "").strip()
     text = text.replace("http://", "").replace("https://", "").rstrip("/")
 
     if "/" in text:
@@ -42,31 +33,20 @@ def normalize_upstream_address(value: Any) -> str | None:
     if ":" not in text:
         return None
 
-    host, port_text = text.rsplit(":", 1)
-
     try:
-        port = int(port_text)
+        port = int(text.rsplit(":", 1)[-1])
     except Exception:
         return None
 
-    if not (1 <= port <= 65535):
-        return None
+    if 1 <= port <= 65535:
+        return port
 
-    if host == "localhost":
-        host = "127.0.0.1"
-
-    return f"{host}:{port}"
+    return None
 
 
-def port_from_address(address: str) -> int | None:
-    try:
-        return int(str(address).rsplit(":", 1)[-1])
-    except Exception:
-        return None
-
-
-def collect_ports_from_config(config: dict[str, Any]) -> list[int]:
+def collect_backend_ports(config: dict[str, Any]) -> list[int]:
     ports: list[int] = []
+    seen: set[int] = set()
 
     routes = config.get("routes") or []
 
@@ -77,388 +57,247 @@ def collect_ports_from_config(config: dict[str, Any]) -> list[int]:
         if not isinstance(route, dict):
             continue
 
-        # Static routes are served by Pingora itself.
-        if str(route.get("type") or "").lower() == "static":
+        route_type = str(route.get("type") or "").lower()
+
+        if route_type in {"static", "web", "webserver", "web_server", "file_server", "files"}:
             continue
 
-        values: list[Any] = []
+        upstreams = route.get("upstreams")
 
-        for key in ("upstream", "backend", "target"):
-            if route.get(key):
-                values.append(route.get(key))
+        if isinstance(upstreams, list):
+            for item in upstreams:
+                if isinstance(item, dict):
+                    port = parse_port(
+                        item.get("address")
+                        or item.get("upstream")
+                        or item.get("backend")
+                    )
+                else:
+                    port = parse_port(item)
 
-        for key in ("upstreams", "backends", "backend_upstreams"):
-            raw = route.get(key)
-
-            if isinstance(raw, list):
-                values.extend(raw)
-            elif raw:
-                values.append(raw)
-
-        for value in values:
-            if isinstance(value, str) and "," in value:
-                items = [part.strip() for part in value.split(",") if part.strip()]
-            else:
-                items = [value]
-
-            for item in items:
-                address = normalize_upstream_address(item)
-
-                if not address:
-                    continue
-
-                port = port_from_address(address)
-
-                if port is not None and port not in ports:
+                if port and port not in seen:
+                    seen.add(port)
                     ports.append(port)
+
+        else:
+            port = parse_port(route.get("upstream") or route.get("backend"))
+
+            if port and port not in seen:
+                seen.add(port)
+                ports.append(port)
 
     return ports
 
 
-def load_config(config_path: str | Path) -> dict[str, Any]:
-    path = Path(config_path).resolve()
+class DemoBackendHandler(BaseHTTPRequestHandler):
+    server_version = "DemoBackend/1.0"
 
-    with path.open("r", encoding="utf-8") as f:
-        data = json.load(f)
+    def log_message(self, fmt: str, *args: Any) -> None:
+        return
 
-    if not isinstance(data, dict):
-        raise ValueError(f"Expected JSON object in {path}")
+    def _read_body(self) -> str:
+        length_raw = self.headers.get("Content-Length") or "0"
 
-    return data
+        try:
+            length = int(length_raw)
+        except Exception:
+            length = 0
 
+        if length <= 0:
+            return ""
 
-def tcp_open(port: int, host: str = "127.0.0.1", timeout: float = 0.3) -> bool:
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
+        return self.rfile.read(length).decode("utf-8", errors="replace")
 
+    def _send(self, method: str, include_body: bool = True) -> None:
+        port = int(self.server.server_port)
+        request_body = self._read_body()
 
-def pid_file(port: int) -> Path:
-    return RUNTIME_DIR / f"demo-backend-{port}.pid"
-
-
-def log_file(port: int) -> Path:
-    return LOG_DIR / f"demo-backend-{port}.log"
-
-
-def read_pid(port: int) -> int | None:
-    path = pid_file(port)
-
-    if not path.exists():
-        return None
-
-    try:
-        return int(path.read_text(encoding="utf-8").strip())
-    except Exception:
-        path.unlink(missing_ok=True)
-        return None
-
-
-def pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except Exception:
-        return False
-
-
-def stop_port(port: int) -> dict[str, Any]:
-    pid = read_pid(port)
-
-    if pid is None:
-        return {
-            "port": port,
-            "status": "not_managed",
-            "stopped": False,
+        response = {
+            "service": "DemoBackend/1.0",
+            "message": f"Demo Backend {port}",
+            "backend_port": port,
+            "method": method,
+            "path": self.path,
+            "headers": {
+                key: value
+                for key, value in self.headers.items()
+                if key.lower()
+                in {
+                    "content-type",
+                    "content-length",
+                    "x-gateway-crud-probe",
+                    "x-requested-with",
+                    "idempotency-key",
+                    "authorization",
+                }
+            },
+            "body": request_body,
         }
 
-    try:
-        if pid_alive(pid):
-            os.kill(pid, signal.SIGTERM)
+        payload = json.dumps(response, indent=2).encode("utf-8")
 
-            deadline = time.time() + 5
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload) if include_body else 0))
+        self.send_header("X-Demo-Backend-Port", str(port))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Idempotency-Key, X-Gateway-CRUD-Probe, X-Requested-With")
+        self.end_headers()
 
-            while time.time() < deadline:
-                if not pid_alive(pid):
-                    break
+        if include_body:
+            self.wfile.write(payload)
 
-                time.sleep(0.2)
+    def do_GET(self) -> None:
+        self._send("GET")
 
-            if pid_alive(pid):
-                os.kill(pid, signal.SIGKILL)
+    def do_POST(self) -> None:
+        self._send("POST")
 
-        pid_file(port).unlink(missing_ok=True)
+    def do_PUT(self) -> None:
+        self._send("PUT")
 
-        return {
-            "port": port,
-            "pid": pid,
-            "status": "stopped",
-            "stopped": True,
-        }
+    def do_PATCH(self) -> None:
+        self._send("PATCH")
 
-    except Exception as exc:
-        return {
-            "port": port,
-            "pid": pid,
-            "status": "stop_failed",
-            "stopped": False,
-            "error": str(exc),
-        }
+    def do_DELETE(self) -> None:
+        self._send("DELETE")
 
+    def do_OPTIONS(self) -> None:
+        self._send("OPTIONS")
 
-def start_port(port: int) -> dict[str, Any]:
-    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    def do_HEAD(self) -> None:
+        self._send("HEAD", include_body=False)
 
-    if tcp_open(port):
-        return {
-            "port": port,
-            "status": "already_running",
-            "started": False,
-            "url": f"http://127.0.0.1:{port}/",
-        }
-
-    log_path = log_file(port)
-
-    with log_path.open("a", encoding="utf-8", errors="replace") as log:
-        process = subprocess.Popen(
-            [
-                sys.executable,
-                str(Path(__file__).resolve()),
-                "serve",
-                str(port),
-            ],
-            cwd=str(PROJECT_ROOT),
-            stdin=subprocess.DEVNULL,
-            stdout=log,
-            stderr=log,
-            text=True,
-            start_new_session=True,
-        )
-
-    pid_file(port).write_text(str(process.pid), encoding="utf-8")
-
-    deadline = time.time() + 8
-
-    while time.time() < deadline:
-        if process.poll() is not None:
-            return {
-                "port": port,
-                "status": "exited",
-                "started": False,
-                "pid": process.pid,
-                "url": f"http://127.0.0.1:{port}/",
-                "log_file": str(log_path),
-            }
-
-        if tcp_open(port):
-            return {
-                "port": port,
-                "status": "started",
-                "started": True,
-                "pid": process.pid,
-                "url": f"http://127.0.0.1:{port}/",
-                "log_file": str(log_path),
-            }
-
-        time.sleep(0.2)
-
-    return {
-        "port": port,
-        "status": "timeout",
-        "started": False,
-        "pid": process.pid,
-        "url": f"http://127.0.0.1:{port}/",
-        "log_file": str(log_path),
-    }
-
-
-def make_handler(port: int):
-    class DemoBackendHandler(BaseHTTPRequestHandler):
-        server_version = "DemoBackend/1.0"
-
-        def do_HEAD(self):
-            self._send_response(include_body=False)
-
-        def do_GET(self):
-            self._send_response(include_body=True)
-
-        def do_POST(self):
-            self._send_response(include_body=True)
-
-        def do_PUT(self):
-            self._send_response(include_body=True)
-
-        def do_PATCH(self):
-            self._send_response(include_body=True)
-
-        def do_DELETE(self):
-            self._send_response(include_body=True)
-
-        def do_OPTIONS(self):
-            self.send_response(204)
-            self.send_header("Allow", "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD")
-            self.end_headers()
-
-        def _send_response(self, include_body: bool = True):
-            body = f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>Demo Backend {port}</title>
-</head>
-<body>
-  <h1>✅ Demo Backend {port}</h1>
-  <p>This response came from backend port <strong>{port}</strong>.</p>
-  <p>Request path: <code>{self.path}</code></p>
-  <p>Generated by AI Pingora Gateway.</p>
-</body>
-</html>
-""".encode("utf-8")
-
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("X-Demo-Backend-Port", str(port))
-            self.end_headers()
-
-            if include_body:
-                self.wfile.write(body)
-
-        def log_message(self, format: str, *args):
-            print(f"[demo-backend:{port}] {self.address_string()} - {format % args}")
-
-    return DemoBackendHandler
+    def do_TRACE(self) -> None:
+        self.send_response(405)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"TRACE not allowed")
 
 
 def serve(port: int) -> None:
-    server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(port))
-    print(f"Demo backend serving on http://127.0.0.1:{port}/", flush=True)
-
-    try:
-        server.serve_forever()
-    finally:
-        server.server_close()
+    server = ThreadingHTTPServer(("127.0.0.1", int(port)), DemoBackendHandler)
+    print(f"Demo Backend {port} listening on http://127.0.0.1:{port}/", flush=True)
+    server.serve_forever()
 
 
-def command_start(config_path: str | Path) -> dict[str, Any]:
-    config = load_config(config_path)
-    ports = collect_ports_from_config(config)
-
-    results = [start_port(port) for port in ports]
-
-    return {
-        "ports": ports,
-        "started": [item for item in results if item.get("started")],
-        "already_running": [
-            item for item in results if item.get("status") == "already_running"
-        ],
-        "results": results,
-    }
-
-
-def command_stop(config_path: str | Path) -> dict[str, Any]:
-    config = load_config(config_path)
-    ports = collect_ports_from_config(config)
-
-    results = [stop_port(port) for port in ports]
-
-    return {
-        "ports": ports,
-        "results": results,
-    }
-
-
-def command_restart(config_path: str | Path) -> dict[str, Any]:
-    config = load_config(config_path)
-    ports = collect_ports_from_config(config)
-
-    stopped = [stop_port(port) for port in ports]
-
-    # Give sockets a moment to release.
-    time.sleep(0.5)
-
-    started = [start_port(port) for port in ports]
-
-    return {
-        "ports": ports,
-        "stopped": stopped,
-        "started": started,
-    }
-
-
-def command_status(config_path: str | Path) -> dict[str, Any]:
-    config = load_config(config_path)
-    ports = collect_ports_from_config(config)
-
+def stop_ports(ports: list[int]) -> list[dict[str, Any]]:
     results = []
 
     for port in ports:
+        command = f"lsof -tiTCP:{port} -sTCP:LISTEN | xargs -r kill -9"
+        completed = subprocess.run(
+            ["bash", "-lc", command],
+            text=True,
+            capture_output=True,
+        )
+
         results.append(
             {
                 "port": port,
-                "listening": tcp_open(port),
-                "pid": read_pid(port),
-                "url": f"http://127.0.0.1:{port}/",
+                "stopped": completed.returncode == 0,
             }
         )
 
+    return results
+
+
+def start_ports(ports: list[int]) -> dict[str, Any]:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    started = []
+    already_running = []
+    results = []
+
+    for port in ports:
+        if is_port_open(port):
+            item = {
+                "port": port,
+                "status": "already_running",
+                "started": False,
+                "url": f"http://127.0.0.1:{port}/",
+            }
+            already_running.append(item)
+            results.append(item)
+            continue
+
+        log_file = LOG_DIR / f"demo-backend-{port}.log"
+
+        with log_file.open("a", encoding="utf-8", errors="replace") as log:
+            process = subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()), "serve", str(port)],
+                cwd=str(PROJECT_ROOT),
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=log,
+                text=True,
+                start_new_session=True,
+            )
+
+        item = {
+            "port": port,
+            "status": "started",
+            "started": True,
+            "pid": process.pid,
+            "url": f"http://127.0.0.1:{port}/",
+            "log_file": str(log_file),
+        }
+
+        started.append(item)
+        results.append(item)
+
     return {
         "ports": ports,
+        "started": started,
+        "already_running": already_running,
         "results": results,
     }
 
 
-def main(argv: list[str]) -> int:
-    if len(argv) < 2:
-        print(
-            "Usage:\n"
-            "  python scripts/demo_backends.py start <config.json>\n"
-            "  python scripts/demo_backends.py stop <config.json>\n"
-            "  python scripts/demo_backends.py restart <config.json>\n"
-            "  python scripts/demo_backends.py status <config.json>\n"
-            "  python scripts/demo_backends.py serve <port>",
-            file=sys.stderr,
-        )
+def load_config(config_path: str | Path) -> dict[str, Any]:
+    return json.loads(Path(config_path).read_text(encoding="utf-8"))
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print("Usage:")
+        print("  python scripts/demo_backends.py start generated-pingora-proxy/config.json")
+        print("  python scripts/demo_backends.py restart generated-pingora-proxy/config.json")
+        print("  python scripts/demo_backends.py stop generated-pingora-proxy/config.json")
+        print("  python scripts/demo_backends.py serve 9101")
         return 2
 
-    command = argv[1].strip().lower()
+    command = sys.argv[1]
 
     if command == "serve":
-        if len(argv) < 3:
-            print("Missing port.", file=sys.stderr)
-            return 2
-
-        serve(int(argv[2]))
+        if len(sys.argv) < 3:
+            raise SystemExit("Missing port")
+        serve(int(sys.argv[2]))
         return 0
 
-    if len(argv) < 3:
-        print("Missing config path.", file=sys.stderr)
-        return 2
+    if len(sys.argv) < 3:
+        raise SystemExit("Missing config path")
 
-    config_path = argv[2]
+    config = load_config(sys.argv[2])
+    ports = collect_backend_ports(config)
 
     if command == "start":
-        result = command_start(config_path)
-    elif command == "stop":
-        result = command_stop(config_path)
-    elif command == "restart":
-        result = command_restart(config_path)
-    elif command == "status":
-        result = command_status(config_path)
-    else:
-        print(f"Unknown command: {command}", file=sys.stderr)
-        return 2
+        print(json.dumps(start_ports(ports), indent=2))
+        return 0
 
-    print(json.dumps(result, indent=2))
-    return 0
+    if command == "stop":
+        print(json.dumps({"stopped": stop_ports(ports)}, indent=2))
+        return 0
+
+    if command == "restart":
+        stopped = stop_ports(ports)
+        started = start_ports(ports)
+        print(json.dumps({"stopped": stopped, **started}, indent=2))
+        return 0
+
+    raise SystemExit(f"Unknown command: {command}")
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv))
+    raise SystemExit(main())

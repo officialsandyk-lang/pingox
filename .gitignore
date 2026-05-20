@@ -44,3 +44,29 @@ logs.jsonl
 bluegreen_failure_evidence.txt
 bluegreen_deployer_failure_evidence.txt
 bluegreen_deployer_entered.txt
+
+# secrets
+.env
+*.pem
+*.key
+*.crt
+
+# Python/runtime
+.venv/
+__pycache__/
+*.pyc
+
+# Rust/build/runtime
+target/
+generated-pingora-proxy/target/
+generated-pingora-proxy/.runtime/
+generated-pingora-proxy/tmp/
+tmp/logs/
+
+# local state/logs/db/backups
+logs.jsonl
+data/*.sqlite3
+data/**/*.sqlite3
+data/update_backups/
+data/stable_snapshots/
+data/audit/
