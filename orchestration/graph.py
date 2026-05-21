@@ -523,6 +523,7 @@ def _rewrite_upstream_value_for_runtime(
     return _rewrite_address_for_runtime(value, runtime_mode)
 
 
+
 def apply_runtime_addressing(
     config: dict[str, Any],
     runtime_mode: str,
@@ -602,6 +603,12 @@ def preflight_node(state: GraphState) -> dict:
         use_compose = False
 
     print("")
+    # Lock environment before printing/routing.
+    runtime = requested_runtime
+    runtime_mode = requested_runtime_mode
+    strategy = requested_strategy
+    deployment_strategy = requested_strategy
+
     print(f"Runtime selected: {runtime}")
     print(f"Runtime mode: {runtime_mode}")
     print(f"Deployment strategy: {strategy}")
@@ -1080,6 +1087,77 @@ def build_graph():
 
 
 @traceable(name="main_create_gateway_flow", run_type="chain")
+
+# ---------------------------------------------------------------------
+# Runtime / strategy contract helpers
+# ---------------------------------------------------------------------
+
+
+def _normalize_graph_runtime(value):
+    text = str(value or "local").strip().lower().replace("-", "_")
+
+    aliases = {
+        "host": "local",
+        "native": "local",
+        "local_host": "local",
+        "dockerhost": "docker_host",
+        "docker_host": "docker_host",
+        "docker": "docker_host",
+        "compose": "docker_host",
+    }
+
+    return aliases.get(text, text)
+
+
+def _normalize_graph_strategy(value):
+    text = str(value or "direct").strip().lower().replace("-", "").replace("_", "")
+
+    aliases = {
+        "direct": "direct",
+        "dev": "direct",
+        "simple": "direct",
+        "bluegreen": "bluegreen",
+        "bg": "bluegreen",
+        "blue": "bluegreen",
+        "green": "bluegreen",
+    }
+
+    return aliases.get(text, text)
+
+
+def _runtime_mode_for_graph(runtime, strategy):
+    runtime = _normalize_graph_runtime(runtime)
+    strategy = _normalize_graph_strategy(strategy)
+
+    if runtime == "local" and strategy == "direct":
+        return "local"
+
+    if strategy == "bluegreen":
+        return "docker_host"
+
+    if runtime in {"docker", "docker_host"}:
+        return "docker_host"
+
+    return runtime
+
+
+def _lock_requested_runtime_strategy(config, runtime, runtime_mode, strategy):
+    if not isinstance(config, dict):
+        return config
+
+    config["runtime"] = runtime_mode
+    config["runtime_mode"] = runtime_mode
+    config["strategy"] = strategy
+    config["deployment_strategy"] = strategy
+
+    return config
+
+
+# ---------------------------------------------------------------------
+# End runtime / strategy contract helpers
+# ---------------------------------------------------------------------
+
+
 def run_graph(
     prompt: str,
     project_root,
@@ -1090,8 +1168,13 @@ def run_graph(
     runtime: str | None = "local",
     runtime_mode: str | None = None,
     strategy: str | None = "direct",
-    deployment_strategy: str | None = None,
-):
+    deployment_strategy: str | None = None, **kwargs):
+    # Runtime/strategy requested by CLI or caller. Do not allow the graph
+    # to silently fall back to local/direct when Docker/bluegreen was requested.
+    requested_runtime = _normalize_graph_runtime(runtime or kwargs.get("runtime") or kwargs.get("runtime_mode") or "local")
+    requested_strategy = _normalize_graph_strategy(strategy or deployment_strategy or kwargs.get("strategy") or kwargs.get("deployment_strategy") or "direct")
+    requested_runtime_mode = _runtime_mode_for_graph(runtime_mode or requested_runtime, requested_strategy)
+
     requested_runtime = normalize_runtime(runtime or "local")
     selected_runtime_mode = normalize_runtime(runtime_mode or requested_runtime)
     selected_strategy = normalize_strategy(deployment_strategy or strategy or "direct")

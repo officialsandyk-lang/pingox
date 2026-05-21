@@ -1,0 +1,676 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+GENERATED_PROJECT_DIR = PROJECT_ROOT / "generated-pingora-proxy"
+DOCKER_DIR = PROJECT_ROOT / "docker-bluegreen"
+STATE_PATH = PROJECT_ROOT / "data" / "docker_bluegreen_state.json"
+
+
+def utc_now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def run_command(
+    command: list[str],
+    *,
+    cwd: Path | None = None,
+    timeout: int = 300,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        cwd=str(cwd or PROJECT_ROOT),
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+    )
+
+
+def require_docker() -> None:
+    if not shutil.which("docker"):
+        raise RuntimeError(
+            "Docker runtime requested, but Docker CLI is not available in this WSL distro."
+        )
+
+    checks = [
+        ["docker", "--version"],
+        ["docker", "ps"],
+    ]
+
+    for command in checks:
+        result = run_command(command, timeout=30)
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Docker check failed: {' '.join(command)}\n"
+                f"STDOUT:\n{result.stdout}\n\n"
+                f"STDERR:\n{result.stderr}"
+            )
+
+
+def normalize_path(path: Any) -> str:
+    text = str(path or "/").strip()
+
+    if not text.startswith("/"):
+        text = "/" + text
+
+    if len(text) > 1:
+        text = text.rstrip("/")
+
+    return text or "/"
+
+
+def extract_port(prompt: str, default: int = 8090) -> int:
+    text = str(prompt or "")
+
+    matches = re.findall(r"\bport\s+(\d{2,5})\b", text, flags=re.IGNORECASE)
+
+    if matches:
+        try:
+            port = int(matches[0])
+            if 1 <= port <= 65535:
+                return port
+        except Exception:
+            pass
+
+    return default
+
+
+def normalize_address(address: Any, runtime_mode: str) -> str:
+    text = str(address or "").strip()
+    text = text.replace("localhost", "127.0.0.1")
+    text = text.replace("http://", "").replace("https://", "").rstrip("/")
+
+    if runtime_mode == "docker_host":
+        text = text.replace("127.0.0.1:", "host.docker.internal:")
+
+    return text
+
+
+def rewrite_route_addresses(route: dict[str, Any], runtime_mode: str) -> dict[str, Any]:
+    fixed = dict(route)
+
+    for key in ["upstream", "backend"]:
+        if fixed.get(key):
+            fixed[key] = normalize_address(fixed[key], runtime_mode)
+
+    upstreams = fixed.get("upstreams")
+
+    if isinstance(upstreams, list):
+        new_upstreams = []
+
+        for item in upstreams:
+            if isinstance(item, dict):
+                new_item = dict(item)
+
+                if new_item.get("address"):
+                    new_item["address"] = normalize_address(new_item["address"], runtime_mode)
+
+                if new_item.get("upstream"):
+                    new_item["upstream"] = normalize_address(new_item["upstream"], runtime_mode)
+
+                if new_item.get("backend"):
+                    new_item["backend"] = normalize_address(new_item["backend"], runtime_mode)
+
+                new_upstreams.append(new_item)
+            else:
+                new_upstreams.append(normalize_address(item, runtime_mode))
+
+        fixed["upstreams"] = new_upstreams
+
+    return fixed
+
+
+def apply_runtime_addressing(config: dict[str, Any], runtime_mode: str, strategy: str) -> dict[str, Any]:
+    fixed = json.loads(json.dumps(config))
+
+    fixed["runtime"] = runtime_mode
+    fixed["runtime_mode"] = runtime_mode
+    fixed["strategy"] = strategy
+    fixed["deployment_strategy"] = strategy
+
+    routes = fixed.get("routes") or []
+
+    if isinstance(routes, list):
+        fixed["routes"] = [
+            rewrite_route_addresses(route, runtime_mode)
+            if isinstance(route, dict)
+            and str(route.get("type") or "").lower() not in {"static", "web", "webserver", "web_server"}
+            else route
+            for route in routes
+        ]
+
+    return fixed
+
+
+def force_static_homepage(config: dict[str, Any]) -> dict[str, Any]:
+    fixed = json.loads(json.dumps(config))
+    routes = fixed.get("routes") or []
+
+    if not isinstance(routes, list):
+        routes = []
+
+    non_root = [
+        route for route in routes
+        if not (
+            isinstance(route, dict)
+            and normalize_path(route.get("path")) == "/"
+        )
+    ]
+
+    fixed["routes"] = [
+        {
+            "path": "/",
+            "type": "static",
+            "root": "public",
+            "index": "index.html",
+        }
+    ] + non_root
+
+    return fixed
+
+
+def build_config_from_prompt_contract(prompt: str, runtime_mode: str, strategy: str) -> dict[str, Any]:
+    from core.intent_contract import build_intent_contract, repair_config_from_contract, validate_config_against_contract
+
+    port = extract_port(prompt, default=8090)
+
+    base_config = {
+        "port": port,
+        "routes": [],
+        "runtime": runtime_mode,
+        "runtime_mode": runtime_mode,
+        "strategy": strategy,
+        "deployment_strategy": strategy,
+        "security": {
+            "allowed_methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+            "blocked_paths": [
+                "/.env",
+                "/.git",
+                "/.git/config",
+                "/admin.php",
+                "/phpmyadmin",
+                "/wp-admin",
+                "/wp-login.php",
+                "/private",
+                "/internal",
+                "/debug",
+            ],
+            "rate_limit_per_minute": 10000,
+            "max_connections": 1000,
+            "max_request_body_bytes": 10485760,
+            "upstream_timeout_seconds": 30,
+        },
+    }
+
+    contract = build_intent_contract(prompt)
+
+    if not contract.routes:
+        raise RuntimeError(
+            "Could not extract a safe prompt intent contract. "
+            "For Docker/future environments, explicit route intent is required."
+        )
+
+    config = repair_config_from_contract(base_config, contract)
+    validation = validate_config_against_contract(config, contract)
+
+    if not validation.get("success"):
+        raise RuntimeError(
+            "Prompt intent contract could not be satisfied: "
+            + json.dumps(validation.get("failures"), indent=2)
+        )
+
+    return config
+
+
+def apply_profiles(config: dict[str, Any], runtime_mode: str, strategy: str) -> dict[str, Any]:
+    fixed = json.loads(json.dumps(config))
+
+    try:
+        from core.security_profile import apply_local_production_security_profile
+
+        fixed = apply_local_production_security_profile(fixed, environment="local")
+    except Exception:
+        pass
+
+    try:
+        from core.production_readiness import apply_production_readiness_profile
+
+        fixed = apply_production_readiness_profile(fixed, environment="local")
+    except Exception:
+        pass
+
+    fixed = force_static_homepage(fixed)
+    try:
+        from core.production_security_contract import apply_production_security_contract
+
+        fixed = apply_production_security_contract(
+            fixed,
+            environment=runtime_mode,
+        )
+    except Exception:
+        pass
+
+    fixed = apply_runtime_addressing(fixed, runtime_mode, strategy)
+
+    return fixed
+
+
+def sync_config_mirrors(config: dict[str, Any]) -> None:
+    mirrors = [
+        GENERATED_PROJECT_DIR / "config.json",
+        PROJECT_ROOT / "active_config.json",
+        PROJECT_ROOT / "gateway_config.json",
+        PROJECT_ROOT / "generated-projects" / "default-project" / "current_config.json",
+    ]
+
+    for path in mirrors:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+
+def create_backup(reason: str) -> Path | None:
+    try:
+        from core.local_backup import create_project_backup
+
+        return create_project_backup(GENERATED_PROJECT_DIR, reason=reason)
+    except Exception:
+        return None
+
+
+def write_project_from_config(config: dict[str, Any]) -> None:
+    from core.project_writer import write_project
+
+    write_project(config, project_dir=GENERATED_PROJECT_DIR)
+    sync_config_mirrors(config)
+
+
+def write_dockerfile() -> None:
+    dockerfile = GENERATED_PROJECT_DIR / "Dockerfile"
+
+    dockerfile.write_text(
+        """FROM rust:1.85-bookworm
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        cmake \
+        pkg-config \
+        libssl-dev \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY Cargo.toml Cargo.lock* ./
+COPY src ./src
+COPY public ./public
+COPY config.json ./config.json
+
+RUN cargo build --release
+
+EXPOSE 8090
+
+CMD ["cargo", "run", "--release"]
+""",
+        encoding="utf-8",
+    )
+
+    dockerignore = GENERATED_PROJECT_DIR / ".dockerignore"
+
+    dockerignore.write_text(
+        """target
+.runtime
+tmp
+*.log
+*.sqlite3
+*.db
+.git
+.gitignore
+__pycache__
+.pytest_cache
+*.bak*
+*.pyc
+data
+logs.jsonl
+generated-projects
+""",
+        encoding="utf-8",
+    )
+
+
+def load_state() -> dict[str, Any]:
+    if not STATE_PATH.exists():
+        return {
+            "active_color": "green",
+            "updated_at": utc_now(),
+        }
+
+    try:
+        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {
+            "active_color": "green",
+            "updated_at": utc_now(),
+        }
+
+
+def save_state(active_color: str) -> None:
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(
+        json.dumps(
+            {
+                "active_color": active_color,
+                "updated_at": utc_now(),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def next_color() -> str:
+    current = str(load_state().get("active_color") or "green")
+
+    return "blue" if current == "green" else "green"
+
+
+def write_nginx_conf(active_color: str, gateway_port: int) -> None:
+    DOCKER_DIR.mkdir(parents=True, exist_ok=True)
+
+    service_name = f"gateway-{active_color}"
+
+    (DOCKER_DIR / "nginx.conf").write_text(
+        f"""events {{}}
+
+http {{
+    server {{
+        listen 80;
+
+        location / {{
+            proxy_pass http://{service_name}:{gateway_port};
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }}
+    }}
+}}
+""",
+        encoding="utf-8",
+    )
+
+
+def write_compose(active_color: str, gateway_port: int) -> Path:
+    DOCKER_DIR.mkdir(parents=True, exist_ok=True)
+
+    compose = DOCKER_DIR / "docker-compose.yml"
+
+    # Build context is relative to docker-bluegreen/
+    compose.write_text(
+        f"""services:
+  gateway-blue:
+    build:
+      context: ../generated-pingora-proxy
+    container_name: ai-pingora-gateway-blue
+    expose:
+      - "{gateway_port}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - ai_pingora_net
+
+  gateway-green:
+    build:
+      context: ../generated-pingora-proxy
+    container_name: ai-pingora-gateway-green
+    expose:
+      - "{gateway_port}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - ai_pingora_net
+
+  gateway-edge:
+    image: nginx:alpine
+    container_name: ai-pingora-gateway-edge
+    depends_on:
+      - gateway-blue
+      - gateway-green
+    ports:
+      - "{gateway_port}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - ai_pingora_net
+
+networks:
+  ai_pingora_net:
+    driver: bridge
+""",
+        encoding="utf-8",
+    )
+
+    return compose
+
+
+def kill_host_port(port: int) -> None:
+    # Stop stale local direct gateway if it owns the host port.
+    run_command(
+        ["bash", "-lc", f"lsof -tiTCP:{port} -sTCP:LISTEN | xargs -r kill -9"],
+        timeout=30,
+    )
+
+
+def docker_compose(command: list[str], *, timeout: int = 900) -> subprocess.CompletedProcess[str]:
+    return run_command(
+        ["docker", "compose", "-f", str(DOCKER_DIR / "docker-compose.yml")] + command,
+        cwd=PROJECT_ROOT,
+        timeout=timeout,
+    )
+
+
+def start_docker_bluegreen(config: dict[str, Any]) -> dict[str, Any]:
+    require_docker()
+
+    port = int(config.get("port") or 8090)
+    color = next_color()
+
+    write_dockerfile()
+    write_nginx_conf(color, port)
+    compose_file = write_compose(color, port)
+
+    # For first stable Docker test, avoid false port conflicts from local direct gateway.
+    docker_compose(["down", "--remove-orphans"], timeout=300)
+    kill_host_port(port)
+
+    print("")
+    print(f"🐳 Starting Docker blue/green deployment. Active color will be: {color}")
+    print(f"Compose file: {compose_file}")
+
+    from agents.deployment_repair_agent import run_docker_command_with_repair
+
+    build = run_docker_command_with_repair(
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(DOCKER_DIR / "docker-compose.yml"),
+            "build",
+        ],
+        project_dir=str(GENERATED_PROJECT_DIR),
+        max_attempts=3,
+        retry_delay_seconds=5,
+        timeout=1200,
+    )
+
+    if build.stdout.strip():
+        print(build.stdout[-4000:])
+
+    if build.stderr.strip():
+        print(build.stderr[-4000:])
+
+    if not build.ok:
+        raise RuntimeError(
+            "Docker compose build failed after deployment repair agent.\n"
+            f"Classification: {build.classification}\n"
+            f"Attempts: {build.attempts}\n"
+            f"Repaired: {build.repaired}\n\n"
+            f"STDOUT:\n{build.stdout}\n\n"
+            f"STDERR:\n{build.stderr}"
+        )
+
+    up = docker_compose(["up", "-d"], timeout=600)
+
+    if up.stdout.strip():
+        print(up.stdout[-4000:])
+
+    if up.returncode != 0:
+        raise RuntimeError(
+            "Docker compose up failed.\n"
+            f"STDOUT:\n{up.stdout}\n\nSTDERR:\n{up.stderr}"
+        )
+
+    save_state(color)
+
+    deadline = time.time() + 180
+    live_url = f"http://127.0.0.1:{port}/"
+
+    while time.time() < deadline:
+        result = run_command(
+            ["bash", "-lc", f"curl -s -o /dev/null -w '%{{http_code}}' {live_url}"],
+            timeout=10,
+        )
+
+        status = result.stdout.strip()
+
+        if status in {"200", "301", "302", "403", "404", "405"}:
+            print(f"✅ Docker gateway edge ready: HTTP {status}")
+
+            ps = docker_compose(["ps"], timeout=60)
+
+            return {
+                "success": True,
+                "active_color": color,
+                "live_url": live_url,
+                "status": status,
+                "compose_file": str(compose_file),
+                "docker_ps": ps.stdout,
+            }
+
+        time.sleep(2)
+
+    logs = docker_compose(["logs", "--tail=200"], timeout=60)
+
+    raise RuntimeError(
+        f"Docker gateway did not become ready at {live_url}\n\n"
+        f"LOGS:\n{logs.stdout}\n{logs.stderr}"
+    )
+
+
+def verify_deployment(config: dict[str, Any], live_url: str, level: str) -> dict[str, Any]:
+    from core.post_change_verifier import format_verification_report, verify_after_change
+
+    result = verify_after_change(
+        config=config,
+        config_path=GENERATED_PROJECT_DIR / "config.json",
+        live_url=live_url,
+        source="environment_deployer",
+        change_type="docker_bluegreen_deploy",
+        level=level,
+        store=True,
+    )
+
+    print("")
+    print(format_verification_report(result))
+
+    return result
+
+
+def deploy_docker_bluegreen(
+    *,
+    prompt: str,
+    verify_level: str = "full",
+) -> dict[str, Any]:
+    require_docker()
+
+    backup = create_backup(reason="before_docker_bluegreen_environment_deploy")
+
+    config = build_config_from_prompt_contract(
+        prompt,
+        runtime_mode="docker_host",
+        strategy="bluegreen",
+    )
+
+    config = apply_profiles(
+        config,
+        runtime_mode="docker_host",
+        strategy="bluegreen",
+    )
+
+    write_project_from_config(config)
+
+    deploy_result = start_docker_bluegreen(config)
+
+    verification = verify_deployment(
+        config,
+        live_url=deploy_result["live_url"],
+        level=verify_level,
+    )
+
+    if not verification.get("success"):
+        raise RuntimeError(
+            "Docker blue/green deployment failed verification: "
+            + str(verification.get("failure_summary"))
+        )
+
+    return {
+        "success": True,
+        "runtime": "docker_host",
+        "runtime_mode": "docker_host",
+        "strategy": "bluegreen",
+        "deployment_strategy": "bluegreen",
+        "active_color": deploy_result["active_color"],
+        "live_url": deploy_result["live_url"],
+        "config": config,
+        "backup": str(backup) if backup else None,
+        "verification": verification,
+        "docker": deploy_result,
+    }
+
+
+def deploy_for_environment(
+    *,
+    prompt: str,
+    runtime: str,
+    runtime_mode: str,
+    strategy: str,
+    verify_level: str = "full",
+) -> dict[str, Any]:
+    runtime = str(runtime or "local").strip().lower()
+    runtime_mode = str(runtime_mode or runtime).strip().lower()
+    strategy = str(strategy or "direct").strip().lower()
+
+    if strategy == "bluegreen" and runtime_mode in {"docker", "docker_host"}:
+        return deploy_docker_bluegreen(
+            prompt=prompt,
+            verify_level=verify_level,
+        )
+
+    raise RuntimeError(
+        f"Environment deployment not implemented yet for runtime={runtime}, "
+        f"runtime_mode={runtime_mode}, strategy={strategy}. "
+        "Supported now: docker_host + bluegreen."
+    )

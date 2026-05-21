@@ -1,0 +1,39 @@
+services:
+  gateway-blue:
+    build:
+      context: ../generated-pingora-proxy
+    container_name: ai-pingora-gateway-blue
+    expose:
+      - "8090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - ai_pingora_net
+
+  gateway-green:
+    build:
+      context: ../generated-pingora-proxy
+    container_name: ai-pingora-gateway-green
+    expose:
+      - "8090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - ai_pingora_net
+
+  gateway-edge:
+    image: nginx:alpine
+    container_name: ai-pingora-gateway-edge
+    depends_on:
+      - gateway-blue
+      - gateway-green
+    ports:
+      - "8090:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - ai_pingora_net
+
+networks:
+  ai_pingora_net:
+    driver: bridge

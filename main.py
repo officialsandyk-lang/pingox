@@ -21,6 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from orchestration.graph import run_graph
+from core.environment_contract import validate_requested_environment, assert_graph_did_not_fallback, assert_docker_containers_running_for_bluegreen
 from core.post_change_verifier import format_verification_report, verify_after_change
 from core.deployment_prepare import prepare_config_for_deployment
 from core.intent_contract import enforce_intent_contract, format_intent_contract_report
@@ -526,7 +527,46 @@ def main() -> int:
     print(f"Runtime addressing mode: {runtime_mode}")
     print("")
 
+    # ENVIRONMENT_CONTRACT_PRE_GRAPH
+    validate_requested_environment(
+        runtime_mode=runtime_mode,
+        strategy=strategy,
+        project_root=PROJECT_ROOT,
+    )
+
+    # ENVIRONMENT_DEPLOYER_BYPASS_GRAPH
+    # Non-local environments must be deployed by the environment deployer.
+    # This prevents Docker/bluegreen requests from silently falling back to local/direct.
+    if strategy == "bluegreen" or runtime_mode in {"docker", "docker_host"}:
+        from core.environment_deployer import deploy_for_environment
+        verify_level_for_env = locals().get("verify_level") or getattr(args, "verify", "full")
+        result = deploy_for_environment(
+            prompt=prompt,
+            runtime=runtime,
+            runtime_mode=runtime_mode,
+            strategy=strategy,
+            verify_level=verify_level_for_env,
+        )
+        print("")
+        print("✅ Environment deployment completed")
+        print(f"Runtime: {result.get('runtime_mode')}")
+        print(f"Strategy: {result.get('strategy')}")
+        print(f"Active color: {result.get('active_color')}")
+        print(f"Live URL: {result.get('live_url')}")
+        return 0
+
     result = call_run_graph(prompt, runtime_mode, strategy)
+
+    # ENVIRONMENT_CONTRACT_POST_GRAPH
+    assert_graph_did_not_fallback(
+        result=result,
+        requested_runtime_mode=runtime_mode,
+        requested_strategy=strategy,
+    )
+
+    if strategy == "bluegreen" or runtime_mode in {"docker", "docker_host"}:
+        assert_docker_containers_running_for_bluegreen()
+
 
     if result is None:
         result = {}

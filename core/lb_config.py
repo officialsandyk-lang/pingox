@@ -507,3 +507,43 @@ def replace_route_upstreams(
 
 def config_changed(before: Dict[str, Any], after: Dict[str, Any]) -> bool:
     return json.dumps(before, sort_keys=True) != json.dumps(after, sort_keys=True)
+
+
+# FINAL_NORMALIZE_ALGORITHM_OVERRIDE
+# This final override ensures update.py/config_update_agent can edit all supported
+# load-balancing algorithms without falling back to round_robin.
+def normalize_algorithm(value):
+    text = str(value or "").strip().lower()
+    text = text.replace("-", "_").replace(" ", "_")
+
+    aliases = {
+        "rr": "round_robin",
+        "roundrobin": "round_robin",
+        "round_robin": "round_robin",
+
+        "rand": "random",
+        "random": "random",
+
+        "wrr": "weighted_round_robin",
+        "weighted": "weighted_round_robin",
+        "weighted_rr": "weighted_round_robin",
+        "weightedroundrobin": "weighted_round_robin",
+        "weighted_roundrobin": "weighted_round_robin",
+        "weighted_round_robin": "weighted_round_robin",
+
+        "iphash": "ip_hash",
+        "ip_hash": "ip_hash",
+        "source_ip_hash": "ip_hash",
+        "sticky": "ip_hash",
+        "sticky_session": "ip_hash",
+
+        "lc": "least_connections",
+        "leastconn": "least_connections",
+        "least_conn": "least_connections",
+        "leastconnection": "least_connections",
+        "least_connections": "least_connections",
+    }
+
+    default = globals().get("DEFAULT_BALANCING", "round_robin")
+    return aliases.get(text, default)
+

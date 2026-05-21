@@ -40,9 +40,11 @@ HTTP_METHODS = {
 
 
 BACKEND_TOKEN = (
-    r"(?:\d{2,5}|"
-    r"(?:localhost|127\.0\.0\.1|0\.0\.0\.0|host\.docker\.internal|[A-Za-z0-9_.-]+):\d{2,5})"
+    r"(?:(?:localhost|127\.0\.0\.1|0\.0\.0\.0|host\.docker\.internal|[A-Za-z0-9_.-]+):\d{2,5}|"
+    r"\d{2,5})"
 )
+
+
 
 
 def _dedupe(items: Iterable[str]) -> List[str]:
@@ -103,8 +105,8 @@ def _backend_candidates(backend: str) -> List[str]:
 
     Examples:
     - 9104 -> 127.0.0.1:9104 and host.docker.internal:9104
-    - 127.0.0.1:9104 -> 127.0.0.1:9104
-    - host.docker.internal:9104 -> host.docker.internal:9104
+    - 127.0.0.1:9104 -> 127.0.0.1:9104 and host.docker.internal:9104
+    - host.docker.internal:9104 -> host.docker.internal:9104 and 127.0.0.1:9104
     """
 
     backend = str(backend or "").strip()
@@ -122,9 +124,24 @@ def _backend_candidates(backend: str) -> List[str]:
     add(backend)
 
     if re.fullmatch(r"\d{2,5}", backend):
+        add(f"127.0.0.1:{backend}")
         add(f"host.docker.internal:{backend}")
+        return candidates
+
+    match = re.match(r"^(?P<host>[^:]+):(?P<port>\d{2,5})$", backend)
+
+    if match:
+        host = match.group("host").lower()
+        port = match.group("port")
+
+        if host in {"127.0.0.1", "localhost", "0.0.0.0"}:
+            add(f"host.docker.internal:{port}")
+
+        if host == "host.docker.internal":
+            add(f"127.0.0.1:{port}")
 
     return candidates
+
 
 
 def _remove_backend_candidates_from_route(
@@ -277,10 +294,16 @@ def _apply_lb_updates(
         _append_summary(summary, message)
 
     algorithm_pattern = (
-        r"\bset\s+"
+        r"\b(?:set|change|edit)\s+"
         r"(?P<path>/[A-Za-z0-9_.\-/]+)"
-        r"\s+(?:algorithm|balancing|load[- ]?balancing(?:\s+algorithm)?)\s+to\s+"
-        r"(?P<algorithm>round\s*robin|round_robin|weighted\s*round\s*robin|weighted_round_robin)"
+        r"\s+(?:algorithm|balancing|load[- ]?balancing(?:\s+algorithm)?)\s+(?:to\s+)?"
+        r"(?P<algorithm>"
+        r"random|rand|"
+        r"round\s*robin|round_robin|roundrobin|"
+        r"weighted\s*round\s*robin|weighted_round_robin|weightedroundrobin|"
+        r"ip\s*hash|ip_hash|iphash|sticky|"
+        r"least\s*connections|least_connections|leastconn|least_conn"
+        r")"
     )
 
     for match in re.finditer(algorithm_pattern, prompt, flags=re.IGNORECASE):
@@ -374,7 +397,7 @@ def _apply_route_updates(
         _append_summary(summary, message)
 
     remove_route_pattern = (
-        r"\bremove\s+"
+        r"\b(?:remove|delete)\s+"
         r"(?!backend\b|upstream\b)"
         r"(?P<path>/?[A-Za-z0-9_.\-/]+)"
     )

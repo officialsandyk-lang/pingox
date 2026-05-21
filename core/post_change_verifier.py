@@ -16,6 +16,31 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "reliability_reports.sqlite3"
 
 
+
+def crud_probe_headers(method: str, marker: str) -> dict[str, str]:
+    method = str(method or "GET").upper()
+
+    headers = {
+        "User-Agent": "ai-pingora-post-change-verifier/1.0",
+        "X-Gateway-CRUD-Probe": marker,
+        "X-Requested-With": "AI-Pingora-Gateway-Verifier",
+    }
+
+    if method in {"POST", "PUT", "PATCH", "DELETE"}:
+        headers["Content-Type"] = "application/json"
+        headers["Idempotency-Key"] = marker
+
+    return headers
+
+
+def crud_probe_body(method: str, marker: str) -> bytes | None:
+    method = str(method or "GET").upper()
+
+    if method in {"POST", "PUT", "PATCH", "DELETE"}:
+        return ('{"probe":"' + marker + '"}').encode("utf-8")
+
+    return None
+
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -356,7 +381,7 @@ def _check_concurrent_routes(
 
 
 CRUD_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]
-CRUD_BODY_METHODS = {"POST", "PUT", "PATCH"}
+CRUD_BODY_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 GATEWAY_REJECTION_STATUSES = {403, 405, 413, 414, 429, 500, 501, 502, 503, 504}
 
 
@@ -441,10 +466,7 @@ def _check_crud_methods_for_route(
         marker = f"crud-probe-{route_path.strip('/').replace('/', '-')}-{method.lower()}"
 
         body: bytes | None = None
-        headers = {
-            "X-Gateway-CRUD-Probe": marker,
-            "X-Requested-With": "AI-Pingora-Gateway-Verifier",
-        }
+        headers = crud_probe_headers(method, marker)
 
         if method in CRUD_BODY_METHODS:
             payload = json.dumps(

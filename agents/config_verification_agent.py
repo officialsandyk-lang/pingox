@@ -369,3 +369,99 @@ def config_verification_langchain_tool(
 # ---------------------------------------------------------------------
 # End LangChain / LangGraph entrypoints
 # ---------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------
+# FINAL override with algorithm integrity support
+# ---------------------------------------------------------------------
+
+@traceable(name="config_verification_agent_with_algorithm_integrity", run_type="chain")
+def run_config_verification_agent(
+    *,
+    config: dict,
+    live_url: str = "http://127.0.0.1:8090/",
+    runtime: str | None = None,
+    strategy: str | None = None,
+    level: str = "full",
+    environment: str | None = None,
+    require_algorithm_integrity: bool = False,
+) -> dict:
+    from core.production_security_contract import (
+        apply_production_security_contract,
+        validate_production_security_contract,
+    )
+    from core.algorithm_integrity import validate_algorithm_integrity
+
+    runtime = runtime or config.get("runtime_mode") or config.get("runtime") or "local"
+    strategy = strategy or config.get("strategy") or config.get("deployment_strategy") or "direct"
+    environment = environment or runtime
+
+    fixed_config = apply_production_security_contract(
+        config,
+        environment=environment,
+    )
+
+    contract = build_verification_contract(
+        fixed_config,
+        live_url=live_url,
+        runtime=runtime,
+        strategy=strategy,
+        level=level,
+    )
+
+    config_contract = validate_config_contract(
+        fixed_config,
+        contract,
+    )
+
+    production_security = validate_production_security_contract(
+        fixed_config,
+        environment=environment,
+    )
+
+    algorithm_integrity = validate_algorithm_integrity(
+        fixed_config,
+        require_baseline=require_algorithm_integrity,
+        allow_extra_routes=False,
+    )
+
+    failures = []
+
+    if not config_contract.get("success"):
+        failures.extend(config_contract.get("failures") or [])
+
+    if not production_security.get("success"):
+        failures.extend(
+            item.get("name", "production_security_failure")
+            for item in production_security.get("failures") or []
+        )
+
+    if require_algorithm_integrity and not algorithm_integrity.get("success"):
+        failures.extend(algorithm_integrity.get("failures") or [])
+
+    success = bool(
+        config_contract.get("success")
+        and production_security.get("success")
+        and (algorithm_integrity.get("success") or not require_algorithm_integrity)
+    )
+
+    return {
+        "success": success,
+        "agent": "config_verification_agent",
+        "runtime": runtime,
+        "strategy": strategy,
+        "environment": environment,
+        "level": level,
+        "live_url": live_url,
+        "config": fixed_config,
+        "contract": contract.to_dict(),
+        "config_contract": config_contract,
+        "production_security": production_security,
+        "algorithm_integrity": algorithm_integrity,
+        "failures": failures,
+    }
+
+
+# ---------------------------------------------------------------------
+# End final algorithm integrity override
+# ---------------------------------------------------------------------

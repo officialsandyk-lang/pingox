@@ -97,6 +97,7 @@ def run_production_gate(
         validate_config_contract,
     )
     from core.post_change_verifier import verify_after_change
+    from core.algorithm_integrity import validate_algorithm_integrity
     from core.production_security_contract import validate_production_security_contract
 
     config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -129,6 +130,22 @@ def run_production_gate(
             "stage": "production_security_contract",
             "config_contract": config_contract,
             "production_security": production_security,
+        "algorithm_integrity": algorithm_integrity,
+        }
+
+    algorithm_integrity = validate_algorithm_integrity(
+        config,
+        require_baseline=True,
+        allow_extra_routes=False,
+    )
+
+    if not algorithm_integrity["success"]:
+        return {
+            "success": False,
+            "stage": "algorithm_integrity",
+            "config_contract": config_contract,
+            "production_security": production_security,
+            "algorithm_integrity": algorithm_integrity,
         }
 
     docker = docker_check()
