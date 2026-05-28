@@ -74,3 +74,43 @@ data/audit/
 # local patch backups
 *.bak*
 *.py.bak*
+
+# secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Rust/build output
+target/
+generated-pingora-proxy/target/
+
+# generated/runtime state
+generated-pingora-proxy/
+tmp/
+logs/
+*.log
+logs.jsonl
+data/*.sqlite3
+data/*.db
+
+# live deployment state
+active_config.json
+gateway_config.json
+current_config.json
+bluegreen_state.json
+docker-bluegreen/bluegreen_state.json
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+pingora_ai.egg-info/

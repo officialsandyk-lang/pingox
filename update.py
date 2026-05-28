@@ -341,12 +341,328 @@ def assert_untouched_routes_preserved(
 # ---------------------------------------------------------------------
 
 
+
+# ---------------------------------------------------------------------
+# Add-route duplicate / backend-port guard
+# ---------------------------------------------------------------------
+
+def _guard_normalize_path(value):
+    text = str(value or "/").strip()
+    if not text.startswith("/"):
+        text = "/" + text
+    return text.rstrip("/") if len(text) > 1 else text
+
+
+def _guard_normalize_backend(value):
+    text = str(value or "").strip()
+    text = text.replace("http://", "").replace("https://", "").rstrip("/")
+    text = text.replace("localhost:", "127.0.0.1:")
+    text = text.replace("host.docker.internal:", "127.0.0.1:")
+    return text
+
+
+def _guard_backend_port(value):
+    import re
+
+    text = _guard_normalize_backend(value)
+    match = re.search(r":(\d{2,5})\b", text)
+    if not match:
+        return ""
+
+    return match.group(1)
+
+
+def _guard_route_backend_addresses(route):
+    addresses = []
+
+    for key in ["upstream", "backend", "address"]:
+        if route.get(key):
+            addresses.append(_guard_normalize_backend(route.get(key)))
+
+    upstreams = route.get("upstreams")
+
+    if isinstance(upstreams, list):
+        for item in upstreams:
+            if isinstance(item, dict):
+                for key in ["address", "upstream", "backend"]:
+                    if item.get(key):
+                        addresses.append(_guard_normalize_backend(item.get(key)))
+            else:
+                addresses.append(_guard_normalize_backend(item))
+
+    # Remove empty/duplicates while preserving order.
+    cleaned = []
+    seen = set()
+
+    for address in addresses:
+        if address and address not in seen:
+            cleaned.append(address)
+            seen.add(address)
+
+    return cleaned
+
+
+def _guard_route_backend_ports(route):
+    ports = []
+
+    for address in _guard_route_backend_addresses(route):
+        port = _guard_backend_port(address)
+        if port and port not in ports:
+            ports.append(port)
+
+    return ports
+
+
+def _guard_prompt_from_args(args):
+    for attr in ["prompt", "update_prompt", "command", "text"]:
+        value = getattr(args, attr, None)
+
+        if isinstance(value, list):
+            prompt = " ".join(str(x) for x in value).strip()
+            if prompt:
+                return prompt
+
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    return ""
+
+
+def _guard_parse_add_route_prompt(prompt):
+    """
+    Supports prompts like:
+      add /coupons to backend 127.0.0.1:9401
+      add /coupons backend 127.0.0.1:9401
+      add /coupons 127.0.0.1:9401
+    """
+    import re
+
+    text = str(prompt or "").strip()
+
+    match = re.search(
+        r"\badd\s+(?P<path>/[a-zA-Z0-9_\-./]*)\s+(?:to\s+)?(?:backend\s+)?(?P<backend>(?:https?://)?(?:localhost|127\.0\.0\.1|host\.docker\.internal):\d{2,5})\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    if not match:
+        return None
+
+    return {
+        "path": _guard_normalize_path(match.group("path")),
+        "backend": _guard_normalize_backend(match.group("backend")),
+        "port": _guard_backend_port(match.group("backend")),
+    }
+
+
+def _guard_load_current_config():
+    import json
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent
+
+    candidates = [
+        root / "generated-pingora-proxy" / "config.json",
+        root / "active_config.json",
+        root / "gateway_config.json",
+        root / "generated-projects" / "default-project" / "current_config.json",
+    ]
+
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+
+        try:
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("routes"), list):
+                return data, candidate
+        except Exception:
+            continue
+
+    return None, None
+
+
+def check_add_route_noop_or_backend_conflict(args):
+    """
+    Return a result dict when deployment should be skipped.
+    Return None when update.py should continue normally.
+
+    Add command rules:
+    - same route/path + same backend exists => no-op, no deploy
+    - same route/path exists with different backend => block, ask user to use edit/update
+    - same route name exists => block
+    - requested backend port already used by another route => block unless explicitly allowed
+    """
+    prompt = _guard_prompt_from_args(args)
+    request = _guard_parse_add_route_prompt(prompt)
+
+    if not request:
+        return None
+
+    config, config_path = _guard_load_current_config()
+
+    if not config:
+        return None
+
+    routes = config.get("routes") or []
+
+    requested_path = _guard_normalize_path(request["path"])
+    requested_name = requested_path.strip("/").lower()
+    requested_backend = _guard_normalize_backend(request["backend"])
+    requested_port = request["port"]
+
+    port_owner_routes = []
+
+    for route in routes:
+        if not isinstance(route, dict):
+            continue
+
+        existing_path = _guard_normalize_path(route.get("path"))
+        existing_name = str(route.get("name") or existing_path.strip("/")).strip().lower()
+        existing_addresses = _guard_route_backend_addresses(route)
+        existing_ports = _guard_route_backend_ports(route)
+
+        same_path = existing_path == requested_path
+        same_name = bool(requested_name) and existing_name == requested_name
+
+        # 1. Route path/name already exists.
+        if same_path or same_name:
+            # Exact backend/address already exists.
+            if requested_backend in existing_addresses:
+                return {
+                    "success": True,
+                    "deployed": False,
+                    "changed": False,
+                    "understood": True,
+                    "reason": "route_already_exists_same_backend",
+                    "message": (
+                        f"ℹ️ Route already exists: {existing_path} -> {requested_backend}. "
+                        "No deployment needed."
+                    ),
+                    "route": existing_path,
+                    "requested_route": requested_path,
+                    "backend": requested_backend,
+                    "existing_backends": existing_addresses,
+                    "config_path": str(config_path),
+                    "change_summary": [
+                        f"Route already exists: {existing_path} -> {requested_backend}"
+                    ],
+                }
+
+            # Same path/name and same backend port, even if address form differs.
+            if requested_port and requested_port in existing_ports:
+                existing = existing_addresses[0] if existing_addresses else requested_port
+                return {
+                    "success": True,
+                    "deployed": False,
+                    "changed": False,
+                    "understood": True,
+                    "reason": "route_already_exists_same_port",
+                    "message": (
+                        f"ℹ️ Route already exists on same backend port: {existing_path} -> {existing}. "
+                        "No deployment needed."
+                    ),
+                    "route": existing_path,
+                    "requested_route": requested_path,
+                    "backend": requested_backend,
+                    "existing_backend": existing,
+                    "existing_backends": existing_addresses,
+                    "config_path": str(config_path),
+                    "change_summary": [
+                        f"Route already exists on same backend port: {existing_path} -> {existing}"
+                    ],
+                }
+
+            # Same route path/name exists but backend is different.
+            # For ADD, do not silently update. User should use edit/update.
+            return {
+                "success": True,
+                "deployed": False,
+                "changed": False,
+                "understood": True,
+                "reason": "route_name_already_exists_different_backend",
+                "message": (
+                    f"⚠️ Route already exists: {existing_path}. "
+                    f"Existing backend(s): {', '.join(existing_addresses) if existing_addresses else 'unknown'}. "
+                    f"Requested backend: {requested_backend}. "
+                    "No deployment was made. Use `pingora-ai update` or an edit command to change the route backend."
+                ),
+                "route": existing_path,
+                "requested_route": requested_path,
+                "backend": requested_backend,
+                "existing_backends": existing_addresses,
+                "config_path": str(config_path),
+                "change_summary": [
+                    f"Route already exists with different backend: {existing_path}"
+                ],
+            }
+
+        # 2. Backend port already used by another route.
+        if requested_port and requested_port in existing_ports and existing_path != requested_path:
+            port_owner_routes.append(
+                {
+                    "path": existing_path,
+                    "name": existing_name,
+                    "backends": existing_addresses,
+                    "ports": existing_ports,
+                }
+            )
+
+    # Backend port is already used by another route.
+    # By default, block to prevent accidental duplicate route-to-backend mapping.
+    # To allow sharing the same backend across multiple paths:
+    #   PINGORA_AI_ALLOW_SHARED_BACKEND=1 pingora-ai add ...
+    import os
+
+    if port_owner_routes and os.environ.get("PINGORA_AI_ALLOW_SHARED_BACKEND") != "1":
+        owner_text = ", ".join(
+            f"{item['path']} -> {', '.join(item['backends'])}"
+            for item in port_owner_routes
+        )
+
+        return {
+            "success": True,
+            "deployed": False,
+            "changed": False,
+            "understood": True,
+            "reason": "backend_port_already_used_by_another_route",
+            "message": (
+                f"⚠️ Backend port {requested_port} is already used by: {owner_text}. "
+                "No deployment was made. Use PINGORA_AI_ALLOW_SHARED_BACKEND=1 to allow sharing."
+            ),
+            "route": requested_path,
+            "backend": requested_backend,
+            "backend_port": requested_port,
+            "existing_routes": port_owner_routes,
+            "config_path": str(config_path),
+            "change_summary": [
+                f"Backend port {requested_port} already used by another route"
+            ],
+        }
+
+    return None
+
+
+# ---------------------------------------------------------------------
+# End add-route duplicate / backend-port guard
+# ---------------------------------------------------------------------
+
 def deploy_docker_bluegreen_update(args: argparse.Namespace) -> dict[str, Any]:
+    add_route_guard = check_add_route_noop_or_backend_conflict(args)
+    if add_route_guard is not None:
+        import json as _json
+
+        print("")
+        print(add_route_guard.get("message", "No deployment needed."))
+        print("")
+        print(_json.dumps(add_route_guard, indent=2))
+        return add_route_guard
+
     from agents.config_update_agent import apply_config_update
     from core.environment_deployer import (
         apply_profiles,
         create_backup,
-        start_docker_bluegreen,
+        start_docker_bluegreen, start_docker_bluegreen_transactional,
         verify_deployment,
         write_project_from_config,
     )
@@ -428,7 +744,7 @@ def deploy_docker_bluegreen_update(args: argparse.Namespace) -> dict[str, Any]:
     write_project_from_config(updated)
     restart_demo_backends()
 
-    deploy_result = start_docker_bluegreen(updated)
+    deploy_result = start_docker_bluegreen_transactional(updated)
 
     verification = {
         "success": True,
@@ -466,6 +782,171 @@ def deploy_docker_bluegreen_update(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+
+# ---------------------------------------------------------------------
+# Interrupted update rollback guard
+# ---------------------------------------------------------------------
+
+def _rollback_arg(args, name: str, default: str) -> str:
+    value = getattr(args, name, None)
+    return str(value or default)
+
+
+def run_rollback_after_interrupted_update(args, reason: str) -> dict:
+    """
+    Best-effort rollback when an update is interrupted or fails mid-deploy.
+
+    This protects against:
+    - Ctrl+C during Docker blue/green update
+    - docker compose conflict after old gateway was stopped
+    - verification failure after generated project was changed
+
+    Note: SIGKILL / kill -9 / WSL crash cannot be caught by Python.
+    """
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    project_root = Path(__file__).resolve().parent
+    rollback_py = project_root / "rollback.py"
+
+    runtime = _rollback_arg(args, "runtime", "docker_host")
+    strategy = _rollback_arg(args, "strategy", "bluegreen")
+    verify = _rollback_arg(args, "verify", "full")
+
+    print("")
+    print("🧯 Update interrupted or failed before safe completion.")
+    print(f"Reason: {reason}")
+    print("↩️ Attempting rollback to last known good gateway...")
+    print("")
+
+    attempts = []
+
+    if rollback_py.exists():
+        attempts.append([
+            sys.executable,
+            str(rollback_py),
+            "--runtime",
+            runtime,
+            "--strategy",
+            strategy,
+            "--verify",
+            verify,
+        ])
+
+        attempts.append([
+            sys.executable,
+            str(rollback_py),
+            "--verify",
+            verify,
+        ])
+
+        attempts.append([
+            sys.executable,
+            str(rollback_py),
+        ])
+
+    stop_script = project_root / "scripts" / "stop_docker_bluegreen.sh"
+
+    rollback_results = []
+
+    for command in attempts:
+        try:
+            print("Running rollback command:")
+            print(" ".join(command))
+
+            result = subprocess.run(
+                command,
+                cwd=str(project_root),
+                text=True,
+                capture_output=True,
+                timeout=1800,
+            )
+
+            rollback_results.append(
+                {
+                    "command": command,
+                    "returncode": result.returncode,
+                    "stdout_tail": result.stdout[-4000:],
+                    "stderr_tail": result.stderr[-4000:],
+                }
+            )
+
+            if result.stdout.strip():
+                print(result.stdout[-4000:])
+
+            if result.stderr.strip():
+                print(result.stderr[-4000:])
+
+            if result.returncode == 0:
+                print("")
+                print("✅ Rollback command completed successfully.")
+                return {
+                    "success": False,
+                    "rolled_back": True,
+                    "reason": reason,
+                    "rollback_command": command,
+                    "rollback_results": rollback_results,
+                }
+
+        except Exception as exc:
+            rollback_results.append(
+                {
+                    "command": command,
+                    "error": str(exc),
+                }
+            )
+
+    print("")
+    print("⚠️ Automatic rollback command did not complete successfully.")
+    print("Manual recovery command:")
+    print("  python rollback.py --runtime docker_host --strategy bluegreen --verify full")
+    print("")
+    print(json.dumps(rollback_results, indent=2, default=str)[-4000:])
+
+    return {
+        "success": False,
+        "rolled_back": False,
+        "reason": reason,
+        "rollback_results": rollback_results,
+    }
+
+
+def deploy_docker_bluegreen_update_with_interrupt_rollback(args) -> dict:
+    try:
+        return deploy_docker_bluegreen_update(args)
+
+    except KeyboardInterrupt:
+        result = run_rollback_after_interrupted_update(
+            args,
+            reason="keyboard_interrupt_ctrl_c",
+        )
+        raise SystemExit(130 if not result.get("rolled_back") else 0)
+
+    except Exception as exc:
+        # Roll back only Docker blue/green update failures.
+        runtime = _rollback_arg(args, "runtime", "docker_host")
+        strategy = _rollback_arg(args, "strategy", "bluegreen")
+
+        if runtime in {"docker", "docker_host"} and strategy == "bluegreen":
+            result = run_rollback_after_interrupted_update(
+                args,
+                reason=f"update_exception: {exc}",
+            )
+
+            if result.get("rolled_back"):
+                print("")
+                print("✅ Previous stable gateway restored after failed update.")
+                return result
+
+        raise
+
+
+# ---------------------------------------------------------------------
+# End interrupted update rollback guard
+# ---------------------------------------------------------------------
+
 def main() -> int:
     runtime, strategy = parse_known_runtime_strategy(sys.argv[1:])
     runtime_mode = effective_runtime_mode(runtime, strategy)
@@ -478,7 +959,7 @@ def main() -> int:
         print(f"Strategy: {strategy}")
         print(f"Runtime addressing mode: {runtime_mode}")
 
-        result = deploy_docker_bluegreen_update(args)
+        result = deploy_docker_bluegreen_update_with_interrupt_rollback(args)
 
         print("")
         print("📋 Update summary:")

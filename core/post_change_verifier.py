@@ -81,8 +81,105 @@ def _route_url(live_url: str, path: str) -> str:
 
 
 def _extract_backend_port(body: str) -> str | None:
-    match = re.search(r"Demo Backend (\d+)", body or "")
+    """
+    Extract backend port from verifier/demo backend responses.
 
+    Handles:
+    - "backend_port": 9101
+    - "port": 9101
+    - X-Demo-Backend-Port evidence copied into body
+    - host.docker.internal:9101
+    - 127.0.0.1:9101
+    - plain text containing 9101/9102/9103
+    """
+    if body is None:
+        return None
+
+    if isinstance(body, bytes):
+        text = body.decode("utf-8", errors="replace")
+    else:
+        text = str(body)
+
+    if not text.strip():
+        return None
+
+    # Direct JSON-key regex. This is the most important fix.
+    for pattern in [
+        r'"backend_port"\s*:\s*"?([0-9]{2,5})"?',
+        r'"selected_backend"\s*:\s*"?([0-9]{2,5})"?',
+        r'"selected_backend_port"\s*:\s*"?([0-9]{2,5})"?',
+        r'"upstream_port"\s*:\s*"?([0-9]{2,5})"?',
+        r'"port"\s*:\s*"?([0-9]{2,5})"?',
+        r'X-Demo-Backend-Port\s*:?\s*"?([0-9]{2,5})"?',
+        r'X-Backend-Port\s*:?\s*"?([0-9]{2,5})"?',
+        r'X-Selected-Backend\s*:?\s*"?([0-9]{2,5})"?',
+    ]:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            port = int(match.group(1))
+            if 1 <= port <= 65535:
+                return str(port)
+
+    # Host:port evidence.
+    match = re.search(
+        r'(?:127\.0\.0\.1|localhost|host\.docker\.internal):([0-9]{2,5})',
+        text,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        port = int(match.group(1))
+        if 1 <= port <= 65535:
+            return str(port)
+
+    # JSON parse fallback.
+    try:
+        parsed = json.loads(text)
+
+        def walk(value):
+            if isinstance(value, dict):
+                for key in [
+                    "backend_port",
+                    "port",
+                    "selected_backend",
+                    "selected_backend_port",
+                    "upstream_port",
+                    "server_port",
+                ]:
+                    if key in value:
+                        try:
+                            port = int(str(value[key]))
+                            if 1 <= port <= 65535:
+                                return str(port)
+                        except Exception:
+                            pass
+
+                for child in value.values():
+                    found = walk(child)
+                    if found:
+                        return found
+
+            if isinstance(value, list):
+                for child in value:
+                    found = walk(child)
+                    if found:
+                        return found
+
+            if isinstance(value, str):
+                found = _extract_backend_port(value)
+                if found:
+                    return found
+
+            return None
+
+        found = walk(parsed)
+        if found:
+            return found
+
+    except Exception:
+        pass
+
+    # Last fallback: known backend port ranges used in your project.
+    match = re.search(r'\b(9[0-9]{3}|10[0-9]{3})\b', text)
     if match:
         return match.group(1)
 
@@ -147,16 +244,25 @@ def _check_route_live(route: dict[str, Any], live_url: str) -> dict[str, Any]:
     path = _normalize_path(route.get("path") or "/")
     status, body = _request(_route_url(live_url, path))
 
+    backend = _extract_backend_port(body)
+
     if path == "/" or _is_static_route(route):
         ok = status == 200
     else:
-        ok = status == 200 and "Demo Backend" in body
+        ok = status == 200 and (
+            backend is not None
+            or _has_backend_evidence(body)
+            or "DemoBackend/1.0" in str(body)
+            or "Demo Backend" in str(body)
+        )
 
     return {
         "name": f"{path} live route check",
         "ok": ok,
         "path": path,
         "status": status,
+        "backend": backend,
+        "backend_evidence": _has_backend_evidence(body),
     }
 
 
@@ -432,15 +538,27 @@ def _is_gateway_rejection(status: int | None) -> bool:
 
 
 def _has_backend_evidence(body: str) -> bool:
-    text = body or ""
+    """
+    True when response body clearly came from the demo backend.
+    """
+    if body is None:
+        return False
 
-    return (
-        "Demo Backend" in text
-        or "DemoBackend" in text
-        or "backend" in text.lower()
-        or "method" in text.lower()
-        or "path" in text.lower()
-    )
+    if isinstance(body, bytes):
+        text = body.decode("utf-8", errors="replace")
+    else:
+        text = str(body)
+
+    if "DemoBackend/1.0" in text:
+        return True
+
+    if "backend_port" in text:
+        return True
+
+    if _extract_backend_port(text):
+        return True
+
+    return False
 
 
 def _check_crud_methods_for_route(

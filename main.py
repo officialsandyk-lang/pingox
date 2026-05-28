@@ -166,6 +166,12 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--config-file",
+        default="",
+        help="Deploy from a ready-made JSON config file instead of planning from natural language.",
+    )
+
+    parser.add_argument(
         "prompt",
         nargs="*",
         help="Natural-language gateway prompt",
@@ -507,6 +513,45 @@ def main() -> int:
     load_dotenv()
 
     args = parse_args()
+
+    if getattr(args, "config_file", ""):
+        from core.environment_deployer import deploy_config_for_environment
+
+        runtime = normalize_runtime(args.runtime)
+        strategy = normalize_strategy(args.strategy, runtime)
+        validate_runtime_strategy(runtime, strategy)
+        runtime_mode = effective_runtime_mode(runtime, strategy)
+
+        print("")
+        print("🚦 AI Pingora Gateway")
+        print(f"Runtime: {runtime}")
+        print(f"Strategy: {strategy}")
+        print(f"Runtime addressing mode: {runtime_mode}")
+        print("Source: config-file")
+        print("")
+
+        validate_requested_environment(
+            runtime_mode=runtime_mode,
+            strategy=strategy,
+            project_root=PROJECT_ROOT,
+        )
+
+        result = deploy_config_for_environment(
+            config_file=args.config_file,
+            runtime=runtime,
+            runtime_mode=runtime_mode,
+            strategy=strategy,
+            verify_level=args.verify,
+        )
+
+        print("")
+        print("✅ Config-file deployment completed")
+        print(f"Runtime: {result.get('runtime_mode')}")
+        print(f"Strategy: {result.get('strategy')}")
+        print(f"Active color: {result.get('active_color')}")
+        print(f"Live URL: {result.get('live_url')}")
+
+        return 0 if result.get("success") else 1
 
     prompt = " ".join(args.prompt).strip()
 

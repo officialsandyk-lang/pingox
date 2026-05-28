@@ -17,6 +17,19 @@ GENERATED_PROJECT_DIR = PROJECT_ROOT / "generated-pingora-proxy"
 DOCKER_DIR = PROJECT_ROOT / "docker-bluegreen"
 STATE_PATH = PROJECT_ROOT / "data" / "docker_bluegreen_state.json"
 
+DOCKER_CONTAINER_NAMES = [
+    "ai-pingora-gateway-blue",
+    "ai-pingora-gateway-green",
+    "ai-pingora-gateway-edge",
+]
+
+DOCKER_NETWORK_NAMES = [
+    "docker-bluegreen_ai_pingora_net",
+    "docker-bluegreen_default",
+]
+
+DOCKER_BLUEGREEN_GATEWAY_PORT = 8090
+
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
@@ -482,10 +495,105 @@ def docker_compose(command: list[str], *, timeout: int = 900) -> subprocess.Comp
     )
 
 
+def docker_bluegreen_cleanup(reason: str = "docker_bluegreen_cleanup") -> dict[str, Any]:
+    print("")
+    print(f"🧹 Docker blue/green cleanup: {reason}")
+
+    results: dict[str, Any] = {
+        "reason": reason,
+        "compose_down": None,
+        "containers": [],
+        "networks": [],
+    }
+
+    if (DOCKER_DIR / "docker-compose.yml").exists():
+        down = docker_compose(["down", "--remove-orphans"], timeout=300)
+        results["compose_down"] = {
+            "returncode": down.returncode,
+            "stdout": down.stdout[-2000:],
+            "stderr": down.stderr[-2000:],
+        }
+
+    for name in DOCKER_CONTAINER_NAMES:
+        rm = run_command(["docker", "rm", "-f", name], timeout=60)
+        results["containers"].append({
+            "name": name,
+            "returncode": rm.returncode,
+            "stdout": rm.stdout.strip(),
+            "stderr": rm.stderr.strip(),
+        })
+
+    ps = run_command(
+        ["bash", "-lc", "docker ps -aq --filter 'name=ai-pingora-gateway' | xargs -r docker rm -f"],
+        timeout=60,
+    )
+    results["containers"].append({
+        "name": "ai-pingora-gateway*",
+        "returncode": ps.returncode,
+        "stdout": ps.stdout.strip(),
+        "stderr": ps.stderr.strip(),
+    })
+
+    for network_name in DOCKER_NETWORK_NAMES:
+        rm_net = run_command(["docker", "network", "rm", network_name], timeout=60)
+        results["networks"].append({
+            "name": network_name,
+            "returncode": rm_net.returncode,
+            "stdout": rm_net.stdout.strip(),
+            "stderr": rm_net.stderr.strip(),
+        })
+
+    return results
+
+
+def is_docker_compose_name_conflict(result: subprocess.CompletedProcess[str]) -> bool:
+    combined = f"{result.stdout}\n{result.stderr}".lower()
+    return any(
+        marker in combined
+        for marker in [
+            "already exists",
+            "already in use",
+            "conflict. the container name",
+            "network with name",
+            "you have to remove",
+        ]
+    )
+
+
+def docker_compose_up_with_conflict_repair(timeout: int = 600) -> subprocess.CompletedProcess[str]:
+    up = docker_compose(["up", "-d"], timeout=timeout)
+
+    if up.returncode == 0:
+        return up
+
+    if not is_docker_compose_name_conflict(up):
+        return up
+
+    print("")
+    print("⚠️ Docker compose up hit stale container/network conflict.")
+    print("🔁 Cleaning Docker blue/green resources and retrying once...")
+
+    docker_bluegreen_cleanup(reason="repair_after_docker_compose_up_conflict")
+    time.sleep(2)
+
+    retry = docker_compose(["up", "-d"], timeout=timeout)
+
+    if retry.returncode == 0:
+        print("✅ Docker compose up succeeded after conflict cleanup retry.")
+
+    return retry
+
 def start_docker_bluegreen(config: dict[str, Any]) -> dict[str, Any]:
     require_docker()
 
-    port = int(config.get("port") or 8090)
+    # Docker blue/green local runtime must use the stable edge/gateway port.
+    # FastAPI config-file plans may still contain port 8080, but generated
+    # Pingora currently starts on 8090. Force Docker/Nginx/readiness to 8090.
+    config["port"] = DOCKER_BLUEGREEN_GATEWAY_PORT
+    config["listen_port"] = DOCKER_BLUEGREEN_GATEWAY_PORT
+    config["proxy_port"] = DOCKER_BLUEGREEN_GATEWAY_PORT
+
+    port = DOCKER_BLUEGREEN_GATEWAY_PORT
     color = next_color()
 
     write_dockerfile()
@@ -532,14 +640,17 @@ def start_docker_bluegreen(config: dict[str, Any]) -> dict[str, Any]:
             f"STDERR:\n{build.stderr}"
         )
 
-    up = docker_compose(["up", "-d"], timeout=600)
+    up = docker_compose_up_with_conflict_repair(timeout=600)
 
     if up.stdout.strip():
         print(up.stdout[-4000:])
 
+    if up.stderr.strip():
+        print(up.stderr[-4000:])
+
     if up.returncode != 0:
         raise RuntimeError(
-            "Docker compose up failed.\n"
+            "Docker compose up failed after conflict cleanup retry.\n"
             f"STDOUT:\n{up.stdout}\n\nSTDERR:\n{up.stderr}"
         )
 
@@ -599,6 +710,295 @@ def verify_deployment(config: dict[str, Any], live_url: str, level: str) -> dict
     return result
 
 
+
+# ---------------------------------------------------------------------
+# Transactional zero-downtime Docker blue/green update
+# ---------------------------------------------------------------------
+
+def docker_container_is_running(name: str) -> bool:
+    result = run_command(
+        ["docker", "inspect", "-f", "{{.State.Running}}", name],
+        timeout=30,
+    )
+    return result.returncode == 0 and result.stdout.strip().lower() == "true"
+
+
+def docker_exec_edge(command: str, timeout: int = 30) -> subprocess.CompletedProcess[str]:
+    return run_command(
+        ["docker", "exec", "ai-pingora-gateway-edge", "sh", "-lc", command],
+        timeout=timeout,
+    )
+
+
+def reload_nginx_edge() -> subprocess.CompletedProcess[str]:
+    return docker_exec_edge("nginx -s reload", timeout=30)
+
+
+def wait_for_candidate_container(
+    *,
+    color: str,
+    port: int,
+    timeout_seconds: int = 120,
+) -> bool:
+    service_name = f"gateway-{color}"
+    deadline = time.time() + timeout_seconds
+
+    while time.time() < deadline:
+        if not docker_container_is_running(f"ai-pingora-gateway-{color}"):
+            time.sleep(2)
+            continue
+
+        # nginx:alpine normally has busybox wget available.
+        result = docker_exec_edge(
+            f"wget -q -S -O /dev/null http://{service_name}:{port}/ 2>&1 || true",
+            timeout=15,
+        )
+
+        output = f"{result.stdout}\n{result.stderr}"
+
+        if any(code in output for code in ["200", "301", "302", "403", "404", "405"]):
+            return True
+
+        time.sleep(2)
+
+    return False
+
+
+def wait_for_live_edge(
+    *,
+    live_url: str,
+    timeout_seconds: int = 90,
+) -> str | None:
+    deadline = time.time() + timeout_seconds
+
+    while time.time() < deadline:
+        result = run_command(
+            ["bash", "-lc", f"curl -s -o /dev/null -w '%{{http_code}}' {live_url}"],
+            timeout=10,
+        )
+
+        status = result.stdout.strip()
+
+        if status in {"200", "301", "302", "403", "404", "405"}:
+            return status
+
+        time.sleep(2)
+
+    return None
+
+
+def ensure_base_bluegreen_stack_exists(config: dict[str, Any]) -> dict[str, Any] | None:
+    """
+    If there is no current live blue/green stack, we cannot do a transactional
+    switch. In that case, perform the normal full start once.
+    """
+    edge_running = docker_container_is_running("ai-pingora-gateway-edge")
+    blue_running = docker_container_is_running("ai-pingora-gateway-blue")
+    green_running = docker_container_is_running("ai-pingora-gateway-green")
+
+    if edge_running and (blue_running or green_running):
+        return None
+
+    print("")
+    print("ℹ️ No live blue/green edge found. Performing initial full Docker start.")
+    return start_docker_bluegreen(config)
+
+
+def rollback_edge_to_color(color: str, port: int) -> None:
+    try:
+        print("")
+        print(f"↩️ Rolling Nginx edge back to {color}...")
+        write_nginx_conf(color, port)
+        reload_nginx_edge()
+        save_state(color)
+        print(f"✅ Edge rolled back to {color}.")
+    except Exception as exc:
+        print(f"⚠️ Edge rollback attempt failed: {exc}")
+
+
+def start_docker_bluegreen_transactional(config: dict[str, Any]) -> dict[str, Any]:
+    """
+    True zero-downtime update path.
+
+    Important behaviour:
+    - Does NOT stop the active colour before candidate verification.
+    - Does NOT stop the Nginx edge before candidate verification.
+    - Builds/starts only the inactive candidate colour.
+    - Switches Nginx only after candidate is healthy.
+    - If interrupted before switch, old live gateway remains running.
+    - If switch fails, attempts to point Nginx back to old active colour.
+    """
+
+    require_docker()
+
+    config["port"] = DOCKER_BLUEGREEN_GATEWAY_PORT
+    config["listen_port"] = DOCKER_BLUEGREEN_GATEWAY_PORT
+    config["proxy_port"] = DOCKER_BLUEGREEN_GATEWAY_PORT
+
+    port = DOCKER_BLUEGREEN_GATEWAY_PORT
+
+    initial = ensure_base_bluegreen_stack_exists(config)
+    if initial is not None:
+        return initial
+
+    old_color = str(load_state().get("active_color") or "green")
+    if old_color not in {"blue", "green"}:
+        old_color = "green"
+
+    candidate_color = "blue" if old_color == "green" else "green"
+
+    print("")
+    print("🔁 Transactional Docker blue/green update")
+    print(f"Current live colour: {old_color}")
+    print(f"Candidate colour: {candidate_color}")
+    print("Old gateway will remain live until candidate passes verification.")
+
+    # Write project files for the candidate image. Existing active container is
+    # unaffected because it already has its old config baked into its image.
+    write_project_from_config(config)
+
+    write_dockerfile()
+    write_compose(old_color, port)
+
+    switched = False
+    live_url = f"http://127.0.0.1:{port}/"
+
+    try:
+        # Remove only candidate. Never remove active or edge here.
+        run_command(
+            ["docker", "rm", "-f", f"ai-pingora-gateway-{candidate_color}"],
+            timeout=60,
+        )
+
+        from agents.deployment_repair_agent import run_docker_command_with_repair
+
+        build = run_docker_command_with_repair(
+            [
+                "docker",
+                "compose",
+                "-f",
+                str(DOCKER_DIR / "docker-compose.yml"),
+                "build",
+                f"gateway-{candidate_color}",
+            ],
+            project_dir=str(GENERATED_PROJECT_DIR),
+            max_attempts=3,
+            retry_delay_seconds=5,
+            timeout=1200,
+        )
+
+        if build.stdout.strip():
+            print(build.stdout[-4000:])
+
+        if build.stderr.strip():
+            print(build.stderr[-4000:])
+
+        if not build.ok:
+            raise RuntimeError(
+                "Candidate Docker build failed. Old gateway is still live.\n"
+                f"Classification: {build.classification}\n"
+                f"Attempts: {build.attempts}\n"
+                f"Repaired: {build.repaired}\n\n"
+                f"STDOUT:\n{build.stdout}\n\n"
+                f"STDERR:\n{build.stderr}"
+            )
+
+        up = docker_compose(
+            ["up", "-d", "--no-deps", f"gateway-{candidate_color}"],
+            timeout=600,
+        )
+
+        if up.stdout.strip():
+            print(up.stdout[-4000:])
+
+        if up.stderr.strip():
+            print(up.stderr[-4000:])
+
+        if up.returncode != 0:
+            raise RuntimeError(
+                "Candidate container failed to start. Old gateway is still live.\n"
+                f"STDOUT:\n{up.stdout}\n\nSTDERR:\n{up.stderr}"
+            )
+
+        candidate_ready = wait_for_candidate_container(
+            color=candidate_color,
+            port=port,
+            timeout_seconds=120,
+        )
+
+        if not candidate_ready:
+            logs = docker_compose(["logs", "--tail=120", f"gateway-{candidate_color}"], timeout=60)
+            raise RuntimeError(
+                "Candidate gateway did not become ready. Old gateway is still live.\n"
+                f"LOGS:\n{logs.stdout}\n{logs.stderr}"
+            )
+
+        print(f"✅ Candidate {candidate_color} is ready internally.")
+
+        # Switch edge only now.
+        write_nginx_conf(candidate_color, port)
+
+        reload = reload_nginx_edge()
+
+        if reload.returncode != 0:
+            rollback_edge_to_color(old_color, port)
+            raise RuntimeError(
+                "Nginx reload failed. Rolled back edge to old colour.\n"
+                f"STDOUT:\n{reload.stdout}\n\nSTDERR:\n{reload.stderr}"
+            )
+
+        switched = True
+
+        status = wait_for_live_edge(
+            live_url=live_url,
+            timeout_seconds=90,
+        )
+
+        if not status:
+            rollback_edge_to_color(old_color, port)
+            raise RuntimeError(
+                "Live edge did not become healthy after switch. Rolled back edge to old colour."
+            )
+
+        save_state(candidate_color)
+
+        print(f"✅ Zero-downtime switch complete: {old_color} → {candidate_color}")
+        print(f"✅ Docker gateway edge ready: HTTP {status}")
+
+        ps = docker_compose(["ps"], timeout=60)
+
+        return {
+            "success": True,
+            "active_color": candidate_color,
+            "previous_color": old_color,
+            "live_url": live_url,
+            "status": status,
+            "compose_file": str(DOCKER_DIR / "docker-compose.yml"),
+            "docker_ps": ps.stdout,
+            "transactional": True,
+            "zero_downtime": True,
+        }
+
+    except KeyboardInterrupt:
+        if switched:
+            rollback_edge_to_color(old_color, port)
+
+        print("")
+        print("🛑 Update interrupted.")
+        print("✅ Previous live gateway should still be serving traffic.")
+
+        raise
+
+    except Exception:
+        if switched:
+            rollback_edge_to_color(old_color, port)
+        raise
+
+
+# ---------------------------------------------------------------------
+# End transactional zero-downtime Docker blue/green update
+# ---------------------------------------------------------------------
+
 def deploy_docker_bluegreen(
     *,
     prompt: str,
@@ -619,6 +1019,8 @@ def deploy_docker_bluegreen(
         runtime_mode="docker_host",
         strategy="bluegreen",
     )
+
+    config = normalize_docker_bluegreen_port(config)
 
     write_project_from_config(config)
 
@@ -649,6 +1051,141 @@ def deploy_docker_bluegreen(
         "verification": verification,
         "docker": deploy_result,
     }
+
+
+def load_config_file(config_file: str | Path) -> dict[str, Any]:
+    """
+    Load a ready-made JSON gateway config.
+
+    This is used by the public CLI config-file path so local deployment can run
+    without calling the local AI/LangGraph prompt-planning layer.
+    """
+    path = Path(config_file)
+
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+
+    if not path.exists():
+        raise RuntimeError(f"Config file not found: {path}")
+
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Could not read config file: {path}: {exc}") from exc
+
+    if not isinstance(config, dict):
+        raise RuntimeError(f"Config file must contain a JSON object: {path}")
+
+    routes = config.get("routes")
+
+    if not isinstance(routes, list) or not routes:
+        raise RuntimeError(f"Config file must contain a non-empty routes list: {path}")
+
+    return config
+
+
+
+def normalize_docker_bluegreen_port(config: dict[str, Any]) -> dict[str, Any]:
+    """
+    Local Docker blue/green runtime currently serves Pingora on stable port 8090.
+
+    FastAPI config-file plans may default to 8080. If Docker/Nginx uses 8080
+    while generated Pingora starts on 8090, the edge returns 502 forever.
+    """
+    fixed = json.loads(json.dumps(config))
+    fixed["port"] = 8090
+    fixed["listen_port"] = 8090
+    fixed["proxy_port"] = 8090
+    return fixed
+
+def deploy_docker_bluegreen_from_config(
+    *,
+    config: dict[str, Any],
+    verify_level: str = "full",
+    backup_reason: str = "before_docker_bluegreen_config_file_deploy",
+) -> dict[str, Any]:
+    """
+    Deploy an already-planned gateway config.
+
+    Important architecture rule:
+    this function must not call prompt_to_config, LangGraph, OpenAI, or any
+    local AI planning layer. It only prepares, writes, deploys, and verifies the
+    supplied JSON config.
+    """
+    require_docker()
+
+    backup = create_backup(reason=backup_reason)
+
+    config = apply_profiles(
+        config,
+        runtime_mode="docker_host",
+        strategy="bluegreen",
+    )
+
+    config["port"] = DOCKER_BLUEGREEN_GATEWAY_PORT
+    config["listen_port"] = DOCKER_BLUEGREEN_GATEWAY_PORT
+    config["proxy_port"] = DOCKER_BLUEGREEN_GATEWAY_PORT
+
+    write_project_from_config(config)
+
+    deploy_result = start_docker_bluegreen(config)
+
+    verification = verify_deployment(
+        config,
+        live_url=deploy_result["live_url"],
+        level=verify_level,
+    )
+
+    if not verification.get("success"):
+        raise RuntimeError(
+            "Docker blue/green config-file deployment failed verification: "
+            + str(verification.get("failure_summary"))
+        )
+
+    return {
+        "success": True,
+        "runtime": "docker_host",
+        "runtime_mode": "docker_host",
+        "strategy": "bluegreen",
+        "deployment_strategy": "bluegreen",
+        "active_color": deploy_result["active_color"],
+        "live_url": deploy_result["live_url"],
+        "config": config,
+        "backup": str(backup) if backup else None,
+        "verification": verification,
+        "docker": deploy_result,
+        "source": "config_file",
+    }
+
+
+def deploy_config_for_environment(
+    *,
+    config_file: str | Path,
+    runtime: str,
+    runtime_mode: str,
+    strategy: str,
+    verify_level: str = "full",
+) -> dict[str, Any]:
+    """
+    Deploy from an already-generated config file for the requested environment.
+    """
+    runtime = str(runtime or "local").strip().lower()
+    runtime_mode = str(runtime_mode or runtime).strip().lower()
+    strategy = str(strategy or "direct").strip().lower()
+
+    config = load_config_file(config_file)
+
+    if strategy == "bluegreen" and runtime_mode in {"docker", "docker_host"}:
+        return deploy_docker_bluegreen_from_config(
+            config=config,
+            verify_level=verify_level,
+        )
+
+    raise RuntimeError(
+        f"Config-file deployment not implemented yet for runtime={runtime}, "
+        f"runtime_mode={runtime_mode}, strategy={strategy}. "
+        "Supported now: docker_host + bluegreen."
+    )
 
 
 def deploy_for_environment(
