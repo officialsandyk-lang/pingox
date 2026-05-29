@@ -1,0 +1,670 @@
+from __future__ import annotations
+
+import html
+import json
+import shutil
+from pathlib import Path
+from typing import Any
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_PROJECT_DIR = PROJECT_ROOT / "generated-pingora-proxy"
+DEFAULT_RUNTIME_TEMPLATE_DIR = PROJECT_ROOT / "templates" / "pingora_runtime"
+
+
+COPY_EXCLUDE_NAMES = {
+    ".git",
+    ".venv",
+    "__pycache__",
+    ".pytest_cache",
+    "target",
+    ".runtime",
+    "runtime",
+    "tmp",
+    "data",
+}
+
+COPY_EXCLUDE_FILES = {
+    "config.json",
+    "active_config.json",
+    "gateway_config.json",
+    "logs.jsonl",
+}
+
+
+def normalize_path(path: Any) -> str:
+    text = str(path or "/").strip()
+
+    if not text:
+        return "/"
+
+    if not text.startswith("/"):
+        text = "/" + text
+
+    allowed = []
+    for char in text:
+        if char.isalnum() or char in {"/", "_", "-", "."}:
+            allowed.append(char)
+
+    text = "".join(allowed)
+
+    if not text:
+        return "/"
+
+    if not text.startswith("/"):
+        text = "/" + text
+
+    if len(text) > 1:
+        text = text.rstrip("/")
+
+    return text or "/"
+
+
+def normalize_port(value: Any, default: int = 8090) -> int:
+    try:
+        port = int(value)
+    except Exception:
+        return default
+
+    if 1 <= port <= 65535:
+        return port
+
+    return default
+
+
+def is_static_route(route: dict[str, Any]) -> bool:
+    route_type = str(route.get("type") or "").strip().lower()
+
+    return route_type in {
+        "static",
+        "web",
+        "webserver",
+        "web_server",
+        "file_server",
+        "files",
+    }
+
+
+def route_display_type(route: dict[str, Any]) -> str:
+    if is_static_route(route):
+        return "static"
+
+    return "proxy"
+
+
+def route_display_balancing(route: dict[str, Any]) -> str:
+    if is_static_route(route):
+        return "single/static"
+
+    balancing = route.get("balancing")
+
+    if balancing:
+        return str(balancing)
+
+    upstreams = route.get("upstreams")
+
+    if isinstance(upstreams, list) and len(upstreams) > 1:
+        return "round_robin"
+
+    return "single/static"
+
+
+def route_display_upstreams(route: dict[str, Any]) -> str:
+    if is_static_route(route):
+        root = route.get("root") or "public"
+        index = route.get("index") or "index.html"
+        return f"{root}/{index}"
+
+    upstreams = route.get("upstreams")
+
+    if isinstance(upstreams, list) and upstreams:
+        parts: list[str] = []
+
+        for item in upstreams:
+            if isinstance(item, dict):
+                address = item.get("address") or item.get("upstream") or item.get("backend") or ""
+                weight = item.get("weight")
+
+                if weight is not None:
+                    parts.append(f"{address} weight {weight}")
+                else:
+                    parts.append(str(address))
+            else:
+                parts.append(str(item))
+
+        return ", ".join(part for part in parts if part)
+
+    upstream = route.get("upstream") or route.get("backend") or "-"
+
+    return str(upstream)
+
+
+def get_static_root(config: dict[str, Any]) -> str:
+    routes = config.get("routes") or []
+
+    if isinstance(routes, list):
+        for route in routes:
+            if not isinstance(route, dict):
+                continue
+
+            if normalize_path(route.get("path")) == "/" and is_static_route(route):
+                return str(route.get("root") or "public").strip() or "public"
+
+    return "public"
+
+
+def get_static_index(config: dict[str, Any]) -> str:
+    routes = config.get("routes") or []
+
+    if isinstance(routes, list):
+        for route in routes:
+            if not isinstance(route, dict):
+                continue
+
+            if normalize_path(route.get("path")) == "/" and is_static_route(route):
+                return str(route.get("index") or "index.html").strip() or "index.html"
+
+    return "index.html"
+
+
+def write_json_config(config: dict[str, Any], project_dir: str | Path) -> Path:
+    project_path = Path(project_dir)
+    project_path.mkdir(parents=True, exist_ok=True)
+
+    config_path = project_path / "config.json"
+    tmp_path = config_path.with_suffix(".json.tmp")
+
+    tmp_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    tmp_path.replace(config_path)
+
+    return config_path
+
+
+def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Path) -> Path:
+    """
+    Always generate the route-directory homepage from config.
+
+    This prevents "/" from falling back to the older simple page:
+    "AI Pingora Webserver is running".
+
+    project_writer.py owns the homepage.
+    update_graph.py only changes config and redeploys.
+    """
+
+    project_path = Path(project_dir)
+    static_root = get_static_root(config)
+    static_index = get_static_index(config)
+
+    public_dir = project_path / static_root
+    index_path = public_dir / static_index
+
+    public_dir.mkdir(parents=True, exist_ok=True)
+
+    port = normalize_port(
+        config.get("port")
+        or config.get("listen_port")
+        or config.get("proxy_port")
+        or 8090,
+        default=8090,
+    )
+
+    routes = config.get("routes") or []
+
+    if not isinstance(routes, list):
+        routes = []
+
+    normalized_routes: list[dict[str, Any]] = []
+
+    for route in routes:
+        if not isinstance(route, dict):
+            continue
+
+        fixed = dict(route)
+        fixed["path"] = normalize_path(fixed.get("path") or "/")
+        normalized_routes.append(fixed)
+
+    rows: list[str] = []
+
+    for route in normalized_routes:
+        path = normalize_path(route.get("path") or "/")
+        route_type = route_display_type(route)
+        balancing = route_display_balancing(route)
+        upstream_text = route_display_upstreams(route)
+
+        url_path = "/" if path == "/" else path.rstrip("/") + "/"
+        url = f"http://127.0.0.1:{port}{url_path}"
+
+        rows.append(
+            f"""
+            <tr>
+              <td><a href="{html.escape(url)}">{html.escape(path)}</a></td>
+              <td>{html.escape(route_type)}</td>
+              <td>{html.escape(balancing)}</td>
+              <td><code>{html.escape(upstream_text)}</code></td>
+            </tr>
+            """
+        )
+
+    index_path.write_text(
+        f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>AI Pingora Gateway Route Directory</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f9fafb;
+      --card: #ffffff;
+      --text: #111827;
+      --muted: #4b5563;
+      --border: #e5e7eb;
+      --link: #2563eb;
+      --code-bg: #f3f4f6;
+      --badge-bg: #dcfce7;
+      --badge-text: #166534;
+    }}
+
+    * {{
+      box-sizing: border-box;
+    }}
+
+    body {{
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 0;
+      padding: 40px;
+      background: var(--bg);
+      color: var(--text);
+    }}
+
+    main {{
+      max-width: 1180px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 32px;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.06);
+    }}
+
+    h1 {{
+      margin: 14px 0 12px;
+      font-size: 34px;
+      line-height: 1.15;
+    }}
+
+    p {{
+      color: var(--muted);
+      font-size: 16px;
+    }}
+
+    code {{
+      background: var(--code-bg);
+      padding: 2px 6px;
+      border-radius: 6px;
+      color: #111827;
+    }}
+
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 24px;
+      font-size: 15px;
+    }}
+
+    th, td {{
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+      padding: 12px 14px;
+      vertical-align: top;
+    }}
+
+    th {{
+      background: var(--code-bg);
+      color: #374151;
+      font-weight: 700;
+    }}
+
+    a {{
+      color: var(--link);
+      font-weight: 700;
+      text-decoration: none;
+    }}
+
+    a:hover {{
+      text-decoration: underline;
+    }}
+
+    .badge {{
+      display: inline-block;
+      background: var(--badge-bg);
+      color: var(--badge-text);
+      padding: 5px 11px;
+      border-radius: 999px;
+      font-weight: 700;
+      font-size: 14px;
+    }}
+
+    .meta {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 16px;
+    }}
+
+    .meta-item {{
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+      background: #ffffff;
+    }}
+
+    .muted {{
+      color: var(--muted);
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <span class="badge">✅ Gateway live</span>
+    <h1>AI Pingora Gateway Route Directory</h1>
+
+    <p>This page is served directly by the generated Pingora static webserver.</p>
+
+    <div class="meta">
+      <div class="meta-item">Live URL: <code>http://127.0.0.1:{port}/</code></div>
+      <div class="meta-item">Total routes: <strong>{len(normalized_routes)}</strong></div>
+      <div class="meta-item">Runtime: <code>{html.escape(str(config.get("runtime") or config.get("runtime_mode") or "local"))}</code></div>
+      <div class="meta-item">Strategy: <code>{html.escape(str(config.get("strategy") or config.get("deployment_strategy") or "direct"))}</code></div>
+    </div>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Route</th>
+          <th>Type</th>
+          <th>Balancing</th>
+          <th>Upstreams / Static file</th>
+        </tr>
+      </thead>
+      <tbody>
+        {''.join(rows)}
+      </tbody>
+    </table>
+
+    <p class="muted">
+      This directory is regenerated from <code>config.json</code> on every project write/update.
+    </p>
+  </main>
+</body>
+</html>
+""",
+        encoding="utf-8",
+    )
+
+    return index_path
+
+
+def _should_skip_copy(name: str) -> bool:
+    return name in COPY_EXCLUDE_NAMES or name in COPY_EXCLUDE_FILES
+
+
+def _copy_file_or_dir(src: Path, dst: Path) -> None:
+    if _should_skip_copy(src.name):
+        return
+
+    if src.is_dir():
+        if dst.exists():
+            shutil.rmtree(dst)
+
+        shutil.copytree(
+            src,
+            dst,
+            ignore=shutil.ignore_patterns(
+                *COPY_EXCLUDE_NAMES,
+                *COPY_EXCLUDE_FILES,
+                "*.log",
+                "*.pyc",
+            ),
+        )
+        return
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+
+
+def _runtime_candidate_dirs(project_dir: Path) -> list[Path]:
+    candidates: list[Path] = []
+
+    if DEFAULT_RUNTIME_TEMPLATE_DIR.exists():
+        candidates.append(DEFAULT_RUNTIME_TEMPLATE_DIR)
+
+    # For local staged updates, reuse the known-good generated runtime source.
+    # This preserves the working Pingora implementation while config/homepage update.
+    if DEFAULT_PROJECT_DIR.exists():
+        candidates.append(DEFAULT_PROJECT_DIR)
+
+    # Avoid duplicates while preserving order.
+    unique: list[Path] = []
+    seen: set[Path] = set()
+
+    for candidate in candidates:
+        resolved = candidate.resolve()
+
+        if resolved == project_dir.resolve():
+            continue
+
+        if resolved in seen:
+            continue
+
+        seen.add(resolved)
+        unique.append(candidate)
+
+    return unique
+
+
+def _has_runtime_source(project_dir: Path) -> bool:
+    return (project_dir / "Cargo.toml").exists() and (project_dir / "src" / "main.rs").exists()
+
+
+def _copy_runtime_scaffold(project_dir: Path) -> bool:
+    """
+    Copy the working Rust/Pingora runtime scaffold into a new project/staging dir.
+
+    Preferred source:
+    1. templates/pingora_runtime, if present.
+    2. current generated-pingora-proxy, if present.
+
+    This is deliberate: the Rust runtime is already verified locally. The writer
+    should update config and homepage without accidentally replacing the runtime
+    with an older/simple static page implementation.
+    """
+
+    if _has_runtime_source(project_dir):
+        return True
+
+    for candidate in _runtime_candidate_dirs(project_dir):
+        if not _has_runtime_source(candidate):
+            continue
+
+        project_dir.mkdir(parents=True, exist_ok=True)
+
+        for item in candidate.iterdir():
+            if _should_skip_copy(item.name):
+                continue
+
+            _copy_file_or_dir(item, project_dir / item.name)
+
+        if _has_runtime_source(project_dir):
+            return True
+
+    return False
+
+
+def _write_minimal_runtime_placeholder(project_dir: Path) -> None:
+    """
+    Fallback only for brand-new empty checkouts where no runtime scaffold exists.
+
+    In the normal project flow, generated-pingora-proxy or templates/pingora_runtime
+    should provide the real Pingora runtime source.
+    """
+
+    src_dir = project_dir / "src"
+    src_dir.mkdir(parents=True, exist_ok=True)
+
+    (project_dir / "Cargo.toml").write_text(
+        """[package]
+name = "generated-pingora-proxy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+""",
+        encoding="utf-8",
+    )
+
+    (src_dir / "main.rs").write_text(
+        """fn main() {
+    eprintln!("No Pingora runtime scaffold was found.");
+    eprintln!("Expected templates/pingora_runtime or an existing generated-pingora-proxy runtime.");
+    std::process::exit(1);
+}
+""",
+        encoding="utf-8",
+    )
+
+
+def _write_generated_readme(project_dir: Path) -> None:
+    readme = project_dir / "README.generated.md"
+
+    readme.write_text(
+        """# Generated AI Pingora Gateway
+
+This folder is generated by the AI Pingora Gateway project.
+
+Important files:
+
+- `config.json` - generated gateway configuration
+- `public/index.html` - route-directory homepage generated from config
+- `src/main.rs` - Rust/Pingora runtime source
+- `Cargo.toml` - Rust project manifest
+
+Do not edit generated files manually unless debugging.
+""",
+        encoding="utf-8",
+    )
+
+
+def _write_project_gitignore(project_dir: Path) -> None:
+    path = project_dir / ".gitignore"
+
+    path.write_text(
+        """target/
+.runtime/
+tmp/
+*.log
+.env
+""",
+        encoding="utf-8",
+    )
+
+
+def _maybe_write_demo_backend_files(config: dict[str, Any], project_dir: Path) -> None:
+    """
+    Optional compatibility with existing demo backend writer.
+
+    The actual runtime backend servers are started by scripts/demo_backends.py.
+    This optional step only preserves any existing file-generation behaviour.
+    """
+
+    demo_config = config.get("demo_backend") or {}
+
+    if isinstance(demo_config, dict):
+        enabled = bool(demo_config.get("enabled", True))
+    else:
+        enabled = True
+
+    if not enabled:
+        return
+
+    try:
+        from core.demo_backend_writer import write_demo_backend_files
+    except Exception:
+        return
+
+    try:
+        write_demo_backend_files(config, project_dir=project_dir)
+    except TypeError:
+        try:
+            write_demo_backend_files(config, project_dir)
+        except TypeError:
+            write_demo_backend_files(config)
+    except Exception as exc:
+        print(f"⚠️ Demo backend file generation skipped: {exc}")
+
+
+def write_project(
+    config: dict[str, Any],
+    project_dir: str | Path = DEFAULT_PROJECT_DIR,
+    **_: Any,
+) -> Path:
+    """
+    Write/update a generated gateway project.
+
+    This function intentionally does three key things:
+
+    1. Preserves/copies the verified Rust/Pingora runtime scaffold.
+    2. Writes the latest config.json.
+    3. Always regenerates public/index.html as a route-directory homepage.
+
+    This prevents update/delete/edit deployments from replacing the homepage with
+    the older generic static page.
+    """
+
+    if not isinstance(config, dict):
+        raise TypeError("write_project expected config to be a dict")
+
+    project_path = Path(project_dir)
+    project_path.mkdir(parents=True, exist_ok=True)
+
+    copied_runtime = _copy_runtime_scaffold(project_path)
+
+    if not copied_runtime:
+        _write_minimal_runtime_placeholder(project_path)
+
+    config_path = write_json_config(config, project_path)
+    homepage_path = write_route_directory_homepage(config, project_path)
+
+    _write_generated_readme(project_path)
+    _write_project_gitignore(project_path)
+    _maybe_write_demo_backend_files(config, project_path)
+
+    print("✅ Project generated successfully")
+    print(f"📁 Folder: {project_path.resolve()}")
+    print(f"🧭 Config: {config_path.resolve()}")
+    print(f"🏠 Route directory: {homepage_path.resolve()}")
+
+    return project_path
+
+
+# Compatibility aliases used by older orchestration code.
+
+
+def generate_project(config: dict[str, Any], project_dir: str | Path = DEFAULT_PROJECT_DIR, **kwargs: Any) -> Path:
+    return write_project(config, project_dir=project_dir, **kwargs)
+
+
+def write_pingora_project(config: dict[str, Any], project_dir: str | Path = DEFAULT_PROJECT_DIR, **kwargs: Any) -> Path:
+    return write_project(config, project_dir=project_dir, **kwargs)
+
+
+def generate_pingora_project(config: dict[str, Any], project_dir: str | Path = DEFAULT_PROJECT_DIR, **kwargs: Any) -> Path:
+    return write_project(config, project_dir=project_dir, **kwargs)
+
+
+def create_project(config: dict[str, Any], project_dir: str | Path = DEFAULT_PROJECT_DIR, **kwargs: Any) -> Path:
+    return write_project(config, project_dir=project_dir, **kwargs)
+
+
+def write(config: dict[str, Any], project_dir: str | Path = DEFAULT_PROJECT_DIR, **kwargs: Any) -> Path:
+    return write_project(config, project_dir=project_dir, **kwargs)

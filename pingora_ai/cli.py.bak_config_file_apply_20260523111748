@@ -1,0 +1,482 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+from pingora_ai.api_client import plan_gateway
+
+
+CLI_DESCRIPTION = """
+AI Pingora Gateway CLI
+
+Command purpose:
+
+  plan
+    Generates a safe gateway config/plan from natural language using the FastAPI
+    AI planning API. It does not build Docker images and does not deploy.
+
+    Example:
+      pingora-ai plan "create gateway with /api random across 127.0.0.1:9101, 127.0.0.1:9102 and 127.0.0.1:9103"
+
+  apply
+    Creates a new gateway from a full natural-language prompt and deploys it
+    using the local stable engine. It calls FastAPI first, saves the plan/config,
+    then runs main.py.
+
+    Example:
+      pingora-ai apply "create gateway with /api random across 127.0.0.1:9101, 127.0.0.1:9102 and 127.0.0.1:9103"
+
+  update
+    General natural-language update command. It can add, edit, or remove routes
+    based on the prompt. It wraps the existing stable update.py engine.
+
+    Example:
+      pingora-ai update "add /coupons to backend 127.0.0.1:9401"
+      pingora-ai update "set /api algorithm to round_robin"
+      pingora-ai update "remove /coupons"
+
+  add
+    Shortcut for adding one route. This deploys the updated gateway.
+
+    Example:
+      pingora-ai add /coupons 127.0.0.1:9401
+
+  edit
+    Shortcut for editing a route, mainly the load-balancing algorithm.
+    This deploys the updated gateway.
+
+    Example:
+      pingora-ai edit /api --algorithm round_robin
+
+  delete
+    Deletes a route from the active gateway config and live gateway.
+    This is not hide/disable. It removes the route.
+
+    Example:
+      pingora-ai delete /coupons
+
+  remove
+    Alias for delete. Same behaviour as delete.
+    This is not hide/disable. It removes the route.
+
+    Example:
+      pingora-ai remove /coupons
+
+Command table:
+
+  Command   Purpose                                                       Deploys
+  -------   ------------------------------------------------------------  -------
+  plan      Generate config/plan only through FastAPI                     No
+  apply     Create and deploy a new gateway                               Yes
+  update    Natural-language update: add/edit/remove                      Yes
+  add       Add one route shortcut                                        Yes
+  edit      Edit route algorithm shortcut                                 Yes
+  delete    Delete route from config and live gateway                     Yes
+  remove    Alias for delete                                              Yes
+
+Important:
+  remove/delete means the route is removed from config and homepage.
+  It does not mean hide. If hide/disable is needed later, add separate
+  commands such as disable/enable.
+"""
+
+
+def find_project_root() -> Path:
+    env_root = os.environ.get("PINGORA_AI_PROJECT_ROOT")
+
+    candidates: list[Path] = []
+
+    if env_root:
+        candidates.append(Path(env_root).expanduser())
+
+    candidates.append(Path.cwd())
+    candidates.append(Path(__file__).resolve().parents[1])
+
+    for candidate in candidates:
+        candidate = candidate.resolve()
+
+        if (candidate / "main.py").exists() and (candidate / "update.py").exists():
+            return candidate
+
+    raise SystemExit(
+        "Could not find project root. Run from the pingora-generator folder "
+        "or set PINGORA_AI_PROJECT_ROOT."
+    )
+
+
+PROJECT_ROOT = find_project_root()
+
+
+def join_prompt(parts: list[str]) -> str:
+    prompt = " ".join(parts).strip()
+
+    if not prompt:
+        raise SystemExit("Missing prompt text.")
+
+    return prompt
+
+
+def normalize_path(path: str) -> str:
+    value = str(path or "").strip()
+
+    if not value:
+        raise SystemExit("Missing route path.")
+
+    if not value.startswith("/"):
+        value = "/" + value
+
+    return value.rstrip("/") if len(value) > 1 else value
+
+
+def save_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def run_command(command: list[str], cwd: Path) -> int:
+    print()
+    print("Running local engine:")
+    print(" ".join(command))
+    print()
+
+    process = subprocess.run(command, cwd=str(cwd))
+    return process.returncode
+
+
+def looks_like_route_delete(prompt: str) -> bool:
+    text = prompt.lower()
+
+    return bool(
+        re.search(r"\b(remove|delete|drop)\b\s+/[a-zA-Z0-9_\-/.]*", text)
+        or re.search(r"\b(remove|delete|drop)\b\s+route\s+/[a-zA-Z0-9_\-/.]*", text)
+    )
+
+
+def run_update_prompt(
+    prompt: str,
+    runtime: str,
+    strategy: str,
+    verify: str,
+    confirm_route_mutation: bool = False,
+) -> int:
+    update_py = PROJECT_ROOT / "update.py"
+
+    if not update_py.exists():
+        raise SystemExit(f"Cannot find update.py at: {update_py}")
+
+    command = [
+        sys.executable,
+        "update.py",
+        "--runtime",
+        runtime,
+        "--strategy",
+        strategy,
+        "--verify",
+        verify,
+    ]
+
+    if confirm_route_mutation or looks_like_route_delete(prompt):
+        command.append("--confirm-route-mutation")
+
+    command.append(prompt)
+
+    return run_command(command, PROJECT_ROOT)
+
+
+def cmd_plan(args: argparse.Namespace) -> int:
+    prompt = join_prompt(args.prompt)
+
+    response = plan_gateway(
+        prompt=prompt,
+        runtime=args.runtime,
+        strategy=args.strategy,
+        verify=args.verify,
+    )
+
+    output_path = PROJECT_ROOT / "data" / "api_plans" / "latest_plan.json"
+    save_json(output_path, response)
+
+    print(json.dumps(response, indent=2))
+    print()
+    print(f"Saved plan to: {output_path}")
+
+    return 0
+
+
+def cmd_apply(args: argparse.Namespace) -> int:
+    prompt = join_prompt(args.prompt)
+
+    print("Planning gateway through FastAPI...")
+
+    response = plan_gateway(
+        prompt=prompt,
+        runtime=args.runtime,
+        strategy=args.strategy,
+        verify=args.verify,
+    )
+
+    if not response.get("ok"):
+        print(json.dumps(response, indent=2))
+        raise SystemExit("API planning failed.")
+
+    plan_path = PROJECT_ROOT / "data" / "api_plans" / "latest_plan.json"
+    config_path = PROJECT_ROOT / "data" / "api_plans" / "latest_config.json"
+
+    save_json(plan_path, response)
+    save_json(config_path, response["config"])
+
+    print("API plan generated successfully.")
+    print(f"Saved plan to: {plan_path}")
+    print(f"Saved config to: {config_path}")
+
+    main_py = PROJECT_ROOT / "main.py"
+
+    if not main_py.exists():
+        raise SystemExit(f"Cannot find main.py at: {main_py}")
+
+    command = [
+        sys.executable,
+        "main.py",
+        "--runtime",
+        args.runtime,
+        "--strategy",
+        args.strategy,
+        "--verify",
+        args.verify,
+        prompt,
+    ]
+
+    return run_command(command, PROJECT_ROOT)
+
+
+def cmd_update(args: argparse.Namespace) -> int:
+    prompt = join_prompt(args.prompt)
+
+    return run_update_prompt(
+        prompt=prompt,
+        runtime=args.runtime,
+        strategy=args.strategy,
+        verify=args.verify,
+        confirm_route_mutation=args.confirm_route_mutation,
+    )
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    path = normalize_path(args.path)
+    backend = str(args.backend).strip()
+
+    if not backend:
+        raise SystemExit("Missing backend.")
+
+    prompt = f"add {path} to backend {backend}"
+
+    return run_update_prompt(
+        prompt=prompt,
+        runtime=args.runtime,
+        strategy=args.strategy,
+        verify=args.verify,
+        confirm_route_mutation=False,
+    )
+
+
+def cmd_edit(args: argparse.Namespace) -> int:
+    path = normalize_path(args.path)
+    algorithm = args.algorithm.strip()
+
+    valid_algorithms = {
+        "random",
+        "round_robin",
+        "weighted_round_robin",
+        "ip_hash",
+        "least_connections",
+        "single",
+    }
+
+    if algorithm not in valid_algorithms:
+        raise SystemExit(
+            f"Invalid algorithm: {algorithm}. "
+            f"Use one of: {', '.join(sorted(valid_algorithms))}"
+        )
+
+    prompt = f"set {path} algorithm to {algorithm}"
+
+    return run_update_prompt(
+        prompt=prompt,
+        runtime=args.runtime,
+        strategy=args.strategy,
+        verify=args.verify,
+        confirm_route_mutation=False,
+    )
+
+
+def cmd_delete(args: argparse.Namespace) -> int:
+    path = normalize_path(args.path)
+    prompt = f"remove {path}"
+
+    return run_update_prompt(
+        prompt=prompt,
+        runtime=args.runtime,
+        strategy=args.strategy,
+        verify=args.verify,
+        confirm_route_mutation=True,
+    )
+
+
+def add_runtime_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--runtime",
+        default="docker_host",
+        help="Runtime target. Default: docker_host",
+    )
+    parser.add_argument(
+        "--strategy",
+        default="bluegreen",
+        help="Deployment strategy. Default: bluegreen",
+    )
+    parser.add_argument(
+        "--verify",
+        default="full",
+        help="Verification level. Default: full",
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="pingora-ai",
+        description=CLI_DESCRIPTION,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    subcommands = parser.add_subparsers(dest="command", required=True)
+
+    plan_parser = subcommands.add_parser(
+        "plan",
+        help="Generate config/plan only. Does not deploy.",
+        description=(
+            "Generate a safe gateway config/plan from natural language using "
+            "the FastAPI AI planning API. This command does not run Docker "
+            "and does not deploy."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    add_runtime_flags(plan_parser)
+    plan_parser.add_argument("prompt", nargs=argparse.REMAINDER)
+    plan_parser.set_defaults(func=cmd_plan)
+
+    apply_parser = subcommands.add_parser(
+        "apply",
+        help="Create and deploy a new gateway.",
+        description=(
+            "Create a new gateway from a full natural-language prompt and "
+            "deploy it using the local stable engine. This calls FastAPI first, "
+            "saves the plan/config, then runs main.py."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    add_runtime_flags(apply_parser)
+    apply_parser.add_argument("prompt", nargs=argparse.REMAINDER)
+    apply_parser.set_defaults(func=cmd_apply)
+
+    update_parser = subcommands.add_parser(
+        "update",
+        help="Natural-language update: add, edit, or remove.",
+        description=(
+            "General natural-language update command. It can add, edit, or "
+            "remove routes based on the prompt. It wraps the existing stable "
+            "update.py engine."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    add_runtime_flags(update_parser)
+    update_parser.add_argument(
+        "--confirm-route-mutation",
+        action="store_true",
+        help="Confirm dangerous route mutation such as delete/remove.",
+    )
+    update_parser.add_argument("prompt", nargs=argparse.REMAINDER)
+    update_parser.set_defaults(func=cmd_update)
+
+    add_parser = subcommands.add_parser(
+        "add",
+        help="Add one route shortcut.",
+        description=(
+            "Shortcut for adding one route. This deploys the updated gateway.\n\n"
+            "Example:\n"
+            "  pingora-ai add /coupons 127.0.0.1:9401"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    add_runtime_flags(add_parser)
+    add_parser.add_argument("path", help="Route path, for example /coupons")
+    add_parser.add_argument("backend", help="Backend address, for example 127.0.0.1:9401")
+    add_parser.set_defaults(func=cmd_add)
+
+    edit_parser = subcommands.add_parser(
+        "edit",
+        help="Edit route algorithm shortcut.",
+        description=(
+            "Shortcut for editing a route algorithm. This deploys the updated gateway.\n\n"
+            "Valid algorithms:\n"
+            "  random\n"
+            "  round_robin\n"
+            "  weighted_round_robin\n"
+            "  ip_hash\n"
+            "  least_connections\n"
+            "  single\n\n"
+            "Example:\n"
+            "  pingora-ai edit /api --algorithm round_robin"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    add_runtime_flags(edit_parser)
+    edit_parser.add_argument("path", help="Route path, for example /api")
+    edit_parser.add_argument("--algorithm", required=True, help="New route algorithm")
+    edit_parser.set_defaults(func=cmd_edit)
+
+    delete_parser = subcommands.add_parser(
+        "delete",
+        help="Delete a route from config and live gateway.",
+        description=(
+            "Deletes a route from the active gateway config and live gateway.\n"
+            "This is not hide/disable. It removes the route.\n\n"
+            "Example:\n"
+            "  pingora-ai delete /coupons"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    add_runtime_flags(delete_parser)
+    delete_parser.add_argument("path", help="Route path to delete, for example /coupons")
+    delete_parser.set_defaults(func=cmd_delete)
+
+    remove_parser = subcommands.add_parser(
+        "remove",
+        help="Alias for delete. Same behaviour.",
+        description=(
+            "Alias for delete. Same behaviour as delete.\n"
+            "This is not hide/disable. It removes the route from the active "
+            "gateway config and live gateway.\n\n"
+            "Example:\n"
+            "  pingora-ai remove /coupons"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    add_runtime_flags(remove_parser)
+    remove_parser.add_argument("path", help="Route path to remove, for example /coupons")
+    remove_parser.set_defaults(func=cmd_delete)
+
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    raise SystemExit(args.func(args))
+
+
+if __name__ == "__main__":
+    main()

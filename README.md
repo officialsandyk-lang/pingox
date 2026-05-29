@@ -1,0 +1,821 @@
+# AI Pingora Gateway Generator
+
+An experimental AI-powered Pingora application gateway and load balancer generator.
+
+This project turns natural-language infrastructure instructions into a working Rust/Pingora reverse proxy with route generation, local update experiments, security policy enforcement, and optional tracing.
+
+> **Status:** Developer preview. Generated infrastructure should be reviewed before any production use.
+
+---
+
+## Overview
+
+AI Pingora Gateway Generator lets you describe a gateway in natural language:
+
+```bash
+python main.py "create proxy on port 8088 with / to backend 3000, /users to backend 3000, /orders to backend 5000, /billing to backend 6000, /reports to backend 7000, and /admin to backend 8000. Block /private and /internal, only allow GET and POST, set rate limit to 120 requests per minute, max request body to 1048576 bytes, max connections to 1000, and upstream timeout to 30 seconds"
+```
+
+The system generates a Pingora-based application gateway, validates the generated config, writes a Rust/Pingora project, runs checks, and can deploy through the project’s blue/green deployment workflow.
+
+Current product positioning:
+
+> AI-powered Pingora application gateway and load balancer generator.
+
+Long-term direction:
+
+> AI-powered ADN / application delivery platform.
+
+---
+
+## Developer-preview notice
+
+This project is an early developer-preview infrastructure generator.
+
+It is intended for:
+
+- experimentation
+- learning
+- local testing
+- early gateway automation research
+- prototype control-plane workflows
+
+It is **not** production-ready infrastructure yet. Do not use it for critical production traffic without additional hardening, security review, operational testing, rollback validation, observability, and deployment testing.
+
+---
+
+## Current capabilities
+
+- Natural-language gateway creation
+- Natural-language live updates
+- Pingora Rust project generation
+- Route-based reverse proxy / load-balancer style configuration
+- Demo backend HTML page generation
+- Clickable route index at `/`
+- Stable local edge URL, usually `http://127.0.0.1:8088`
+- Blue/green deployment workflow experiments
+- Active/inactive color switching
+- Config repair
+- Runtime repair for generated Pingora/Rust issues
+- Deployment repair classification
+- Security policy extraction
+- Blocked path enforcement
+- Allowed method enforcement
+- Rate limit configuration
+- Max request body configuration
+- Max connection configuration
+- Upstream timeout configuration
+- Safe destructive update handling
+- Duplicate/no-op update summaries
+- Optional LangSmith tracing for agent and LLM visibility
+
+---
+
+## Architecture
+
+The project uses a small AI-assisted control plane to generate, repair, validate, and deploy a Pingora gateway.
+
+```text
+User prompt
+   |
+   v
+main.py / update.py
+   |
+   v
+orchestration graph
+   |
+   +--> prompt-to-config / config update agent
+   +--> config repair agent
+   +--> security agent
+   +--> project writer
+   +--> runtime/debug agent
+   +--> deployment diagnostics
+   +--> blue/green deploy workflow
+   |
+   v
+generated Pingora gateway
+   |
+   v
+http://127.0.0.1:8088
+```
+
+The AI layer helps interpret and repair intent, but generated configuration and infrastructure should always be reviewed before use.
+
+---
+
+## Project structure
+
+```text
+pingora-generator/
+├── agents/
+│   ├── config_repair_agent.py
+│   ├── config_update_agent.py
+│   ├── control_plane_repair_agent.py
+│   ├── debug_agent.py
+│   ├── deployment_repair_agent.py
+│   ├── diagnostic helpers
+│   ├── runtime_agent.py
+│   └── security_agent.py
+├── ai/
+│   └── ai_config.py
+├── core/
+│   ├── bluegreen_deployer.py
+│   ├── compose_writer.py
+│   ├── docker_writer.py
+│   ├── logger.py
+│   ├── preflight.py
+│   ├── project_writer.py
+│   ├── runner.py
+│   ├── safety.py
+│   └── validator.py
+├── orchestration/
+│   ├── graph.py
+│   ├── state.py
+│   └── update_graph.py
+├── scripts/
+├── tests/
+├── main.py
+├── update.py
+├── rollback.py
+├── test_langsmith.py
+├── test_langsmith_client.py
+├── .env.example
+├── .gitignore
+├── LICENSE
+└── README.md
+```
+
+Generated/runtime folders may appear locally:
+
+```text
+generated-pingora-proxy/
+generated-projects/
+backups/
+reports/
+```
+
+These are usually ignored by Git.
+
+---
+
+## Agents
+
+### `config_update_agent.py`
+
+Parses natural-language update prompts and applies route/security changes.
+
+Examples:
+
+```text
+add /inventory to backend 9001
+remove /admin
+block /secret and /debug
+only allow GET and POST
+set rate limit to 90 requests per minute
+```
+
+It also detects duplicate and no-op updates.
+
+Example summary:
+
+```text
+Duplicate route ignored: /inventory already exists -> 127.0.0.1:9001
+Route already absent: /admin
+```
+
+### `config_repair_agent.py`
+
+Repairs invalid or incomplete gateway configs before validation and project generation.
+
+### `security_agent.py`
+
+Extracts and enforces security rules such as:
+
+- blocked paths
+- allowed methods
+- default dangerous blocked paths
+- max request body
+- max connections
+- upstream timeout
+
+### `runtime_agent.py`
+
+Repairs generated Pingora/Rust runtime issues, especially upstream parsing and `HttpPeer` host:port failures.
+
+### `control_plane_repair_agent.py`
+
+Repairs Python orchestration/control-plane issues.
+
+Example:
+
+```text
+update.py expected run_update_flow
+update_graph.py actually has run_update_graph
+```
+
+Instead of crashing, it can introspect the update graph and select the valid entrypoint.
+
+### `deployment_repair_agent.py`
+
+Detects deployment-time problems such as transient Docker registry/network failures.
+
+Example:
+
+```text
+failed to resolve source metadata for docker.io/library/rust:1-bookworm
+```
+
+The diagnostics layer is intended to classify this as an infrastructure/network issue rather than a prompt/config issue.
+
+### `debug_agent.py`
+
+Helps inspect and explain failures during generation or deployment.
+
+### Diagnostic helpers
+
+Contains early reliability-related tracing/check logic for future diagnostic workflows.
+
+---
+
+## Requirements
+
+- Python 3.12+
+- Rust toolchain
+- Docker
+- Docker Compose
+- API key configured through environment variables
+- Optional tracing key configured through environment variables
+
+---
+
+## Setup
+
+Create and activate a virtual environment:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+```
+
+Install required Python packages.
+
+If the project has `requirements.txt`:
+
+```bash
+pip install -r requirements.txt
+```
+
+If not, install the core packages manually:
+
+```bash
+pip install python-dotenv requests langsmith langchain langchain-openai
+```
+
+Create your local `.env` file from the example:
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` and add your own keys.
+
+Do not commit `.env`.
+
+---
+
+## Environment variables
+
+Example `.env.example` values:
+
+```env
+OPENAI_API_KEY=your-openai-api-key-here
+OPENAI_MODEL=gpt-4.1-mini
+
+LANGSMITH_TRACING=true
+LANGSMITH_PROJECT=ai-pingora-generator
+LANGSMITH_ENDPOINT=https://api.smith.langchain.com
+LANGSMITH_API_KEY=your-langsmith-api-key-here
+
+ENABLE_LANGCHAIN_UPDATE_AGENT=true
+```
+
+Your real `.env` should contain real keys:
+
+```env
+OPENAI_API_KEY=your-openai-api-key-here
+LANGSMITH_API_KEY=your-langsmith-api-key-here
+```
+
+Never commit real API keys.
+
+---
+
+## LangSmith notes
+
+This project supports optional LangSmith tracing.
+
+For the default US LangSmith region:
+
+```env
+LANGSMITH_ENDPOINT=https://api.smith.langchain.com
+```
+
+For EU LangSmith, the API key must be created in the EU LangSmith workspace:
+
+```env
+LANGSMITH_ENDPOINT=https://eu.api.smith.langchain.com
+```
+
+A region mismatch can produce:
+
+```text
+403 Forbidden
+```
+
+Test LangSmith auth:
+
+```bash
+python test_langsmith_client.py
+```
+
+Expected result:
+
+```text
+Auth works
+Projects:
+- ai-pingora-generator
+```
+
+When tracing works, LangSmith should show traces such as:
+
+```text
+main_create_gateway_flow
+update_gateway_flow
+config_update_agent
+config_update_agent_langchain_parse
+security_agent_enforce_security
+runtime_agent
+control_plane_repair_agent
+deployment_repair_agent
+```
+
+LangSmith is optional observability for the AI/control-plane layer. The generated gateway should not depend on LangSmith at runtime.
+
+---
+
+## Create a gateway
+
+Run:
+
+```bash
+python main.py "create proxy on port 8088 with / to backend 3000, /users to backend 3000, /orders to backend 5000, /billing to backend 6000, /reports to backend 7000, and /admin to backend 8000. Block /private and /internal, only allow GET and POST, set rate limit to 120 requests per minute, max request body to 1048576 bytes, max connections to 1000, and upstream timeout to 30 seconds"
+```
+
+Expected output includes:
+
+```text
+Project generated successfully
+cargo check passed
+Live URL: http://127.0.0.1:8088
+```
+
+The stable local gateway URL is usually:
+
+```text
+http://127.0.0.1:8088
+```
+
+---
+
+## Test the generated gateway
+
+Test the homepage:
+
+```bash
+curl -i http://127.0.0.1:8088/
+```
+
+Test generated routes:
+
+```bash
+curl -i http://127.0.0.1:8088/users/
+curl -i http://127.0.0.1:8088/orders/
+curl -i http://127.0.0.1:8088/billing/
+curl -i http://127.0.0.1:8088/reports/
+```
+
+Test blocked paths:
+
+```bash
+curl -i http://127.0.0.1:8088/private
+curl -i http://127.0.0.1:8088/internal
+```
+
+Expected:
+
+```text
+403 Forbidden
+```
+
+Test disallowed method:
+
+```bash
+curl -i -X PUT http://127.0.0.1:8088/users/
+```
+
+Expected:
+
+```text
+405 Method Not Allowed
+```
+
+---
+
+## Apply a live update
+
+Example:
+
+```bash
+python update.py "add /inventory to backend 9001, add /payments to backend 9100, add /support to backend 9200, remove /admin, block /secret and /debug, keep /private and /internal blocked, only allow GET and POST, set rate limit to 90 requests per minute, max request body to 524288 bytes, max connections to 750, and upstream timeout to 20 seconds"
+```
+
+Expected summary examples:
+
+```text
+Added route: /inventory -> 127.0.0.1:9001
+Added route: /payments -> 127.0.0.1:9100
+Added route: /support -> 127.0.0.1:9200
+Removed route: /admin
+Security changed
+```
+
+The update flow uses the active blue/green config as the source of truth where available.
+
+---
+
+## Local mode vs Docker blue/green mode
+
+There are two important runtime modes.
+
+### Local mode
+
+In local mode, the Pingora gateway process itself listens on the public port, for example:
+
+```text
+127.0.0.1:8088
+```
+
+If a local gateway is already running, update commands may require stopping and restarting the local process because the port is already in use.
+
+Useful check:
+
+```bash
+ss -ltnp | grep :8088
+```
+
+### Docker blue/green mode
+
+In Docker blue/green mode, the public URL is intended to stay stable while the inactive color is built, checked, and switched after validation.
+
+Rule of thumb:
+
+```text
+Local mode = restart may be required
+Docker blue/green mode = intended zero-downtime update path
+```
+
+---
+
+## Duplicate/no-op update behavior
+
+If a route already exists with the same backend, the update flow should not silently deploy.
+
+Example:
+
+```bash
+python update.py "add /inventory to backend 9001"
+```
+
+Expected if the route already exists:
+
+```text
+Duplicate route ignored: /inventory already exists -> 127.0.0.1:9001
+```
+
+For no-op updates, the system should skip unnecessary generation/build/deployment work.
+
+---
+
+## Remove a route
+
+Safe route removal:
+
+```bash
+python update.py "remove /billing"
+```
+
+If the route exists:
+
+```text
+Removed route: /billing
+```
+
+If the route does not exist:
+
+```text
+Route already absent: /billing
+```
+
+Route removal means the route is removed from gateway config. It does not delete backend data.
+
+---
+
+## Safe destructive command behavior
+
+The system treats destructive words carefully.
+
+This command is blocked by default:
+
+```bash
+python update.py delete analytics
+```
+
+Expected:
+
+```text
+Destructive command detected
+No changes were applied.
+```
+
+To continue, confirm explicitly:
+
+```bash
+python update.py delete analytics --confirm
+```
+
+Expected:
+
+```text
+Safety backup created: backups/destructive-update-...
+Removed route: /analytics
+```
+
+The gateway operation does not delete backend data, but it can stop traffic from reaching a route.
+
+Safer alternatives:
+
+```bash
+python update.py "remove /analytics"
+python update.py "block /analytics"
+```
+
+---
+
+## Blue/green deployment
+
+The gateway keeps a stable public edge URL:
+
+```text
+http://127.0.0.1:8088
+```
+
+Updates are deployed through active/inactive color switching where the Docker blue/green flow is used.
+
+Example output:
+
+```text
+Update deployed with blue/green switching
+Active color: green
+Live URL: http://127.0.0.1:8088
+```
+
+If deployment fails, traffic should not switch.
+
+---
+
+## Deployment repair
+
+Docker registry or network failures are not gateway config failures.
+
+Example failure:
+
+```text
+failed to resolve source metadata for docker.io/library/rust:1-bookworm
+```
+
+This usually means Docker could not fetch the Rust base image.
+
+Manual retry:
+
+```bash
+docker pull rust:1-bookworm
+```
+
+Then rerun the create or update command.
+
+The diagnostics layer is intended to classify these failures and avoid misleading prompt/config suggestions.
+
+---
+
+## Useful development commands
+
+Compile-check Python files:
+
+```bash
+python -m py_compile update.py
+python -m py_compile orchestration/update_graph.py
+python -m py_compile agents/config_update_agent.py
+```
+
+Run tests:
+
+```bash
+pytest -q
+```
+
+Run LangSmith auth test:
+
+```bash
+python test_langsmith_client.py
+```
+
+Run create flow:
+
+```bash
+python main.py "create proxy on port 8088 with / to backend 3000 and /users to backend 3000"
+```
+
+Run update flow:
+
+```bash
+python update.py "add /inventory to backend 9001"
+```
+
+Run duplicate test:
+
+```bash
+python update.py "add /inventory to backend 9001"
+```
+
+Run safe delete test:
+
+```bash
+python update.py delete analytics
+```
+
+Run confirmed delete:
+
+```bash
+python update.py delete analytics --confirm
+```
+
+---
+
+## Git hygiene
+
+Do not commit secrets, local runtime state, generated build artifacts, or logs.
+
+Recommended `.gitignore` entries:
+
+```gitignore
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Rust/build output
+target/
+**/target/
+
+# Generated/runtime gateway output
+generated-projects/
+generated-pingora-proxy/
+
+# Runtime state/config
+active_config.json
+gateway_config.json
+bluegreen_state.json
+gateway_state.json
+.gateway_state.json
+
+# Logs/reports/backups
+logs.jsonl
+*.jsonl
+*.log
+reports/
+backups/
+
+# Temp/save files
+*.save
+
+# IDE/OS
+.idea/
+.vscode/
+.DS_Store
+```
+
+Before publishing or pushing, scan for secrets:
+
+```bash
+grep -R "OPENAI_API_KEY=" . --exclude-dir=.git --exclude-dir=.venv --exclude-dir=target
+grep -R "LANGSMITH_API_KEY=" . --exclude-dir=.git --exclude-dir=.venv --exclude-dir=target
+grep -R "GITHUB_TOKEN\|GITHUB_PAT" . --exclude-dir=.git --exclude-dir=.venv --exclude-dir=target
+```
+
+Safe files to commit:
+
+```text
+README.md
+.env.example
+.gitignore
+LICENSE
+main.py
+update.py
+rollback.py
+agents/
+ai/
+core/
+orchestration/
+scripts/
+tests/
+test_langsmith.py
+test_langsmith_client.py
+```
+
+Do not commit:
+
+```text
+.env
+.venv/
+active_config.json
+gateway_config.json
+logs.jsonl
+generated-projects/
+generated-pingora-proxy/
+backups/
+reports/
+```
+
+---
+
+## Publishing status
+
+This repository is public as a developer-preview project.
+
+It is shared for experimentation, learning, and early feedback. It should not be treated as production-ready infrastructure yet.
+
+---
+
+## Known limitations
+
+- This is not production-ready infrastructure.
+- Generated code and configs should be reviewed before use.
+- Local mode updates may require restarting the local gateway process.
+- Docker blue/green mode is the intended path for zero-downtime update experiments.
+- Docker builds may fail because of transient Docker Hub/network issues.
+- LangSmith keys must match the correct LangSmith region.
+- Current demo backends are for local testing only.
+- Advanced active health checks, retries, circuit breakers, weighted routing, WAF rules, and full ADN features are future work.
+- The AI update flow should be reviewed before applying to critical systems.
+
+---
+
+## Roadmap
+
+Planned direction:
+
+- Health checks
+- Retry policies
+- Circuit breakers
+- Weighted routing
+- Canary deployment
+- Rollback command hardening
+- Policy diff preview
+- Config validation report
+- Better deployment diagnostics
+- Richer LangSmith traces
+- UI control plane
+- API control plane
+- ADN/application delivery platform features
+
+---
+
+## Safety disclaimer
+
+This project uses AI to generate and update infrastructure code.
+
+Always review generated configs and code before using them in production environments. Do not commit secrets, production credentials, or private infrastructure configs.
+
+---
+
+## License
+
+This project is licensed under the Apache License 2.0.
+
+See [LICENSE](./LICENSE) for details.

@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_DIR="/mnt/c/Users/offic/dev/pingora-generator"
+LOCK_FILE="$PROJECT_DIR/tmp/auto_monitor_heal.lock"
+START_CONFIG="$PROJECT_DIR/tmp/full_acceptance_start_config.json"
+
+cd "$PROJECT_DIR"
+source .venv/bin/activate
+
+mkdir -p "$PROJECT_DIR/tmp"
+
+exec 9>"$LOCK_FILE"
+
+if ! flock -n 9; then
+  echo "❌ Another monitor/healing run is active. Try again later."
+  exit 1
+fi
+
+echo ""
+echo "================================================================================"
+echo "🧪 AI Pingora Docker full acceptance gate"
+echo "================================================================================"
+
+echo ""
+echo "1) Saving starting config..."
+cp generated-pingora-proxy/config.json "$START_CONFIG"
+
+echo ""
+echo "2) Checking agent architecture..."
+python tools/check_agent_architecture.py
+
+echo ""
+echo "3) Checking algorithm integrity..."
+python tools/algorithm_integrity.py check
+
+echo ""
+echo "4) Running baseline Docker production gate..."
+python prod_check.py --level full --environment docker_local --stress-requests-per-route 20
+
+echo ""
+echo "5) Testing ADD route..."
+python update.py --runtime docker_host --strategy bluegreen --verify full \
+  "add /e2eadd to backend 127.0.0.1:9401"
+
+curl -fsS http://127.0.0.1:8090/e2eadd/ | grep "9401" >/dev/null
+echo "✅ add route passed"
+
+echo ""
+echo "6) Testing EDIT algorithm on /users and restoring it..."
+
+ORIGINAL_USERS_ALGO="$(python - <<'PY'
+import json
+config=json.load(open("generated-pingora-proxy/config.json"))
+for r in config["routes"]:
+    if r.get("path")=="/users":
+        print(r.get("balancing") or "single")
+        break
+PY
+)"
+
+if [ "$ORIGINAL_USERS_ALGO" = "random" ]; then
+  TEMP_USERS_ALGO="round robin"
+  TEMP_EXPECTED="round_robin"
+else
+  TEMP_USERS_ALGO="random"
+  TEMP_EXPECTED="random"
+fi
+
+python update.py --runtime docker_host --strategy bluegreen --verify full \
+  "set /users algorithm to $TEMP_USERS_ALGO"
+
+python - <<PY
+import json, sys
+config=json.load(open("generated-pingora-proxy/config.json"))
+expected="$TEMP_EXPECTED"
+for r in config["routes"]:
+    if r.get("path")=="/users":
+        actual=r.get("balancing")
+        print("/users after edit:", actual)
+        if actual != expected:
+            raise SystemExit(f"Expected /users {expected}, got {actual}")
+PY
+
+python update.py --runtime docker_host --strategy bluegreen --verify full \
+  "set /users algorithm to $ORIGINAL_USERS_ALGO"
+
+python - <<PY
+import json, sys
+config=json.load(open("generated-pingora-proxy/config.json"))
+expected="$ORIGINAL_USERS_ALGO"
+for r in config["routes"]:
+    if r.get("path")=="/users":
+        actual=r.get("balancing")
+        print("/users restored:", actual)
+        if actual != expected:
+            raise SystemExit(f"Expected /users restored to {expected}, got {actual}")
+PY
+
+echo "✅ edit algorithm and restore passed"
+
+echo ""
+echo "7) Testing REMOVE route synonym..."
+python update.py --runtime docker_host --strategy bluegreen --verify full \
+  "add /e2eremove to backend 127.0.0.1:9401"
+
+python update.py --runtime docker_host --strategy bluegreen --verify full \
+  --confirm-route-mutation \
+  "remove /e2eremove"
+
+if curl -fsS http://127.0.0.1:8090/ | grep "/e2eremove" >/dev/null; then
+  echo "❌ /e2eremove still appears on homepage"
+  exit 1
+fi
+
+echo "✅ remove route passed"
+
+echo ""
+echo "8) Testing DELETE route..."
+python update.py --runtime docker_host --strategy bluegreen --verify full \
+  --confirm-route-mutation \
+  "delete /e2eadd"
+
+if curl -fsS http://127.0.0.1:8090/ | grep "/e2eadd" >/dev/null; then
+  echo "❌ /e2eadd still appears on homepage"
+  exit 1
+fi
+
+echo "✅ delete route passed"
+
+echo ""
+echo "9) Testing ROLLBACK restore from saved config..."
+
+python update.py --runtime docker_host --strategy bluegreen --verify full \
+  "add /e2erollback to backend 127.0.0.1:9401"
+
+curl -fsS http://127.0.0.1:8090/e2erollback/ | grep "9401" >/dev/null
+
+python - <<'PY'
+import json
+from pathlib import Path
+
+from core.environment_deployer import (
+    apply_profiles,
+    start_docker_bluegreen,
+    verify_deployment,
+    write_project_from_config,
+)
+
+project = Path("/mnt/c/Users/offic/dev/pingora-generator")
+start_config = project / "tmp" / "full_acceptance_start_config.json"
+
+config = json.loads(start_config.read_text(encoding="utf-8"))
+
+fixed = apply_profiles(
+    config,
+    runtime_mode="docker_host",
+    strategy="bluegreen",
+)
+
+write_project_from_config(fixed)
+deploy = start_docker_bluegreen(fixed)
+
+verification = verify_deployment(
+    fixed,
+    live_url=deploy["live_url"],
+    level="full",
+)
+
+print("Rollback verification success:", verification.get("success"))
+
+if not verification.get("success"):
+    raise SystemExit(1)
+PY
+
+if curl -fsS http://127.0.0.1:8090/ | grep "/e2erollback" >/dev/null; then
+  echo "❌ rollback failed: /e2erollback still appears"
+  exit 1
+fi
+
+echo "✅ rollback restore passed"
+
+echo ""
+echo "10) Running final algorithm integrity check..."
+python tools/algorithm_integrity.py check
+
+echo ""
+echo "11) Running final Docker production gate..."
+python prod_check.py --level full --environment docker_local --stress-requests-per-route 50
+
+echo ""
+echo "12) Testing Docker self-healing..."
+./scripts/stop_docker_bluegreen.sh
+
+python heal.py --verify full
+
+python - <<'PY'
+import sqlite3
+from pathlib import Path
+
+db = Path("data/reliability_reports.sqlite3")
+conn = sqlite3.connect(db)
+conn.row_factory = sqlite3.Row
+
+row = conn.execute("""
+    SELECT id, created_at_utc, runtime, strategy, root_cause, action, success
+    FROM docker_self_healing_runs
+    ORDER BY id DESC
+    LIMIT 1
+""").fetchone()
+
+if not row:
+    raise SystemExit("No docker_self_healing_runs row found")
+
+print(dict(row))
+
+if int(row["success"]) != 1:
+    raise SystemExit("Latest Docker healing run did not store success=1")
+PY
+
+echo ""
+echo "13) Running final post-healing production gate..."
+python prod_check.py --level full --environment docker_local --stress-requests-per-route 50
+
+echo ""
+echo "================================================================================"
+echo "✅ ALL AI PINGORA DOCKER ACCEPTANCE TESTS PASSED"
+echo "================================================================================"
