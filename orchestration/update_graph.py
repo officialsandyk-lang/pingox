@@ -203,7 +203,7 @@ def _write_json(path: Path, data: dict[str, Any]) -> None:
 
 
 def _utc_now_slug() -> str:
-    return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    return datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
 
 
 def _normalize_path(path: Any) -> str:

@@ -23,7 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 
 def utc_stamp() -> str:
-    return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    return datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
 
 
 def run_command(
@@ -456,7 +456,7 @@ def rollback_bluegreen_current(backup_path: str | None = None, verify: str = "fu
 
     safety_dir = backups_dir / (
         "rollback-current-before-bluegreen-"
-        + datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        + datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     )
 
     if current_project.exists():
