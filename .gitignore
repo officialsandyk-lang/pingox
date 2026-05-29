@@ -2,19 +2,30 @@
 .venv/
 __pycache__/
 *.pyc
+.DS_Store
 
-target/
+# IDE/local
+.idea/
+*.egg-info/
+
+# Generated/runtime output
 generated-pingora-proxy/
 generated-projects/
 docker-bluegreen/
+target/
 
+# Runtime state/logs/backups
 tmp/
 logs/
 *.log
-
-data/update_backups/
-data/api_plans/
-data/*.sqlite3
+logs.jsonl
+bluegreen_deployer_entered.txt
+active_config.json
+gateway_config.json
+data/
 *.sqlite3
 
-.DS_Store
+# Patch/temp backups
+*.bak
+*.bak*
+*.save
