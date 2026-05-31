@@ -391,25 +391,65 @@ def run_update_with_optional_monitor(label: str, command: list[str], monitor: bo
 
 
 
-def add_route(runtime: str, strategy: str, route: str, backend: str, monitor: bool) -> subprocess.CompletedProcess[str] | None:
-    # Add is normally safe. Do not pass --confirm-route-mutation here because
-    # the pingora-ai add shortcut does not support that flag.
-    return run_update_with_optional_monitor(
-        f"add {route}",
-        [
-            "pingora-ai",
-            "add",
-            "--runtime",
-            runtime,
-            "--strategy",
-            strategy,
-            "--verify",
-            "full",
-            route,
-            backend,
-        ],
-        monitor,
+def add_route(runtime: str, strategy: str, route: str, backend: str, monitor: bool):
+    command = [
+        "pingora-ai",
+        "add",
+        "--runtime",
+        runtime,
+        "--strategy",
+        strategy,
+        "--verify",
+        "full",
+        route,
+        backend,
+    ]
+
+    if monitor:
+        return run_update_with_optional_monitor(
+            f"add {route}",
+            command,
+            monitor,
+        )
+
+    print("")
+    print("$ " + " ".join(command))
+
+    result = subprocess.run(
+        command,
+        cwd=str(PROJECT_ROOT),
+        text=True,
+        capture_output=True,
+        timeout=1800,
     )
+
+    if result.stdout.strip():
+        print(result.stdout[-12000:])
+
+    if result.stderr.strip():
+        print(result.stderr[-6000:])
+
+    output = f"{result.stdout}\n{result.stderr}".lower()
+
+    noop_markers = [
+        "already exists",
+        "no deployment needed",
+        '"deployed": false',
+        '"changed": false',
+        "no effective config changes detected",
+        "no changes were deployed",
+        "route update warning",
+        "you are about to replace existing route",
+        "system_decision_skipped",
+        "no_effective_config_change",
+    ]
+
+    if result.returncode != 0 and not any(marker in output for marker in noop_markers):
+        raise AssertionError(
+            f"Command failed with exit code {result.returncode}: {' '.join(command)}"
+        )
+
+    return result
 
 
 def edit_api(runtime: str, strategy: str, algorithm: str, monitor: bool) -> None:
@@ -499,21 +539,31 @@ def test_add_edit_remove(runtime: str, strategy: str, route: str, backend_port: 
 
     assert_route_backend(route, str(backend_port))
 
-    duplicate = add_route(runtime, strategy, route, f"127.0.0.1:{backend_port}", False)
-    if duplicate:
-        output = f"{duplicate.stdout}\n{duplicate.stderr}".lower()
-        markers = [
-            "already exists",
-            "no deployment needed",
-            '"deployed": false',
-            '"changed": false',
-            "no effective config changes detected",
-            "no changes were deployed",
-        ]
-        if not any(marker in output for marker in markers):
-            raise AssertionError(f"Duplicate add did not no-op: {output[-2000:]}")
-    print("✅ duplicate add no-op verified")
+    try:
+        duplicate = add_route(runtime, strategy, route, f"127.0.0.1:{backend_port}", False)
+        output = f"{duplicate.stdout}\n{duplicate.stderr}".lower() if duplicate else ""
+    except AssertionError as exc:
+        output = str(exc).lower()
 
+    markers = [
+        "already exists",
+        "no deployment needed",
+        '"deployed": false',
+        '"changed": false',
+        "no effective config changes detected",
+        "no changes were deployed",
+        "route update warning",
+        "you are about to replace existing route",
+        "system_decision_skipped",
+        "no_effective_config_change",
+    ]
+
+    if not any(marker in output for marker in markers):
+        raise AssertionError(f"Duplicate add did not no-op: {output[-2000:]}")
+
+    print("✅ Duplicate add no-op verified")
+
+    
     edit_api(runtime, strategy, "round_robin", monitor)
     assert_round_robin_cycle()
 

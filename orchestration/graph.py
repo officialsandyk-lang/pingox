@@ -1253,3 +1253,114 @@ def run_graph(
             "error": str(exc),
             "failed_node": initial_state.get("last_node"),
         }
+
+# ---------------------------------------------------------------------------
+# Deterministic decision-engine wrapper
+# This wraps run_graph so every LangGraph flow passes through deterministic
+# decision + security contract gates before returning/deploying config.
+# ---------------------------------------------------------------------------
+if not globals().get("_DECISION_ENGINE_RUN_GRAPH_WRAPPED"):
+    _DECISION_ENGINE_RUN_GRAPH_WRAPPED = True
+
+    _original_run_graph_for_decision_engine = run_graph
+
+    from orchestration.decision_node import run_decision_node as _run_decision_node
+    from orchestration.security_contract_node import run_security_contract_node as _run_security_contract_node
+    from orchestration.root_cause_learning_node import run_root_cause_learning_node as _run_root_cause_learning_node
+
+    def _extract_state_from_graph_result(result):
+        if isinstance(result, dict):
+            return dict(result)
+
+        if hasattr(result, "dict"):
+            try:
+                return dict(result.dict())
+            except Exception:
+                pass
+
+        return {"result": result}
+
+    def run_graph(*args, **kwargs):
+        result = _original_run_graph_for_decision_engine(*args, **kwargs)
+
+        state = _extract_state_from_graph_result(result)
+
+        # Some graph versions return config directly; normalize into state.
+        if "config" not in state and "routes" in state:
+            state = {"config": state, "gateway_config": state}
+
+        if "config" in state or "gateway_config" in state:
+            state = _run_decision_node(state)
+
+            if state.get("decision_failed"):
+                state = _run_root_cause_learning_node(state)
+                return state
+
+            state = _run_security_contract_node(state)
+
+            if state.get("security_contract_failed"):
+                state = _run_root_cause_learning_node(state)
+                return state
+
+            return state
+
+        return result
+
+
+# ---------------------------------------------------------------------------
+# System decision-engine LangGraph wrapper
+# ---------------------------------------------------------------------------
+if not globals().get("_SYSTEM_DECISION_ENGINE_RUN_GRAPH_WRAPPED"):
+    _SYSTEM_DECISION_ENGINE_RUN_GRAPH_WRAPPED = True
+
+    _original_run_graph_for_system_decision = run_graph
+
+    from core.system_decision_engine import apply_and_enforce_system_decisions
+
+    def _system_decision_extract_state(result):
+        if isinstance(result, dict):
+            return dict(result)
+
+        if hasattr(result, "dict"):
+            try:
+                return dict(result.dict())
+            except Exception:
+                pass
+
+        return {"result": result}
+
+    def run_graph(*args, **kwargs):
+        result = _original_run_graph_for_system_decision(*args, **kwargs)
+        state = _system_decision_extract_state(result)
+
+        prompt = None
+        if args:
+            prompt = str(args[0])
+        prompt = kwargs.get("prompt") or prompt
+
+        config = state.get("config") or state.get("gateway_config")
+
+        # Some graph versions return raw config directly.
+        if config is None and "routes" in state:
+            config = state
+
+        if isinstance(config, dict):
+            try:
+                fixed = apply_and_enforce_system_decisions(
+                    config,
+                    prompt=prompt,
+                    strict_security=False,
+                    allow_repair=True,
+                )
+                state["config"] = fixed
+                state["gateway_config"] = fixed
+                state["system_decision_result"] = fixed.get("_system_decision_result")
+                state["system_decision_failed"] = False
+            except Exception as exc:
+                state["error"] = str(exc)
+                state["system_decision_failed"] = True
+                state["next_action"] = "repair_config"
+
+            return state
+
+        return result

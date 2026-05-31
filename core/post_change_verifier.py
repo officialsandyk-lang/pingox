@@ -1152,3 +1152,97 @@ if __name__ == "__main__":
 
     if not result.get("success"):
         raise SystemExit(1)
+
+
+# ---------------------------------------------------------------------------
+# Security policy contract verifier wrapper
+# ---------------------------------------------------------------------------
+if not globals().get("_SECURITY_POLICY_CONTRACT_VERIFIER_WRAPPED"):
+    _SECURITY_POLICY_CONTRACT_VERIFIER_WRAPPED = True
+
+    import inspect as _security_contract_inspect
+    import json as _security_contract_json
+    from pathlib import Path as _SecurityContractPath
+    from core.security_policy_contract import verify_security_policy_contract as _verify_security_policy_contract
+
+    _original_verify_after_change = verify_after_change
+
+    def verify_after_change(*args, **kwargs):
+        signature = _security_contract_inspect.signature(_original_verify_after_change)
+        bound = signature.bind_partial(*args, **kwargs)
+
+        result = _original_verify_after_change(*args, **kwargs)
+
+        if not isinstance(result, dict):
+            return result
+
+        config = bound.arguments.get("config") or kwargs.get("config")
+
+        if not isinstance(config, dict):
+            config_path = (
+                bound.arguments.get("config_path")
+                or kwargs.get("config_path")
+                or "generated-pingora-proxy/config.json"
+            )
+            try:
+                config = _security_contract_json.loads(
+                    _SecurityContractPath(config_path).read_text(encoding="utf-8")
+                )
+            except Exception:
+                config = None
+
+        if not isinstance(config, dict):
+            return result
+
+        level = str(bound.arguments.get("level") or kwargs.get("level") or "").lower()
+        environment = str(
+            bound.arguments.get("environment")
+            or kwargs.get("environment")
+            or config.get("runtime")
+            or config.get("runtime_mode")
+            or ""
+        ).lower()
+
+        strict = level == "production" or environment == "production"
+
+        try:
+            from core.security_policy_contract import apply_security_policy_contract as _apply_security_policy_contract_for_verify
+
+            environment_for_contract = (
+                config.get("runtime")
+                or config.get("runtime_mode")
+                or environment
+                or "local"
+            )
+
+            config = _apply_security_policy_contract_for_verify(
+                config,
+                environment=str(environment_for_contract),
+            )
+        except Exception:
+            pass
+
+        contract = _verify_security_policy_contract(config, strict=strict)
+
+        checks = result.setdefault("checks", [])
+
+        for check in contract["checks"]:
+            checks.append(
+                {
+                    "name": "security contract: " + check["name"],
+                    "ok": check["ok"],
+                    **{k: v for k, v in check.items() if k not in {"name", "ok"}},
+                }
+            )
+
+        if not contract["ok"]:
+            result["success"] = False
+            result["failed_checks"] = result.get("failed_checks", []) + [
+                {
+                    "name": "security policy contract",
+                    "ok": False,
+                    "failed_checks": contract["failed_checks"],
+                }
+            ]
+
+        return result

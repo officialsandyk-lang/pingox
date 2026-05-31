@@ -2401,3 +2401,126 @@ if __name__ == "__main__":
 
     output = run_update_graph(prompt)
     print(json.dumps(output, indent=2, default=str))
+
+
+# ---------------------------------------------------------------------------
+# System decision-engine update wrapper v2
+# Handles duplicate-add no-op safely and re-applies security contract before
+# returning update configs.
+# ---------------------------------------------------------------------------
+if not globals().get("_SYSTEM_DECISION_ENGINE_UPDATE_GRAPH_WRAPPED_V2"):
+    _SYSTEM_DECISION_ENGINE_UPDATE_GRAPH_WRAPPED_V2 = True
+
+    from core.security_policy_contract import apply_security_policy_contract as _system_apply_security_contract_v2
+    from core.system_decision_engine import apply_and_enforce_system_decisions as _system_apply_decisions_v2
+
+    _previous_run_update_graph_for_system_decision_v2 = run_update_graph
+
+    def _system_decision_prompt_from_args_v2(*args, **kwargs):
+        for value in args:
+            if isinstance(value, str):
+                return value
+        for key in ("prompt", "update_prompt", "command"):
+            if kwargs.get(key):
+                return str(kwargs[key])
+        return None
+
+    def _system_decision_result_text_v2(result: dict) -> str:
+        parts = []
+
+        for key in (
+            "summary",
+            "message",
+            "warning",
+            "error",
+            "status",
+            "action",
+            "notes",
+            "deployment_status",
+        ):
+            value = result.get(key)
+            if value is not None:
+                parts.append(str(value))
+
+        for key in ("warnings", "messages", "events", "changes", "update_summary"):
+            value = result.get(key)
+            if value is not None:
+                parts.append(str(value))
+
+        return "\\n".join(parts).lower()
+
+    def _system_decision_is_noop_update_v2(result: dict) -> bool:
+        text = _system_decision_result_text_v2(result)
+
+        if result.get("changed") is False:
+            return True
+
+        if result.get("deployed") is False and (
+            "no effective config changes" in text
+            or "no changes were deployed" in text
+            or "already exists" in text
+            or "duplicate" in text
+        ):
+            return True
+
+        markers = [
+            "no effective config changes detected",
+            "no changes were deployed",
+            "already exists",
+            "duplicate add",
+            "no deployment needed",
+        ]
+
+        return any(marker in text for marker in markers)
+
+    def _system_decision_extract_config_v2(result: dict):
+        for key in ("config", "updated_config", "gateway_config", "final_config", "active_config"):
+            value = result.get(key)
+            if isinstance(value, dict):
+                return key, value
+        return None, None
+
+    def run_update_graph(*args, **kwargs):
+        result = _previous_run_update_graph_for_system_decision_v2(*args, **kwargs)
+
+        if not isinstance(result, dict):
+            return result
+
+        # Duplicate add/no-op should not be treated as a failed decision-engine config.
+        if _system_decision_is_noop_update_v2(result):
+            result["system_decision_skipped"] = True
+            result["system_decision_skip_reason"] = "no_effective_config_change"
+            result.setdefault("changed", False)
+            result.setdefault("deployed", False)
+            return result
+
+        prompt = _system_decision_prompt_from_args_v2(*args, **kwargs)
+
+        key, config = _system_decision_extract_config_v2(result)
+
+        if isinstance(config, dict):
+            runtime = (
+                config.get("runtime")
+                or config.get("runtime_mode")
+                or kwargs.get("runtime")
+                or kwargs.get("runtime_mode")
+                or "local"
+            )
+
+            secured = _system_apply_security_contract_v2(config, environment=str(runtime))
+
+            fixed = _system_apply_decisions_v2(
+                secured,
+                prompt=prompt,
+                strict_security=False,
+                allow_repair=True,
+            )
+
+            result[key] = fixed
+            result["config"] = fixed
+            result["updated_config"] = fixed
+            result["gateway_config"] = fixed
+            result["system_decision_result"] = fixed.get("_system_decision_result")
+            result["system_decision_skipped"] = False
+
+        return result

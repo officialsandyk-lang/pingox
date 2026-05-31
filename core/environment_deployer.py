@@ -1141,6 +1141,12 @@ def deploy_docker_bluegreen_from_config(
     local AI planning layer. It only prepares, writes, deploys, and verifies the
     supplied JSON config.
     """
+    config = _system_decision_preflight_or_raise(config, runtime="docker_host")
+
+    config = _decision_engine_preflight_or_raise(config, runtime="docker_host")
+    from core.security_policy_contract import apply_security_policy_contract as _apply_security_policy_contract_runtime
+    config = _apply_security_policy_contract_runtime(config, environment="docker_host")
+
     require_docker()
 
     backup = create_backup(reason=backup_reason)
@@ -1583,6 +1589,75 @@ def _apply_local_config_file_security_defaults(config: dict) -> dict:
 
     return config
 
+
+def _decision_engine_preflight_or_raise(config: dict, runtime: str) -> dict:
+    """
+    Hard deterministic preflight before project generation/deploy.
+
+    Important:
+    - Weighted route corruption must fail before repair/deploy.
+    - Safe repairs such as root static route and runtime addressing happen only
+      after hard algorithm checks pass.
+    """
+    from core.decision_engine import (
+        apply_deterministic_repairs,
+        evaluate_config,
+    )
+
+    if not isinstance(config, dict):
+        raise RuntimeError("Decision engine rejected deployment config: config must be a dictionary")
+
+    raw_decision = evaluate_config(config)
+    raw_failed = raw_decision.get("failed_decisions", [])
+
+    hard_fail_categories = {
+        "weighted_round_robin_integrity",
+    }
+
+    hard_failed = [
+        item for item in raw_failed
+        if item.get("category") in hard_fail_categories
+    ]
+
+    if hard_failed:
+        reason = "; ".join(item.get("reason", "unknown") for item in hard_failed)
+        raise RuntimeError(
+            "Decision engine rejected deployment config before project generation: "
+            + reason
+        )
+
+    repaired = apply_deterministic_repairs(config, runtime=str(runtime))
+    decision = evaluate_config(repaired)
+
+    if not decision.get("ok"):
+        failed = decision.get("failed_decisions", [])
+        reason = "; ".join(item.get("reason", "unknown") for item in failed)
+        raise RuntimeError("Decision engine rejected deployment config: " + reason)
+
+    return repaired
+
+
+def _system_decision_preflight_or_raise(config: dict, runtime: str, prompt: str | None = None) -> dict:
+    """
+    Deterministic system-level preflight before project generation/deploy.
+
+    This covers:
+    - runtime/strategy
+    - route shape
+    - algorithms
+    - health-check policy
+    - addressing
+    - mutation safety when prompt is supplied
+    """
+    from core.system_decision_engine import apply_and_enforce_system_decisions
+
+    return apply_and_enforce_system_decisions(
+        config,
+        prompt=prompt,
+        strict_security=False,
+        allow_repair=True,
+    )
+
 def deploy_local_direct_from_config(config: dict, verify: str = "full") -> dict:
     """
     Config-file deployment for local/direct runtime.
@@ -1593,6 +1668,12 @@ def deploy_local_direct_from_config(config: dict, verify: str = "full") -> dict:
     Important difference:
     local mode rewrites host.docker.internal back to 127.0.0.1.
     """
+    config = _system_decision_preflight_or_raise(config, runtime="local")
+
+    config = _decision_engine_preflight_or_raise(config, runtime="local")
+    from core.security_policy_contract import apply_security_policy_contract as _apply_security_policy_contract_runtime
+    config = _apply_security_policy_contract_runtime(config, environment="local")
+
     from pathlib import Path
 
     prepared = _prepare_local_direct_config_file(config)
@@ -1710,3 +1791,100 @@ def deploy_for_environment(
         f"runtime_mode={runtime_mode}, strategy={strategy}. "
         "Supported now: docker_host + bluegreen."
     )
+
+
+# ---------------------------------------------------------------------------
+# Security policy contract wrapper
+# ---------------------------------------------------------------------------
+if not globals().get("_SECURITY_POLICY_CONTRACT_ENV_DEPLOYER_WRAPPED"):
+    _SECURITY_POLICY_CONTRACT_ENV_DEPLOYER_WRAPPED = True
+
+    import inspect as _security_contract_inspect
+    from core.security_policy_contract import apply_security_policy_contract as _apply_security_policy_contract
+
+    _original_deploy_config_for_environment = deploy_config_for_environment
+
+    def deploy_config_for_environment(*args, **kwargs):
+        signature = _security_contract_inspect.signature(_original_deploy_config_for_environment)
+        bound = signature.bind_partial(*args, **kwargs)
+
+        config = bound.arguments.get("config")
+        runtime_mode = (
+            bound.arguments.get("runtime_mode")
+            or bound.arguments.get("runtime")
+            or bound.arguments.get("runtime_name")
+            or kwargs.get("runtime_mode")
+            or kwargs.get("runtime")
+            or "local"
+        )
+
+        if isinstance(config, dict):
+            bound.arguments["config"] = _apply_security_policy_contract(
+                config,
+                environment=str(runtime_mode),
+            )
+
+        return _original_deploy_config_for_environment(*bound.args, **bound.kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Deterministic decision-engine deploy wrapper
+# ---------------------------------------------------------------------------
+if not globals().get("_DECISION_ENGINE_ENV_DEPLOYER_WRAPPED"):
+    _DECISION_ENGINE_ENV_DEPLOYER_WRAPPED = True
+
+    import inspect as _decision_engine_inspect
+    from core.decision_engine import (
+        apply_deterministic_repairs as _decision_apply_repairs,
+        evaluate_config as _decision_evaluate_config,
+    )
+
+    _original_deploy_config_for_environment_for_decision = deploy_config_for_environment
+
+    def deploy_config_for_environment(*args, **kwargs):
+        signature = _decision_engine_inspect.signature(_original_deploy_config_for_environment_for_decision)
+        bound = signature.bind_partial(*args, **kwargs)
+
+        config = bound.arguments.get("config")
+
+        runtime = (
+            bound.arguments.get("runtime_mode")
+            or bound.arguments.get("runtime")
+            or kwargs.get("runtime_mode")
+            or kwargs.get("runtime")
+            or (config or {}).get("runtime")
+            or (config or {}).get("runtime_mode")
+            or "local"
+        )
+
+        if isinstance(config, dict):
+            # First evaluate raw config so dangerous algorithm corruption is not hidden
+            # by deterministic repair. Root/static and addressing can be repaired, but
+            # malformed weighted routes must be rejected before deployment.
+            pre_decision = _decision_evaluate_config(config)
+            pre_failed = pre_decision.get("failed_decisions", [])
+
+            hard_fail_categories = {
+                "weighted_round_robin_integrity",
+            }
+
+            hard_failed = [
+                item for item in pre_failed
+                if item.get("category") in hard_fail_categories
+            ]
+
+            if hard_failed:
+                reason = "; ".join(item.get("reason", "unknown") for item in hard_failed)
+                raise RuntimeError("Decision engine rejected deployment config before repair: " + reason)
+
+            repaired = _decision_apply_repairs(config, runtime=str(runtime))
+            decision = _decision_evaluate_config(repaired)
+
+            if not decision.get("ok"):
+                failed = decision.get("failed_decisions", [])
+                reason = "; ".join(item.get("reason", "unknown") for item in failed)
+                raise RuntimeError("Decision engine rejected deployment config: " + reason)
+
+            bound.arguments["config"] = repaired
+
+        return _original_deploy_config_for_environment_for_decision(*bound.args, **bound.kwargs)

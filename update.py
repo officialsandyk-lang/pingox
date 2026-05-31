@@ -968,3 +968,17 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# ---------------------------------------------------------------------------
+# System decision-engine helper for update CLI
+# ---------------------------------------------------------------------------
+def _system_decision_validate_update_config(config: dict, prompt: str | None = None) -> dict:
+    from core.system_decision_engine import apply_and_enforce_system_decisions
+
+    return apply_and_enforce_system_decisions(
+        config,
+        prompt=prompt,
+        strict_security=False,
+        allow_repair=True,
+    )

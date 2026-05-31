@@ -230,5 +230,98 @@ def main() -> int:
     return 1
 
 
+
+
+# ---------------------------------------------------------------------------
+# Security contract production gate wrapper
+# ---------------------------------------------------------------------------
+if not globals().get("_SECURITY_POLICY_CONTRACT_PROD_CHECK_WRAPPED"):
+    _SECURITY_POLICY_CONTRACT_PROD_CHECK_WRAPPED = True
+
+    import sys as _security_contract_sys
+    from pathlib import Path as _SecurityContractPath
+    from core.security_policy_contract import (
+        load_config as _security_contract_load_config,
+        verify_security_policy_contract as _security_contract_verify,
+    )
+
+    _original_prod_check_main = main
+
+    def main():
+        original_result = _original_prod_check_main()
+
+        config_path = _SecurityContractPath("generated-pingora-proxy/config.json")
+
+        if not config_path.exists():
+            print("⚠️ Security contract check skipped: generated config not found.")
+            return original_result
+
+        strict = "production" in " ".join(_security_contract_sys.argv).lower()
+
+        config = _security_contract_load_config(config_path)
+        result = _security_contract_verify(config, strict=strict)
+
+        print("")
+        print("🔐 Security policy contract gate")
+        print(f"Strict mode: {strict}")
+        print(f"Success: {result['ok']}")
+
+        for check in result["checks"]:
+            icon = "✅" if check["ok"] else "❌"
+            print(f"{icon} {check['name']}")
+
+        if not result["ok"]:
+            return 1
+
+        return original_result
+
+
+
+# ---------------------------------------------------------------------------
+# System decision-engine production-readiness gate
+# ---------------------------------------------------------------------------
+if not globals().get("_SYSTEM_DECISION_ENGINE_PROD_CHECK_WRAPPED"):
+    _SYSTEM_DECISION_ENGINE_PROD_CHECK_WRAPPED = True
+
+    import json as _system_decision_json
+    import sys as _system_decision_sys
+    from pathlib import Path as _SystemDecisionPath
+    from core.system_decision_engine import evaluate_system_config as _system_evaluate_config
+
+    _original_prod_check_main_for_system_decision = main
+
+    def main():
+        original_result = _original_prod_check_main_for_system_decision()
+
+        config_path = _SystemDecisionPath("generated-pingora-proxy/config.json")
+
+        if not config_path.exists():
+            print("⚠️ System decision production gate skipped: generated config not found.")
+            return original_result
+
+        config = _system_decision_json.loads(config_path.read_text(encoding="utf-8"))
+
+        strict = "production" in " ".join(_system_decision_sys.argv).lower()
+
+        decision = _system_evaluate_config(
+            config,
+            prompt="production readiness check",
+            strict_security=strict,
+        )
+
+        print("")
+        print("🧠 System decision production gate")
+        print(f"Strict security: {strict}")
+        print(f"Success: {decision['ok']}")
+
+        for item in decision.get("decisions", []):
+            icon = "✅" if item.get("ok") else "❌"
+            print(f"{icon} [{item.get('category')}] {item.get('reason')}")
+
+        if not decision.get("ok"):
+            return 1
+
+        return original_result
+
 if __name__ == "__main__":
     raise SystemExit(main())

@@ -570,3 +570,17 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# ---------------------------------------------------------------------------
+# System decision-engine helper for rollback target validation
+# ---------------------------------------------------------------------------
+def _system_decision_validate_rollback_config(config: dict) -> dict:
+    from core.system_decision_engine import apply_and_enforce_system_decisions
+
+    return apply_and_enforce_system_decisions(
+        config,
+        prompt="rollback promotion",
+        strict_security=False,
+        allow_repair=True,
+    )
