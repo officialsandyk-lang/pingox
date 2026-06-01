@@ -182,3 +182,52 @@ def prepare_config_for_deployment(
         "intent_contract": intent_result,
         "success": True,
     }
+
+
+# ---------------------------------------------------------------------------
+# Security policy contract wrappers for deployment prepare functions
+# ---------------------------------------------------------------------------
+if not globals().get("_SECURITY_POLICY_CONTRACT_DEPLOYMENT_PREPARE_WRAPPED"):
+    _SECURITY_POLICY_CONTRACT_DEPLOYMENT_PREPARE_WRAPPED = True
+
+    from functools import wraps as _security_contract_wraps
+    from core.security_policy_contract import apply_security_policy_contract as _apply_security_policy_contract
+
+    def _apply_contract_to_prepare_result(result, environment="local"):
+        if isinstance(result, dict):
+            if "config" in result and isinstance(result["config"], dict):
+                result = dict(result)
+                result["config"] = _apply_security_policy_contract(result["config"], environment=environment)
+                return result
+
+            if "routes" in result:
+                return _apply_security_policy_contract(result, environment=environment)
+
+        return result
+
+    def _wrap_prepare_function(name):
+        fn = globals().get(name)
+        if not callable(fn):
+            return
+
+        @_security_contract_wraps(fn)
+        def wrapped(*args, **kwargs):
+            environment = (
+                kwargs.get("runtime_mode")
+                or kwargs.get("runtime")
+                or kwargs.get("environment")
+                or "local"
+            )
+            result = fn(*args, **kwargs)
+            return _apply_contract_to_prepare_result(result, environment=environment)
+
+        globals()[name] = wrapped
+
+    for _name in [
+        "prepare_deployment",
+        "prepare_config_for_deployment",
+        "prepare_config",
+        "prepare_generated_config",
+        "prepare_for_deployment",
+    ]:
+        _wrap_prepare_function(_name)
