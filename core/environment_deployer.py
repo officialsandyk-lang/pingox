@@ -414,12 +414,46 @@ def write_nginx_conf(active_color: str, gateway_port: int) -> None:
 
     service_name = f"gateway-{active_color}"
 
-    (DOCKER_DIR / "nginx.conf").write_text(
-        f"""events {{}}
+    nginx_conf = f"""events {{}}
 
 http {{
+    # AI Pingora Gateway - NGINX Edge Security
+    # v0.1.3-dev-preview-nginx-edge-security
+
+    limit_req_zone $binary_remote_addr zone=ai_pingora_edge_rate:10m rate=1000r/s;
+
+    server_tokens off;
+
     server {{
         listen 80;
+
+        client_max_body_size 10m;
+        client_body_timeout 15s;
+        client_header_timeout 15s;
+        send_timeout 30s;
+
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-Frame-Options "DENY" always;
+        add_header Referrer-Policy "no-referrer" always;
+        add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+        add_header X-Permitted-Cross-Domain-Policies "none" always;
+
+        limit_req zone=ai_pingora_edge_rate burst=2000 nodelay;
+
+        location = /__edge_health {{
+            add_header Content-Type text/plain;
+            return 200 "ok\\n";
+        }}
+
+        # Block sensitive paths
+        location ~* ^/(\\.env|\\.git|\\.git/|private|internal|debug|wp-admin|wp-login\\.php|phpmyadmin|admin\\.php) {{
+            return 403;
+        }}
+
+        # Block dangerous/suspicious extensions
+        location ~* \\.(php|phtml|sql|bak|old|swp|ini|env|log)$ {{
+            return 403;
+        }}
 
         location / {{
             proxy_pass http://{service_name}:{gateway_port};
@@ -428,12 +462,15 @@ http {{
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_connect_timeout 5s;
+            proxy_send_timeout 30s;
+            proxy_read_timeout 30s;
         }}
     }}
 }}
-""",
-        encoding="utf-8",
-    )
+"""
+
+    atomic_write_text(DOCKER_DIR / "nginx.conf", nginx_conf)
 
 
 def write_compose(active_color: str, gateway_port: int) -> Path:

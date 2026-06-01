@@ -78,7 +78,23 @@ def reload_edge_router(active_color: str, config: dict[str, Any]) -> None:
         up_edge_router(active_color, config)
         return
 
-    # The config file is mounted from the host. Reload Nginx in-place.
+    # The config file is mounted from the host. Test before reload so a bad
+    # generated config does not break the running edge router.
+    test = subprocess.run(
+        ["docker", "exec", EDGE_CONTAINER_NAME, "nginx", "-t"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+
+    if test.returncode != 0:
+        raise EdgeRouterError(
+            "Nginx edge config test failed; reload skipped:\n"
+            + test.stdout
+            + "\n\nCompose file:\n"
+            + str(compose_path)
+        )
+
     result = subprocess.run(
         ["docker", "exec", EDGE_CONTAINER_NAME, "nginx", "-s", "reload"],
         text=True,
@@ -93,3 +109,5 @@ def reload_edge_router(active_color: str, config: dict[str, Any]) -> None:
             + "\n\nCompose file:\n"
             + str(compose_path)
         )
+
+

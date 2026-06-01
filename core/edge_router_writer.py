@@ -116,12 +116,13 @@ def write_edge_router_files(active_color: str, config: dict[str, Any]) -> Path:
     The edge router owns the user-defined public port.
     Blue/green Pingora containers run behind it on the Docker network.
 
-    Example:
-      user config port: 8088
-
-      host:8088
-        -> pingora-edge-router
-        -> pingora-blue:8088 or pingora-green:8088
+    Security enforced here:
+      - blocked sensitive paths
+      - blocked suspicious extensions
+      - secure headers
+      - body-size limits
+      - request timeouts
+      - edge rate limiting
     """
     if active_color not in COLORS:
         raise ValueError(f"Invalid active color: {active_color}")
@@ -134,7 +135,9 @@ def write_edge_router_files(active_color: str, config: dict[str, Any]) -> Path:
 
     upstream_host = f"pingora-{active_color}"
 
-    nginx_conf = f"""upstream active_pingora {{
+    nginx_conf = f"""limit_req_zone $binary_remote_addr zone=ai_pingora_edge_rate:10m rate=1000r/s;
+
+upstream active_pingora {{
     server {upstream_host}:{internal_port} max_fails=3 fail_timeout=10s;
     keepalive 64;
 }}
@@ -143,9 +146,34 @@ server {{
     listen 80;
     server_name _;
 
+    server_tokens off;
+
+    client_max_body_size 10m;
+    client_body_timeout 15s;
+    client_header_timeout 15s;
+    send_timeout 30s;
+
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "no-referrer" always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+    add_header X-Permitted-Cross-Domain-Policies "none" always;
+
+    limit_req zone=ai_pingora_edge_rate burst=2000 nodelay;
+
     location = /__edge_health {{
         add_header Content-Type text/plain;
         return 200 "ok\\n";
+    }}
+
+    # Block sensitive paths
+    location ~* ^/(\\.env|\\.git|\\.git/|private|internal|debug|wp-admin|wp-login\\.php|phpmyadmin|admin\\.php) {{
+        return 403;
+    }}
+
+    # Block dangerous/suspicious extensions
+    location ~* \\.(php|phtml|sql|bak|old|swp|ini|env|log)$ {{
+        return 403;
     }}
 
     location / {{
@@ -189,3 +217,5 @@ networks:
     compose_path.write_text(compose_yml, encoding="utf-8")
 
     return compose_path
+
+
