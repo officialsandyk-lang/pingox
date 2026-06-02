@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 from typing import Any
 
 from core.deployment_state import COLORS, PROJECT_STORE_DIR
@@ -111,18 +112,8 @@ def live_url_from_config(config: dict[str, Any]) -> str:
 
 def write_edge_router_files(active_color: str, config: dict[str, Any]) -> Path:
     """
-    Write the Nginx edge router files.
-
-    The edge router owns the user-defined public port.
-    Blue/green Pingora containers run behind it on the Docker network.
-
-    Security enforced here:
-      - blocked sensitive paths
-      - blocked suspicious extensions
-      - secure headers
-      - body-size limits
-      - request timeouts
-      - edge rate limiting
+    Write NGINX edge router files with TLS, HTTPS redirect, API-key auth,
+    blocked paths, secure headers, body limits, and rate-limit config.
     """
     if active_color not in COLORS:
         raise ValueError(f"Invalid active color: {active_color}")
@@ -132,6 +123,9 @@ def write_edge_router_files(active_color: str, config: dict[str, Any]) -> Path:
     public_port = public_port_from_config(config)
     internal_port = internal_port_from_config(config)
     bind_host = public_bind_host_from_config(config)
+
+    https_port = int(config.get("https_port") or os.getenv("PINGORA_TLS_HTTPS_PORT", "8443"))
+    expected_api_key = os.getenv("PINGORA_EDGE_API_KEY", "dev-local-secret")
 
     upstream_host = f"pingora-{active_color}"
 
@@ -146,6 +140,25 @@ server {{
     listen 80;
     server_name _;
 
+    location = /__edge_health {{
+        add_header Content-Type text/plain;
+        return 200 "ok\\n";
+    }}
+
+    location / {{
+        return 308 https://$host:{https_port}$request_uri;
+    }}
+}}
+
+server {{
+    listen 443 ssl;
+    server_name _;
+
+    ssl_certificate /etc/nginx/tls/local.crt;
+    ssl_certificate_key /etc/nginx/tls/local.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+
     server_tokens off;
 
     client_max_body_size 10m;
@@ -158,6 +171,7 @@ server {{
     add_header Referrer-Policy "no-referrer" always;
     add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
     add_header X-Permitted-Cross-Domain-Policies "none" always;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
 
     limit_req zone=ai_pingora_edge_rate burst=2000 nodelay;
 
@@ -166,12 +180,19 @@ server {{
         return 200 "ok\\n";
     }}
 
-    # Block sensitive paths
+    set $api_key_valid 0;
+    if ($http_x_api_key = "{expected_api_key}") {{
+        set $api_key_valid 1;
+    }}
+
+    if ($api_key_valid = 0) {{
+        return 401;
+    }}
+
     location ~* ^/(\\.env|\\.git|\\.git/|private|internal|debug|wp-admin|wp-login\\.php|phpmyadmin|admin\\.php) {{
         return 403;
     }}
 
-    # Block dangerous/suspicious extensions
     location ~* \\.(php|phtml|sql|bak|old|swp|ini|env|log)$ {{
         return 403;
     }}
@@ -182,7 +203,7 @@ server {{
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Proto https;
 
         proxy_connect_timeout 5s;
         proxy_send_timeout 60s;
@@ -200,8 +221,10 @@ server {{
     restart: unless-stopped
     ports:
       - "{bind_host}:{public_port}:80"
+      - "{bind_host}:{https_port}:443"
     volumes:
       - ./default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ../../data/tls:/etc/nginx/tls:ro
     networks:
       - {EDGE_NETWORK}
 

@@ -830,10 +830,8 @@ def run_rollback_after_interrupted_update(args, reason: str) -> dict:
         attempts.append([
             sys.executable,
             str(rollback_py),
-            "--runtime",
-            runtime,
-            "--strategy",
-            strategy,
+            "--mode",
+            "bluegreen",
             "--verify",
             verify,
         ])
@@ -892,7 +890,7 @@ def run_rollback_after_interrupted_update(args, reason: str) -> dict:
     print("")
     print("⚠️ Automatic rollback command did not complete successfully.")
     print("Manual recovery command:")
-    print("  python rollback.py --runtime docker_host --strategy bluegreen --verify full")
+    print("  python rollback.py --mode bluegreen --verify full")
     print("")
     print(json.dumps(rollback_results, indent=2, default=str)[-4000:])
 

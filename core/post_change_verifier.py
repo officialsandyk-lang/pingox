@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import ssl
+
 import json
 import re
 import sqlite3
@@ -10,6 +13,25 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+_TLS_AUTH_CONTEXT = ssl._create_unverified_context()
+
+def _verifier_headers(extra: dict | None = None) -> dict:
+    headers = dict(extra or {})
+    if os.getenv("PINGORA_EDGE_API_KEY"):
+        headers.setdefault("X-API-Key", os.getenv("PINGORA_EDGE_API_KEY", ""))
+    return headers
+
+def _verifier_urlopen(request, timeout=10):
+    import urllib.request
+    if isinstance(request, str):
+        req = urllib.request.Request(request, headers=_verifier_headers())
+    else:
+        req = request
+        for key, value in _verifier_headers().items():
+            if not req.has_header(key):
+                req.add_header(key, value)
+    return urllib.request.urlopen(req, timeout=timeout, context=_TLS_AUTH_CONTEXT)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -59,7 +81,7 @@ def _normalize_path(path: Any) -> str:
 
 def _request(url: str, timeout: int = 10) -> tuple[int | None, str]:
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
+        with _verifier_urlopen(url, timeout=timeout) as response:
             return int(response.status), response.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         try:
@@ -507,7 +529,7 @@ def _request_method(
             headers=headers or {},
         )
 
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _verifier_urlopen(request, timeout=timeout) as response:
             response_body = response.read().decode("utf-8", errors="replace")
             return int(response.status), response_body, dict(response.headers)
     except urllib.error.HTTPError as exc:

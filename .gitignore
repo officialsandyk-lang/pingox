@@ -1,31 +1,70 @@
-.env
+# Python
 .venv/
 __pycache__/
 *.pyc
-.DS_Store
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# IDE/local
-.idea/
-*.egg-info/
+# Environment / secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.crt
+data/tls/
+secrets/
+*.sqlite
+*.sqlite3
+*.db
 
-# Generated/runtime output
+# Local/generated runtime state
 generated-pingora-proxy/
-generated-projects/
 docker-bluegreen/
-target/
-
-# Runtime state/logs/backups
 tmp/
 logs/
 *.log
 logs.jsonl
-bluegreen_deployer_entered.txt
+data/update_backups/
+data/api_plans/
+data/audit/
+data/*.sqlite3
+data/*.sqlite
+data/*.db
 active_config.json
+current_config.json
 gateway_config.json
-data/
-*.sqlite3
 
-# Patch/temp backups
+# Rust
+target/
+Cargo.lock
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Backup/debug patch files
 *.bak
-*.bak*
+*.bak_*
 *.save
+*_entered.txt
+
+# Python package build metadata
+*.egg-info/
+build/
+dist/
+
+# Generated/local data
+data/
+generated-projects/
+bluegreen_deployer_entered.txt
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local generated TLS/security state
+data/security/
+data/tls/

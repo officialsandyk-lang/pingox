@@ -1,4 +1,5 @@
 from __future__ import annotations
+from core.nginx_edge_decision import raise_if_blocked, validate_candidate_container_config, validate_edge_config_points_to_color, validate_running_nginx_points_to_color
 
 import json
 import os
@@ -9,6 +10,8 @@ import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from core.nginx_config_guard import validate_nginx_text, validate_nginx_file
+from core.nginx_failure_classifier import classify_nginx_failure
 from typing import Any
 
 
@@ -413,55 +416,101 @@ def write_nginx_conf(active_color: str, gateway_port: int) -> None:
     DOCKER_DIR.mkdir(parents=True, exist_ok=True)
 
     service_name = f"gateway-{active_color}"
+    expected_api_key = os.getenv("PINGORA_EDGE_API_KEY", "dev-local-secret")
 
     nginx_conf = f"""events {{}}
 
 http {{
-    # AI Pingora Gateway - NGINX Edge Security
-    # v0.1.3-dev-preview-nginx-edge-security
-
-    limit_req_zone $binary_remote_addr zone=ai_pingora_edge_rate:10m rate=1000r/s;
-
-    server_tokens off;
+    limit_req_zone $binary_remote_addr zone=pingora_edge_rate:10m rate=120r/s;
 
     server {{
         listen 80;
-
-        client_max_body_size 10m;
-        client_body_timeout 15s;
-        client_header_timeout 15s;
-        send_timeout 30s;
-
-        add_header X-Content-Type-Options "nosniff" always;
-        add_header X-Frame-Options "DENY" always;
-        add_header Referrer-Policy "no-referrer" always;
-        add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
-        add_header X-Permitted-Cross-Domain-Policies "none" always;
-
-        limit_req zone=ai_pingora_edge_rate burst=2000 nodelay;
+        server_name _;
 
         location = /__edge_health {{
             add_header Content-Type text/plain;
             return 200 "ok\\n";
         }}
 
-        # Block sensitive paths
-        location ~* ^/(\\.env|\\.git|\\.git/|private|internal|debug|wp-admin|wp-login\\.php|phpmyadmin|admin\\.php) {{
-            return 403;
-        }}
-
-        # Block dangerous/suspicious extensions
-        location ~* \\.(php|phtml|sql|bak|old|swp|ini|env|log)$ {{
-            return 403;
-        }}
-
         location / {{
+            return 308 https://$host:8443$request_uri;
+        }}
+    }}
+
+    server {{
+        listen 443 ssl;
+        server_name _;
+
+        ssl_certificate /etc/nginx/tls/local.crt;
+        ssl_certificate_key /etc/nginx/tls/local.key;
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_prefer_server_ciphers on;
+
+        client_max_body_size 10m;
+
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-Frame-Options "DENY" always;
+        add_header Referrer-Policy "no-referrer" always;
+        add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+        add_header X-Permitted-Cross-Domain-Policies "none" always;
+        add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+        location = /__edge_health {{
+            add_header Content-Type text/plain;
+            return 200 "ok\\n";
+        }}
+
+        # Public route-directory homepage.
+        location = / {{
             proxy_pass http://{service_name}:{gateway_port};
             proxy_http_version 1.1;
             proxy_set_header Host $host;
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header X-Forwarded-Proto https;
+            proxy_connect_timeout 5s;
+            proxy_send_timeout 30s;
+            proxy_read_timeout 30s;
+        }}
+
+        # Static browser noise can stay public or return cleanly.
+        location = /favicon.ico {{
+            proxy_pass http://{service_name}:{gateway_port};
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-Proto https;
+        }}
+
+        # Block sensitive paths before auth.
+        location ~* ^/(\\.env|\\.git|\\.git/|private|internal|debug|wp-admin|wp-login\\.php|phpmyadmin|admin\\.php) {{
+            return 403;
+        }}
+
+        # Block dangerous/suspicious extensions before auth.
+        location ~* \\.(php|phtml|sql|bak|old|swp|ini|env|log)$ {{
+            return 403;
+        }}
+
+        # Protected routes: everything except public root requires X-API-Key.
+        location / {{
+            set $api_key_valid 0;
+
+            if ($http_x_api_key = "{expected_api_key}") {{
+                set $api_key_valid 1;
+            }}
+
+            if ($api_key_valid = 0) {{
+                return 401;
+            }}
+
+            limit_req zone=pingora_edge_rate burst=240 nodelay;
+
+            proxy_pass http://{service_name}:{gateway_port};
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto https;
             proxy_connect_timeout 5s;
             proxy_send_timeout 30s;
             proxy_read_timeout 30s;
@@ -506,15 +555,18 @@ def write_compose(active_color: str, gateway_port: int) -> Path:
   gateway-edge:
     image: nginx:alpine
     container_name: ai-pingora-gateway-edge
+    ports:
+      - "8090:80"
+      - "8443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ../data/tls:/etc/nginx/tls:ro
     depends_on:
       - gateway-blue
       - gateway-green
-    ports:
-      - "{gateway_port}:80"
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
     networks:
       - ai_pingora_net
+
 
 networks:
   ai_pingora_net:
@@ -664,6 +716,7 @@ def start_docker_bluegreen(config: dict[str, Any]) -> dict[str, Any]:
             "-f",
             str(DOCKER_DIR / "docker-compose.yml"),
             "build",
+            "--no-cache",
         ],
         project_dir=str(GENERATED_PROJECT_DIR),
         max_attempts=3,
@@ -703,39 +756,30 @@ def start_docker_bluegreen(config: dict[str, Any]) -> dict[str, Any]:
 
     save_state(color)
 
-    deadline = time.time() + 180
-    live_url = f"http://127.0.0.1:{port}/"
+    readiness_url = f"http://127.0.0.1:{port}/__edge_health"
+    live_url = "https://127.0.0.1:8443"
 
-    while time.time() < deadline:
-        result = run_command(
-            ["bash", "-lc", f"curl -s -o /dev/null -w '%{{http_code}}' {live_url}"],
-            timeout=10,
-        )
+    try:
+        status_code = wait_for_docker_edge_health(port, timeout_seconds=180)
+        status = str(status_code)
+        print(f"✅ Docker gateway edge ready: HTTP {status}")
+    except Exception as exc:
+        logs = docker_compose(["logs", "--tail=200"], timeout=60)
+        raise RuntimeError(
+            f"Docker gateway did not become ready at {readiness_url}\n\n"
+            f"LOGS:\n{logs.stdout}\n{logs.stderr}"
+        ) from exc
 
-        status = result.stdout.strip()
+    ps = docker_compose(["ps"], timeout=60)
 
-        if status in {"200", "301", "302", "403", "404", "405"}:
-            print(f"✅ Docker gateway edge ready: HTTP {status}")
-
-            ps = docker_compose(["ps"], timeout=60)
-
-            return {
-                "success": True,
-                "active_color": color,
-                "live_url": live_url,
-                "status": status,
-                "compose_file": str(compose_file),
-                "docker_ps": ps.stdout,
-            }
-
-        time.sleep(2)
-
-    logs = docker_compose(["logs", "--tail=200"], timeout=60)
-
-    raise RuntimeError(
-        f"Docker gateway did not become ready at {live_url}\n\n"
-        f"LOGS:\n{logs.stdout}\n{logs.stderr}"
-    )
+    return {
+        "success": True,
+        "active_color": color,
+        "live_url": live_url,
+        "status": status,
+        "compose_file": str(compose_file),
+        "docker_ps": ps.stdout,
+    }
 
 
 def verify_deployment(config: dict[str, Any], live_url: str, level: str) -> dict[str, Any]:
@@ -770,6 +814,42 @@ def docker_container_is_running(name: str) -> bool:
     return result.returncode == 0 and result.stdout.strip().lower() == "true"
 
 
+
+def wait_for_docker_edge_health(port: int = 8090, timeout_seconds: int = 180) -> int:
+    """
+    Docker readiness must check the unauthenticated HTTP edge health endpoint.
+
+    This is separate from the public app URL:
+      readiness: http://127.0.0.1:8090/__edge_health
+      public:    https://127.0.0.1:8443
+    """
+    import time
+    import urllib.request
+    import urllib.error
+
+    url = f"http://127.0.0.1:{port}/__edge_health"
+    deadline = time.time() + timeout_seconds
+    last_error = None
+
+    while time.time() < deadline:
+        try:
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=3) as response:
+                status = int(response.status)
+                if status == 200:
+                    return status
+                last_error = f"HTTP {status}"
+        except Exception as exc:
+            last_error = str(exc)
+
+        time.sleep(2)
+
+    raise RuntimeError(
+        f"Docker gateway did not become ready at {url}\n"
+        f"Last readiness error: {last_error}"
+    )
+
+
 def docker_exec_edge(command: str, timeout: int = 30) -> subprocess.CompletedProcess[str]:
     return run_command(
         ["docker", "exec", "ai-pingora-gateway-edge", "sh", "-lc", command],
@@ -777,27 +857,68 @@ def docker_exec_edge(command: str, timeout: int = 30) -> subprocess.CompletedPro
     )
 
 
-def reload_nginx_edge() -> subprocess.CompletedProcess[str]:
+def reload_nginx_edge():
     """
-    Test Nginx config before reload and retry because bind-mounted config files
-    can briefly race on Docker Desktop/macOS.
+    Reload NGINX edge safely on Docker Desktop/macOS.
+
+    Problem:
+    /etc/nginx/nginx.conf is bind-mounted from docker-bluegreen/nginx.conf.
+    During blue/green switch, rewriting that host file and immediately running
+    nginx -t can cause Docker Desktop to expose a partially synced file:
+      pread() returned only N bytes instead of M
+
+    Fix:
+    Validate the host config, docker cp it to a non-mounted temp file inside the
+    container, test that temp config, then reload NGINX using that temp config.
     """
-    last = None
+    nginx_path = DOCKER_DIR / "nginx.conf"
+    container_tmp_conf = "/tmp/ai-pingora-nginx.conf"
 
-    for _ in range(5):
-        test = docker_exec_edge("nginx -t", timeout=30)
-        last = test
+    validate_nginx_file(nginx_path)
 
-        if test.returncode == 0:
-            reload_result = docker_exec_edge("nginx -s reload", timeout=30)
-            last = reload_result
+    copy_result = run_command(
+        [
+            "docker",
+            "cp",
+            str(nginx_path),
+            f"ai-pingora-gateway-edge:{container_tmp_conf}",
+        ],
+        timeout=30,
+    )
 
-            if reload_result.returncode == 0:
-                return reload_result
+    if copy_result.returncode != 0:
+        return copy_result
 
-        time.sleep(0.5)
+    test_result = run_command(
+        [
+            "docker",
+            "exec",
+            "ai-pingora-gateway-edge",
+            "nginx",
+            "-t",
+            "-c",
+            container_tmp_conf,
+        ],
+        timeout=30,
+    )
 
-    return last
+    if test_result.returncode != 0:
+        return test_result
+
+    return run_command(
+        [
+            "docker",
+            "exec",
+            "ai-pingora-gateway-edge",
+            "nginx",
+            "-s",
+            "reload",
+            "-c",
+            container_tmp_conf,
+        ],
+        timeout=30,
+    )
+
 
 
 def wait_for_candidate_container(
@@ -830,27 +951,49 @@ def wait_for_candidate_container(
     return False
 
 
-def wait_for_live_edge(
-    *,
-    live_url: str,
-    timeout_seconds: int = 90,
-) -> str | None:
+def wait_for_live_edge(live_url: str, timeout_seconds: int = 90) -> int:
+    """
+    Wait for the NGINX edge to be healthy after a blue/green switch.
+
+    Important:
+    After TLS/API-key enforcement, /api is protected and / may redirect.
+    Therefore switch health must use the public unauthenticated edge endpoint.
+    """
+    import time
+
+    health_url = "http://127.0.0.1:8090/__edge_health"
     deadline = time.time() + timeout_seconds
+    last_status = None
+    last_output = ""
 
     while time.time() < deadline:
         result = run_command(
-            ["bash", "-lc", f"curl -s -o /dev/null -w '%{{http_code}}' {live_url}"],
+            ["bash", "-lc", f"curl -s -o /dev/null -w '%{{http_code}}' {health_url}"],
             timeout=10,
         )
 
-        status = result.stdout.strip()
+        last_output = (result.stdout or "") + "\n" + (result.stderr or "")
+        status_text = (result.stdout or "").strip()
 
-        if status in {"200", "301", "302", "403", "404", "405"}:
+        try:
+            status = int(status_text)
+        except Exception:
+            status = None
+
+        last_status = status
+
+        if status == 200:
             return status
 
-        time.sleep(2)
+        time.sleep(1)
 
-    return None
+    raise RuntimeError(
+        "Live edge did not become healthy after switch. "
+        f"Checked {health_url}. "
+        f"Last status: {last_status}. "
+        f"Last output: {last_output[-1000:]}"
+    )
+
 
 
 def ensure_base_bluegreen_stack_exists(config: dict[str, Any]) -> dict[str, Any] | None:
@@ -927,7 +1070,8 @@ def start_docker_bluegreen_transactional(config: dict[str, Any]) -> dict[str, An
     write_compose(old_color, port)
 
     switched = False
-    live_url = f"http://127.0.0.1:{port}/"
+    readiness_url = f"http://127.0.0.1:{port}/__edge_health"
+    live_url = "https://127.0.0.1:8443"
 
     try:
         # Remove only candidate. Never remove active or edge here.
@@ -945,6 +1089,7 @@ def start_docker_bluegreen_transactional(config: dict[str, Any]) -> dict[str, An
                 "-f",
                 str(DOCKER_DIR / "docker-compose.yml"),
                 "build",
+                "--no-cache",
                 f"gateway-{candidate_color}",
             ],
             project_dir=str(GENERATED_PROJECT_DIR),
@@ -1004,14 +1149,48 @@ def start_docker_bluegreen_transactional(config: dict[str, Any]) -> dict[str, An
         # Switch edge only now.
         write_nginx_conf(candidate_color, port)
 
+        # Hard gate: never reload malformed NGINX config.
+        validate_nginx_file(DOCKER_DIR / "nginx.conf")
+
+        # Keep a snapshot of the exact candidate edge config used for switch debugging.
+        candidate_snapshot = DOCKER_DIR / f"nginx.candidate-{candidate_color}.conf"
+        candidate_snapshot.write_text(
+            (DOCKER_DIR / "nginx.conf").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+
         reload = reload_nginx_edge()
 
         if reload.returncode != 0:
             rollback_edge_to_color(old_color, port)
+
+            failure_output = (reload.stdout or "") + "\n" + (reload.stderr or "")
+            nginx_failure = classify_nginx_failure(failure_output)
+            root_cause = nginx_failure.root_cause if nginx_failure else "unknown"
+
             raise RuntimeError(
                 "Nginx reload failed. Rolled back edge to old colour.\n"
+                f"Root cause: {root_cause}\n"
                 f"STDOUT:\n{reload.stdout}\n\nSTDERR:\n{reload.stderr}"
             )
+
+        # Docker Desktop/macOS safety:
+        # nginx -s reload can report success while old workers still serve the
+        # previous upstream target. Restarting only the edge container forces
+        # workers to load the active candidate config without touching blue/green.
+        restart = run_command(
+            ["docker", "restart", "ai-pingora-gateway-edge"],
+            timeout=60,
+        )
+
+        if restart.returncode != 0:
+            rollback_edge_to_color(old_color, port)
+            raise RuntimeError(
+                "Nginx edge restart failed after reload. Rolled back edge to old colour.\n"
+                f"STDOUT:\n{restart.stdout}\n\nSTDERR:\n{restart.stderr}"
+            )
+
+        wait_for_docker_edge_health(port=8090, timeout_seconds=90)
 
         switched = True
 
@@ -1390,12 +1569,12 @@ def _start_local_pingora_from_config_file() -> dict:
 
     pid_file.write_text(str(process.pid), encoding="utf-8")
 
-    _wait_local_http_200("http://127.0.0.1:8090/", timeout_seconds=180)
+    _wait_local_http_200("http://127.0.0.1:8090/__edge_health", timeout_seconds=180)
 
     return {
         "pid": process.pid,
         "log_file": str(log_file),
-        "live_url": "http://127.0.0.1:8090/",
+        "live_url": "https://127.0.0.1:8443",
     }
 
 
@@ -1732,7 +1911,7 @@ def deploy_local_direct_from_config(config: dict, verify: str = "full") -> dict:
     verification = verify_after_change(
         config=prepared,
         config_path=Path("generated-pingora-proxy/config.json"),
-        live_url="http://127.0.0.1:8090/",
+        live_url="https://127.0.0.1:8443",
         source="environment_deployer",
         change_type="local_direct_config_file_deploy",
         level=verify,
@@ -1765,7 +1944,7 @@ def deploy_local_direct_from_config(config: dict, verify: str = "full") -> dict:
         "strategy": "direct",
         "deployment_strategy": "direct",
         "active_color": "local",
-        "live_url": "http://127.0.0.1:8090/",
+        "live_url": "https://127.0.0.1:8443",
         "gateway": gateway,
         "verification": verification,
     }

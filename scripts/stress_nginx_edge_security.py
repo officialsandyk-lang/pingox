@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -37,9 +38,20 @@ def run(cmd: list[str], timeout: int = 1800):
     return result
 
 
-def http_ok(url: str) -> bool:
+def http_ok(url: str, api_key: str | None = None) -> bool:
     try:
-        with urllib.request.urlopen(url, timeout=5) as response:
+        request = urllib.request.Request(url)
+        if api_key:
+            request.add_header("X-API-Key", api_key)
+
+        # Local dev uses a self-signed certificate, so use curl-style unverified SSL.
+        if url.startswith("https://"):
+            import ssl
+            context = ssl._create_unverified_context()
+            with urllib.request.urlopen(request, timeout=5, context=context) as response:
+                return int(response.status) == 200
+
+        with urllib.request.urlopen(request, timeout=5) as response:
             return int(response.status) == 200
     except Exception:
         return False
@@ -47,15 +59,16 @@ def http_ok(url: str) -> bool:
 
 def wait_api() -> None:
     deadline = time.time() + 180
+    api_key = os.getenv("PINGORA_EDGE_API_KEY", "dev-local-secret")
 
     while time.time() < deadline:
-        if http_ok("http://127.0.0.1:8090/api/"):
-            print("✅ /api is live")
+        if http_ok("https://127.0.0.1:8443/api/", api_key=api_key):
+            print("✅ /api is live over HTTPS with API key")
             return
 
         time.sleep(2)
 
-    raise AssertionError("Timed out waiting for /api")
+    raise AssertionError("Timed out waiting for /api over HTTPS with API key")
 
 
 def main() -> int:

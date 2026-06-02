@@ -264,6 +264,19 @@ def repair_docker_project(
     return False, classification
 
 
+
+def ensure_no_cache_for_compose_build(command: Sequence[str]) -> list[str]:
+    """
+    Force docker compose build to rebuild generated config.json and public/index.html.
+    This prevents stale blue/green candidate images during route updates.
+    """
+    cmd = list(command)
+    if "compose" in cmd and "build" in cmd and "--no-cache" not in cmd:
+        idx = cmd.index("build")
+        cmd.insert(idx + 1, "--no-cache")
+    return cmd
+
+
 @traceable(name="deployment_repair_agent", run_type="chain")
 def run_docker_command_with_repair(
     command: Sequence[str],
@@ -272,6 +285,8 @@ def run_docker_command_with_repair(
     retry_delay_seconds: int = 5,
     timeout: int | None = 1200,
 ) -> CommandResult:
+    command = ensure_no_cache_for_compose_build(command)
+
     repaired = False
     last_result: subprocess.CompletedProcess | None = None
     classification = "unknown"
