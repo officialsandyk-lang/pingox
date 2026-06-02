@@ -1,4 +1,5 @@
 from __future__ import annotations
+from core.mutation_decision import enforce_mutation_decision, load_current_config
 
 import argparse
 import json
@@ -668,6 +669,14 @@ def deploy_docker_bluegreen_update(args: argparse.Namespace) -> dict[str, Any]:
     )
 
     prompt = " ".join(args.prompt).strip()
+    # Central mutation decision gate.
+    # This blocks unsafe add/edit/remove/delete operations before generation/deploy.
+    enforce_mutation_decision(
+        prompt=prompt,
+        config=load_current_config(),
+        confirmed=bool(getattr(args, "confirm_route_mutation", False)),
+    )
+
 
     dangerous = dangerous_route_mutation(prompt)
 
