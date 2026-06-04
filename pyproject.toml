@@ -9,10 +9,25 @@ description = "Natural-language Gateway-as-Code CLI for Pingora gateways"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
-dependencies = []
+dependencies = [
+    "python-dotenv",]
 
 [project.scripts]
 pingora-ai = "pingora_ai.cli:main"
 
-[tool.setuptools]
-packages = ["pingora_ai"]
+[tool.setuptools.packages.find]
+include = [
+    "pingora_ai*",
+    "core*",
+    "agents*",
+    "server*"
+]
+exclude = [
+    "generated-pingora-proxy*",
+    "tmp*",
+    "data*",
+    "logs*",
+    "docker-bluegreen*",
+    "generated-projects*",
+    "runtime*"
+]

@@ -8,7 +8,8 @@ import shutil
 import subprocess
 import sys
 import time
-from datetime import UTC, datetime
+from datetime import datetime, timezone
+UTC = timezone.utc
 from pathlib import Path
 from core.nginx_config_guard import validate_nginx_text, validate_nginx_file
 from core.nginx_failure_classifier import classify_nginx_failure

@@ -11,7 +11,11 @@ DEFAULT_API_URL = "http://127.0.0.1:8000"
 
 
 def get_api_url() -> str:
-    return os.environ.get("PINGORA_AI_API_URL", DEFAULT_API_URL).rstrip("/")
+    return (
+        os.environ.get("PINGORA_AI_API_BASE_URL")
+        or os.environ.get("PINGORA_AI_API_URL")
+        or DEFAULT_API_URL
+    ).strip().rstrip("/")
 
 
 def get_api_token() -> str:

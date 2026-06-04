@@ -506,3 +506,119 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def watch_environment(environment: str = "local", public_url: str | None = None, interval_seconds: int = 30, max_loops: int | None = None) -> int:
+    """
+    Active guardian stream:
+    repeatedly scans environment and triggers safe repairs for known issues.
+    """
+    import time
+    import json
+    import os
+    from core.environment_guardian import scan_environment
+    from core.environment_repairs import repair_public_edge
+    from core.agent_incident_commander import record_runtime_failure_lesson
+
+    loop = 0
+
+    while True:
+        loop += 1
+        result = scan_environment(
+            environment=environment,
+            public_url=public_url,
+            api_url=os.getenv("PINGORA_AI_API_BASE_URL") or os.getenv("PINGORA_AI_API_URL"),
+            api_token=os.getenv("PINGORA_AI_API_TOKEN"),
+        )
+
+        print(json.dumps({
+            "watch_loop": loop,
+            "environment": environment,
+            "success": result.get("success"),
+            "failed_checks": [c.get("name") for c in result.get("failed_checks", [])],
+        }, indent=2))
+
+        if not result.get("success"):
+            failed_names = {c.get("name") for c in result.get("failed_checks", [])}
+
+            incident = record_runtime_failure_lesson(
+                runtime=environment,
+                strategy="guardian_watch",
+                operation="environment_watch",
+                error=json.dumps(result.get("failed_checks", [])),
+                config={},
+                allow_auto_repair=True,
+            )
+
+            print("Guardian stored incident:", incident.get("incident_id"))
+
+            if {
+                "nginx_active",
+                "nginx_listening_public_ports",
+                "iptables_80_443_before_reject",
+            } & failed_names:
+                repair = repair_public_edge()
+                print("Repair attempted:", json.dumps(repair, indent=2))
+
+        if max_loops and loop >= max_loops:
+            return 0 if result.get("success") else 1
+
+        time.sleep(interval_seconds)
+
+
+def watch_environment(environment: str = "local", public_url: str | None = None, interval_seconds: int = 30, max_loops: int | None = None) -> int:
+    """
+    Active guardian stream:
+    repeatedly scans environment and triggers safe repairs for known issues.
+    """
+    import time
+    import json
+    import os
+    from core.environment_guardian import scan_environment
+    from core.environment_repairs import repair_public_edge
+    from core.agent_incident_commander import record_runtime_failure_lesson
+
+    loop = 0
+
+    while True:
+        loop += 1
+        result = scan_environment(
+            environment=environment,
+            public_url=public_url,
+            api_url=os.getenv("PINGORA_AI_API_BASE_URL") or os.getenv("PINGORA_AI_API_URL"),
+            api_token=os.getenv("PINGORA_AI_API_TOKEN"),
+        )
+
+        print(json.dumps({
+            "watch_loop": loop,
+            "environment": environment,
+            "success": result.get("success"),
+            "failed_checks": [c.get("name") for c in result.get("failed_checks", [])],
+        }, indent=2))
+
+        if not result.get("success"):
+            failed_names = {c.get("name") for c in result.get("failed_checks", [])}
+
+            incident = record_runtime_failure_lesson(
+                runtime=environment,
+                strategy="guardian_watch",
+                operation="environment_watch",
+                error=json.dumps(result.get("failed_checks", [])),
+                config={},
+                allow_auto_repair=True,
+            )
+
+            print("Guardian stored incident:", incident.get("incident_id"))
+
+            if {
+                "nginx_active",
+                "nginx_listening_public_ports",
+                "iptables_80_443_before_reject",
+            } & failed_names:
+                repair = repair_public_edge()
+                print("Repair attempted:", json.dumps(repair, indent=2))
+
+        if max_loops and loop >= max_loops:
+            return 0 if result.get("success") else 1
+
+        time.sleep(interval_seconds)

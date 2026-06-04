@@ -731,3 +731,59 @@ def apply_and_enforce_system_decisions(
 
     candidate["_system_decision_result"] = decision
     return candidate
+
+
+def apply_micro_decision_gate(config: dict, args=None, production_mode: bool = False) -> dict:
+    """
+    Compatibility wrapper: keeps the existing high-level system decision engine,
+    but adds tiny true/false micro-decisions before final config is accepted.
+    """
+    from core.micro_decision_engine import run_micro_decisions
+
+    result = run_micro_decisions(config, args=args, production_mode=production_mode)
+    final_config = result.get("final_config") or config
+    final_config["_micro_decision_result"] = {
+        "success": result.get("success"),
+        "decisions": result.get("decisions", []),
+        "failed_decisions": result.get("failed_decisions", []),
+        "critical_failed": result.get("critical_failed", []),
+    }
+
+    if result.get("critical_failed"):
+        final_config["_micro_decision_halt"] = True
+
+    return final_config
+
+
+def apply_lightweight_decision_gate(
+    config: dict,
+    args=None,
+    operation: str = "plan",
+    production_mode: bool = False,
+) -> dict:
+    """
+    Lightweight decision gate.
+
+    Use this instead of running every deep check every time.
+    """
+    from core.micro_decision_engine import run_lightweight_decisions
+
+    result = run_lightweight_decisions(
+        config,
+        args=args,
+        operation=operation,
+        production_mode=production_mode,
+    )
+
+    final_config = result.get("final_config") or config
+    final_config["_decision_policy"] = result.get("policy")
+    final_config["_micro_decision_result"] = {
+        "success": result.get("success"),
+        "failed_decisions": result.get("failed_decisions", []),
+        "critical_failed": result.get("critical_failed", []),
+    }
+
+    if result.get("critical_failed"):
+        final_config["_micro_decision_halt"] = True
+
+    return final_config

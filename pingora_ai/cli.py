@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from pingora_ai.api_client import plan_gateway
+from pingora_ai.api_client import plan_gateway, get_api_url
 
 # Ensure project root is importable when running from installed console script.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -103,7 +103,7 @@ def _append_confirm_route_mutation(cmd: list[str], args) -> list[str]:
     return cmd
 
 
-def find_project_root() -> Path:
+def find_project_root() -> Path | None:
     env_root = os.environ.get("PINGORA_AI_PROJECT_ROOT")
 
     candidates: list[Path] = []
@@ -120,18 +120,44 @@ def find_project_root() -> Path:
         if (candidate / "main.py").exists() and (candidate / "update.py").exists():
             return candidate
 
-    raise SystemExit(
-        "Could not find project root. Run from the pingora-generator folder "
-        "or set PINGORA_AI_PROJECT_ROOT."
-    )
+    return None
 
 
 PROJECT_ROOT = find_project_root()
 
-# Allow installed `pingora-ai` console command to import local project modules
-# such as core/, agents/, orchestration/, etc.
-if str(PROJECT_ROOT) not in sys.path:
+# Source-tree operations need project root. Pure installed-CLI commands
+# such as `edge enable` must work without a source checkout.
+if PROJECT_ROOT and str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+
+def require_project_root() -> Path:
+    if PROJECT_ROOT:
+        return PROJECT_ROOT
+
+    raise SystemExit(
+        "Could not find project root. Run from the pingora-generator folder "
+        "or set PINGORA_AI_PROJECT_ROOT. This is required for source-tree "
+        "operations such as apply/update, but not for edge enable."
+    )
+
+
+def get_work_dir() -> Path:
+    """
+    Return the working directory for CLI-generated files.
+
+    Source/developer mode:
+      uses repo root.
+
+    Installed user CLI mode:
+      uses ~/.pingora-ai so plan/edge commands work without cloning the repo.
+    """
+    if PROJECT_ROOT:
+        return PROJECT_ROOT
+
+    work_dir = Path(os.environ.get("PINGORA_AI_HOME", "~/.pingora-ai")).expanduser()
+    work_dir.mkdir(parents=True, exist_ok=True)
+    return work_dir
 
 
 def apply_runtime_shortcuts(args: argparse.Namespace) -> None:
@@ -149,6 +175,43 @@ def apply_runtime_shortcuts(args: argparse.Namespace) -> None:
         args.target = "linux"
         args.runtime = "bare_metal_linux"
         args.strategy = "bluegreen"
+
+
+
+def enforce_requested_environment(config: dict, args: argparse.Namespace) -> dict:
+    """
+    Enforce the runtime/strategy explicitly requested by CLI flags.
+
+    Hosted planner may return default docker_host/bluegreen even when the
+    user requested --local. CLI flags are treated as the source of truth.
+
+    Rule:
+      hosted planner suggests
+      local deterministic CLI decides
+      config verification proves
+    """
+    if not isinstance(config, dict):
+        return config
+
+    if getattr(args, "local", False):
+        runtime = "local"
+        strategy = "direct"
+    elif getattr(args, "docker", False):
+        runtime = "docker_host"
+        strategy = "bluegreen"
+    elif getattr(args, "linux", False):
+        runtime = "bare_metal_linux"
+        strategy = "bluegreen"
+    else:
+        runtime = getattr(args, "runtime", None) or config.get("runtime") or "docker_host"
+        strategy = getattr(args, "strategy", None) or config.get("strategy") or "bluegreen"
+
+    config["runtime"] = runtime
+    config["strategy"] = strategy
+    config["runtime_mode"] = runtime
+    config["deployment_strategy"] = strategy
+
+    return config
 
 
 def join_prompt(parts: list[str]) -> str:
@@ -213,7 +276,8 @@ def run_update_prompt(
             "that updates config and calls deploy_bare_metal_with_shared_pipeline()."
         )
 
-    update_py = PROJECT_ROOT / "update.py"
+    project_root = require_project_root()
+    update_py = project_root / "update.py"
 
     if not update_py.exists():
         raise SystemExit(f"Cannot find update.py at: {update_py}")
@@ -235,7 +299,7 @@ def run_update_prompt(
     command.append(prompt)
 
     try:
-        return run_command(command, PROJECT_ROOT)
+        return run_command(command, project_root)
 
     except Exception as exc:
         error_text = str(exc)
@@ -277,7 +341,7 @@ def ensure_planner_available_or_explain() -> None:
     import urllib.request
     import urllib.error
 
-    health_url = "http://127.0.0.1:8000/health"
+    health_url = get_api_url() + "/health"
 
     try:
         with urllib.request.urlopen(health_url, timeout=3) as response:
@@ -307,14 +371,202 @@ def ensure_planner_available_or_explain() -> None:
             "  Open a new terminal and run:\\n\\n"
             "    cd ~/dev/pingora-generator\\n"
             "    source .venv/bin/activate\\n"
-            "    uvicorn server.main:app --host 127.0.0.1 --port 8000 --reload\\n\\n"
+            "    uvicorn server.main:app --host 127.0.0.1 --port 8000 --reload\n\n    Or set:\n    export PINGORA_AI_API_URL=https://your-api-domain\\n\\n"
             "Then retry your pingora-ai command.\\n"
         )
 
 
+
+def _normalise_prompt_text(prompt: str) -> str:
+    return " ".join((prompt or "").strip().lower().replace("?", " ").split())
+
+
+def is_onboarding_prompt(prompt: str) -> bool:
+    text = _normalise_prompt_text(prompt)
+
+    if not text:
+        return True
+
+    exact = {
+        "what do you do",
+        "what you do",
+        "what can you do",
+        "how can you help",
+        "how you can help",
+        "what is this",
+        "what is pingora ai",
+        "what is pingora-ai",
+        "explain this",
+        "explain yourself",
+        "help",
+        "help me",
+        "start",
+        "intro",
+        "introduction",
+        "hello",
+        "hi",
+    }
+
+    if text in exact:
+        return True
+
+    phrases = [
+        "what do you",
+        "what you do",
+        "how can you help",
+        "how to use",
+        "how does this work",
+        "what is this system",
+        "tell me about",
+        "introduce",
+    ]
+
+    return any(p in text for p in phrases)
+
+
+def looks_like_gateway_request(prompt: str) -> bool:
+    """
+    Keep this intentionally simple and deterministic.
+    If it does not look like gateway/proxy/route/edge work,
+    do not send it to hosted planner.
+    """
+    text = _normalise_prompt_text(prompt)
+
+    gateway_words = {
+        "gateway",
+        "route",
+        "routes",
+        "api",
+        "backend",
+        "backends",
+        "upstream",
+        "upstreams",
+        "proxy",
+        "reverse",
+        "load",
+        "balance",
+        "balancer",
+        "algorithm",
+        "random",
+        "round",
+        "robin",
+        "weighted",
+        "ip_hash",
+        "least",
+        "connections",
+        "port",
+        "ports",
+        "nginx",
+        "pingora",
+        "edge",
+        "public",
+        "tls",
+        "ssl",
+        "https",
+        "http",
+        "block",
+        "allow",
+        "firewall",
+        "health",
+        "deploy",
+        "apply",
+        "create",
+        "add",
+        "remove",
+        "delete",
+        "edit",
+        "change",
+        "make",
+        "live",
+        "coupon",
+        "coupons",
+    }
+
+    # Path-like or address-like prompt is probably gateway-related.
+    if "/" in text or "127.0.0.1" in text or "localhost" in text:
+        return True
+
+    # Port numbers like 9101 are strong gateway signals.
+    if any(part.isdigit() and 1 <= int(part) <= 65535 for part in text.split() if part.isdigit()):
+        return True
+
+    return any(word in text for word in gateway_words)
+
+
+def print_out_of_context_message(prompt: str) -> None:
+    print(f"""
+I understand your message, but I will not create a gateway plan from it because it does not look like a gateway, route, proxy, edge, or deployment request.
+
+You can ask me in simple language, for example:
+
+  pingora-ai plan --local "create route /coupons to port 9101"
+
+  pingora-ai apply --local "create gateway with /api to 127.0.0.1:9101"
+
+  pingora-ai add --local /coupons 127.0.0.1:9101
+
+  pingora-ai remove --local /coupons --confirm-route-mutation
+
+  pingora-ai edge enable
+
+For help, run:
+
+  pingora-ai plan "what do you do"
+
+Your input was:
+  {prompt}
+""".strip())
+
+
+def print_onboarding() -> None:
+    print("""
+AI Pingora Gateway helps you create and run API gateways from simple language.
+
+You can say things like:
+
+  pingora-ai edge enable
+
+  pingora-ai plan --local "create route /coupons to port 9101"
+
+  pingora-ai apply --local "create gateway with /api to 127.0.0.1:9101"
+
+  pingora-ai add --local /coupons 127.0.0.1:9101
+
+  pingora-ai edit --local /api --algorithm random --confirm-route-mutation
+
+  pingora-ai remove --local /coupons --confirm-route-mutation
+
+What it checks:
+  - public edge readiness
+  - Nginx and firewall rules
+  - route and upstream safety
+  - load-balancing algorithm rules
+  - blocked sensitive paths
+  - runtime/environment mismatch
+  - deployment health
+
+Plain language is okay:
+  "create route for coupons on port 9101"
+  "remove existing coupons route and make it live"
+  "change api algorithm to random"
+
+Safety rule:
+  destructive changes such as edit/remove need explicit confirmation.
+""".strip())
+
 def cmd_plan(args: argparse.Namespace) -> int:
-    ensure_planner_available_or_explain()
+    apply_runtime_shortcuts(args)
     prompt = join_prompt(args.prompt)
+
+    if is_onboarding_prompt(prompt):
+        print_onboarding()
+        return 0
+
+    if not looks_like_gateway_request(prompt):
+        print_out_of_context_message(prompt)
+        return 2
+
+    ensure_planner_available_or_explain()
 
     response = plan_gateway(
         prompt=prompt,
@@ -324,10 +576,47 @@ def cmd_plan(args: argparse.Namespace) -> int:
     )
 
     if response.get("ok") and isinstance(response.get("config"), dict):
+        from core.system_decision_engine import apply_lightweight_decision_gate
+        from core.plan_state_guard import load_existing_config, apply_plan_state_guard
+
+        work_dir = get_work_dir()
+        existing_config = load_existing_config(work_dir)
+
+        response["config"] = enforce_requested_environment(response["config"], args)
+        response["config"] = apply_lightweight_decision_gate(
+            response["config"],
+            args=args,
+            operation="plan",
+            production_mode=False,
+        )
         response["config"] = ensure_route_directory_homepage(response["config"])
 
-    output_path = PROJECT_ROOT / "data" / "api_plans" / "latest_plan.json"
-    config_path = PROJECT_ROOT / "data" / "api_plans" / "latest_config.json"
+        state_guard = apply_plan_state_guard(
+            prompt=prompt,
+            new_config=response["config"],
+            existing_config=existing_config,
+        )
+
+        if state_guard.get("halt"):
+            print()
+            print("⚠️ Plan halted by local decision guard")
+            print(state_guard.get("message"))
+            print()
+            print(json.dumps({
+                "ok": False,
+                "halted": True,
+                "reason": state_guard.get("message"),
+                "decision": state_guard.get("decision"),
+            }, indent=2))
+            return 2
+
+        response["config"] = state_guard.get("config") or response["config"]
+        if state_guard.get("warnings"):
+            response.setdefault("warnings", []).extend(state_guard["warnings"])
+
+    work_dir = get_work_dir()
+    output_path = work_dir / "data" / "api_plans" / "latest_plan.json"
+    config_path = work_dir / "data" / "api_plans" / "latest_config.json"
 
     save_json(output_path, response)
 
@@ -339,8 +628,6 @@ def cmd_plan(args: argparse.Namespace) -> int:
     print(f"Saved plan to: {output_path}")
 
     return 0
-
-
 
 def _deploy_bare_metal_from_cli(args: argparse.Namespace, config: dict) -> int:
     if not getattr(args, "host", None):
@@ -363,8 +650,9 @@ def _deploy_bare_metal_from_cli(args: argparse.Namespace, config: dict) -> int:
     config["runtime"] = "bare_metal_linux"
     config["strategy"] = "bluegreen"
 
-    write_json_config(config, PROJECT_ROOT / "generated-pingora-proxy")
-    write_route_directory_homepage(config, PROJECT_ROOT / "generated-pingora-proxy")
+    project_root = require_project_root()
+    write_json_config(config, project_root / "generated-pingora-proxy")
+    write_route_directory_homepage(config, project_root / "generated-pingora-proxy")
 
     print()
     print("🚀 Deploying to bare_metal_linux target")
@@ -437,8 +725,9 @@ def cmd_apply(args: argparse.Namespace) -> int:
         print(json.dumps(response, indent=2))
         raise SystemExit("API planning failed.")
 
-    plan_path = PROJECT_ROOT / "data" / "api_plans" / "latest_plan.json"
-    config_path = PROJECT_ROOT / "data" / "api_plans" / "latest_config.json"
+    project_root = require_project_root()
+    plan_path = project_root / "data" / "api_plans" / "latest_plan.json"
+    config_path = project_root / "data" / "api_plans" / "latest_config.json"
 
     response["config"] = ensure_route_directory_homepage(response["config"])
 
@@ -452,7 +741,7 @@ def cmd_apply(args: argparse.Namespace) -> int:
     if getattr(args, "target", None) in {"linux", "bare_metal_linux"}:
         return _deploy_bare_metal_from_cli(args, response["config"])
 
-    main_py = PROJECT_ROOT / "main.py"
+    main_py = project_root / "main.py"
 
     if not main_py.exists():
         raise SystemExit(f"Cannot find main.py at: {main_py}")
@@ -471,7 +760,7 @@ def cmd_apply(args: argparse.Namespace) -> int:
         "__config_file_deploy__",
     ]
 
-    return run_command(command, PROJECT_ROOT)
+    return run_command(command, project_root)
 
 
 def cmd_update(args: argparse.Namespace) -> int:
@@ -598,6 +887,29 @@ def add_runtime_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--service-user", default="ubuntu", help=argparse.SUPPRESS)
 
 
+
+def cmd_edge(args: argparse.Namespace) -> int:
+    action = getattr(args, "edge_action", None)
+
+    if action == "enable":
+        from core.public_edge import enable_public_edge
+
+        result = enable_public_edge()
+        print(json.dumps(result, indent=2))
+
+        if result.get("success"):
+            print()
+            print("✅ Public edge enabled locally.")
+            print("If browser access still fails, open cloud firewall/Security List ports 80 and 443.")
+            return 0
+
+        print()
+        print("❌ Public edge enable failed. See checks above.")
+        return 1
+
+    raise SystemExit("Unknown edge action.")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pingora-ai",
@@ -606,6 +918,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     subcommands = parser.add_subparsers(dest="command", required=True)
+
+    edge_parser = subcommands.add_parser(
+        "edge",
+        help="Manage public edge setup such as HTTP/HTTPS ports and Nginx bootstrap.",
+    )
+    edge_subcommands = edge_parser.add_subparsers(dest="edge_action", required=True)
+
+    edge_enable = edge_subcommands.add_parser(
+        "enable",
+        help="Enable a public HTTP/HTTPS edge on this Linux machine.",
+    )
+    edge_enable.set_defaults(func=cmd_edge)
+
 
     plan_parser = subcommands.add_parser(
         "plan",

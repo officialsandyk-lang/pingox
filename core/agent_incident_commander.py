@@ -450,3 +450,209 @@ def record_runtime_failure_lesson(
     )
 
     return incident
+
+
+def store_reliability_lesson(
+    pattern_id: str,
+    root_cause: str,
+    category: str,
+    summary: str,
+    repair_hint: str,
+    repair_action: str,
+    safe_to_auto_repair: bool,
+    markers: dict | None = None,
+) -> dict:
+    """
+    Store or update a micro-lesson in reliability_knowledge.
+    Handles older DB schemas by adding missing columns.
+    """
+    import json
+    import sqlite3
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    db = Path("data/reliability_reports.sqlite3")
+    db.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS reliability_knowledge (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        pattern_id TEXT UNIQUE
+    )
+    """)
+
+    required = {
+        "root_cause": "TEXT",
+        "category": "TEXT",
+        "summary": "TEXT",
+        "repair_hint": "TEXT",
+        "repair_action": "TEXT",
+        "safe_to_auto_repair": "INTEGER DEFAULT 0",
+        "markers_json": "TEXT",
+        "created_at_utc": "TEXT",
+    }
+
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(reliability_knowledge)")}
+    for col, typ in required.items():
+        if col not in existing:
+            conn.execute(f"ALTER TABLE reliability_knowledge ADD COLUMN {col} {typ}")
+
+    conn.execute(
+        """
+        INSERT INTO reliability_knowledge (
+            pattern_id, root_cause, category, summary, repair_hint,
+            repair_action, safe_to_auto_repair, markers_json, created_at_utc
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(pattern_id) DO UPDATE SET
+            root_cause=excluded.root_cause,
+            category=excluded.category,
+            summary=excluded.summary,
+            repair_hint=excluded.repair_hint,
+            repair_action=excluded.repair_action,
+            safe_to_auto_repair=excluded.safe_to_auto_repair,
+            markers_json=excluded.markers_json,
+            created_at_utc=excluded.created_at_utc
+        """,
+        (
+            pattern_id,
+            root_cause,
+            category,
+            summary,
+            repair_hint,
+            repair_action,
+            1 if safe_to_auto_repair else 0,
+            json.dumps(markers or {}, sort_keys=True),
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "stored": True,
+        "pattern_id": pattern_id,
+        "root_cause": root_cause,
+        "category": category,
+        "repair_action": repair_action,
+        "safe_to_auto_repair": safe_to_auto_repair,
+    }
+
+
+def store_or_update_lesson_lightweight(
+    pattern_id: str,
+    root_cause: str,
+    category: str,
+    summary: str,
+    repair_action: str | None = None,
+    safe_to_auto_repair: bool = False,
+    repair_success: bool | None = None,
+) -> dict:
+    """
+    Lightweight learning:
+    - one row per pattern_id
+    - increment seen_count
+    - update success/failure counters
+    - no duplicate growth
+    """
+    import sqlite3
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    db = Path("data/reliability_reports.sqlite3")
+    db.parent.mkdir(parents=True, exist_ok=True)
+
+    conn = sqlite3.connect(db)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS reliability_knowledge (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        pattern_id TEXT UNIQUE
+    )
+    """)
+
+    required = {
+        "root_cause": "TEXT",
+        "category": "TEXT",
+        "summary": "TEXT",
+        "repair_action": "TEXT",
+        "safe_to_auto_repair": "INTEGER DEFAULT 0",
+        "seen_count": "INTEGER DEFAULT 0",
+        "repair_success_count": "INTEGER DEFAULT 0",
+        "repair_failed_count": "INTEGER DEFAULT 0",
+        "last_seen_utc": "TEXT",
+        "archived": "INTEGER DEFAULT 0",
+    }
+
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(reliability_knowledge)")}
+    for col, typ in required.items():
+        if col not in existing:
+            conn.execute(f"ALTER TABLE reliability_knowledge ADD COLUMN {col} {typ}")
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    success_inc = 1 if repair_success is True else 0
+    failed_inc = 1 if repair_success is False else 0
+
+    conn.execute(
+        """
+        INSERT INTO reliability_knowledge (
+            pattern_id,
+            root_cause,
+            category,
+            summary,
+            repair_action,
+            safe_to_auto_repair,
+            seen_count,
+            repair_success_count,
+            repair_failed_count,
+            last_seen_utc,
+            archived
+        )
+        VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, 0)
+        ON CONFLICT(pattern_id) DO UPDATE SET
+            root_cause=excluded.root_cause,
+            category=excluded.category,
+            summary=excluded.summary,
+            repair_action=excluded.repair_action,
+            safe_to_auto_repair=excluded.safe_to_auto_repair,
+            seen_count=COALESCE(reliability_knowledge.seen_count, 0) + 1,
+            repair_success_count=COALESCE(reliability_knowledge.repair_success_count, 0) + ?,
+            repair_failed_count=COALESCE(reliability_knowledge.repair_failed_count, 0) + ?,
+            last_seen_utc=excluded.last_seen_utc
+        """,
+        (
+            pattern_id,
+            root_cause,
+            category,
+            summary,
+            repair_action,
+            1 if safe_to_auto_repair else 0,
+            success_inc,
+            failed_inc,
+            now,
+            success_inc,
+            failed_inc,
+        ),
+    )
+
+    conn.commit()
+
+    row = conn.execute("""
+        SELECT pattern_id, seen_count, repair_success_count, repair_failed_count, archived
+        FROM reliability_knowledge
+        WHERE pattern_id = ?
+    """, (pattern_id,)).fetchone()
+
+    conn.close()
+
+    return {
+        "stored": True,
+        "pattern_id": pattern_id,
+        "seen_count": row[1] if row else None,
+        "repair_success_count": row[2] if row else None,
+        "repair_failed_count": row[3] if row else None,
+        "archived": row[4] if row else None,
+    }
