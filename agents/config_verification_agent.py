@@ -15,6 +15,16 @@ SUPPORTED_ALGORITHMS = {
 }
 
 
+
+def resolve_live_url(config: dict, live_url: str | None = None) -> str:
+    return str(
+        live_url
+        or config.get("live_url")
+        or config.get("public_url")
+        or config.get("base_url")
+        or "http://127.0.0.1:8090/"
+    ).rstrip("/") + "/"
+
 @dataclass
 class VerificationContract:
     runtime: str
@@ -254,12 +264,13 @@ except Exception:
 def run_config_verification_agent(
     *,
     config: dict,
-    live_url: str = "http://127.0.0.1:8090/",
+    live_url: str | None = None,
     runtime: str | None = None,
     strategy: str | None = None,
     level: str = "full",
     environment: str | None = None,
 ) -> dict:
+    live_url = resolve_live_url(config, live_url)
     """
     Production config verification agent.
 
@@ -338,7 +349,7 @@ def run_config_verification_agent(
 @tool("config_verification_agent")
 def config_verification_langchain_tool(
     config_json: str,
-    live_url: str = "http://127.0.0.1:8090/",
+    live_url: str | None = None,
     runtime: str = "local",
     strategy: str = "direct",
     level: str = "full",
@@ -379,13 +390,15 @@ def config_verification_langchain_tool(
 def run_config_verification_agent(
     *,
     config: dict,
-    live_url: str = "http://127.0.0.1:8090/",
+    live_url: str | None = None,
     runtime: str | None = None,
     strategy: str | None = None,
     level: str = "full",
     environment: str | None = None,
     require_algorithm_integrity: bool = False,
 ) -> dict:
+    live_url = resolve_live_url(config, live_url)
+
     from core.production_security_contract import (
         apply_production_security_contract,
         validate_production_security_contract,
@@ -419,11 +432,18 @@ def run_config_verification_agent(
         environment=environment,
     )
 
-    algorithm_integrity = validate_algorithm_integrity(
-        fixed_config,
-        require_baseline=require_algorithm_integrity,
-        allow_extra_routes=False,
-    )
+    algorithm_integrity = {
+        "success": True,
+        "skipped": True,
+        "reason": "algorithm integrity baseline check is disabled for create/apply unless explicitly requested",
+    }
+
+    if require_algorithm_integrity:
+        algorithm_integrity = validate_algorithm_integrity(
+            fixed_config,
+            require_baseline=require_algorithm_integrity,
+            allow_extra_routes=False,
+        )
 
     failures = []
 

@@ -68,3 +68,38 @@ __pycache__/
 # Local generated TLS/security state
 data/security/
 data/tls/
+
+# Local secrets / SSH keys
+.env
+sshpingora
+sshpingora.pub
+sshpingora_test
+sshpingora_test.pub
+*.pem
+*.key
+
+# Python / local env
+.venv/
+__pycache__/
+*.pyc
+
+# Build/runtime outputs
+target/
+generated-pingora-proxy/target/
+tmp/
+logs/
+*.log
+*.sqlite3
+
+# Runtime state / generated plans / backups
+data/api_plans/
+data/update_backups/
+data/stable_snapshots/*.sqlite3
+docker-bluegreen/.active_color
+active_config.json
+gateway_config.json
+
+# Local backup files
+*.bak
+*.bak-*
+*.broken_backup

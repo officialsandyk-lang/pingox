@@ -1347,3 +1347,304 @@ if __name__ == "__main__":
 
     for item in load_recent_learnings(limit=10):
         print(f"- {item.get('root_cause')} | success={item.get('successful_repair_count')} | failed={item.get('failed_repair_count')}")
+
+
+
+# ---------------------------------------------------------------------------
+# Bare-metal Linux root-cause classification helpers
+# ---------------------------------------------------------------------------
+
+BARE_METAL_ROOT_CAUSE_PATTERNS = [
+    {
+        "needle": ["exec format error", "mach-o"],
+        "root_cause": "bare_metal_wrong_binary_format",
+        "layer": "build_setup",
+        "repair_hint": "Build/upload Linux ELF binary instead of Mac Mach-O binary.",
+    },
+    {
+        "needle": ["host.docker.internal", "resolve_failed", "failed to lookup address information"],
+        "root_cause": "bare_metal_docker_host_address_leak",
+        "layer": "decision_config",
+        "repair_hint": "Rewrite Docker-only upstream hostnames to 127.0.0.1/private Linux addresses.",
+    },
+    {
+        "needle": ["8091", "18081", "18082"],
+        "root_cause": "bare_metal_runtime_port_ignored",
+        "layer": "runtime",
+        "repair_hint": "Use 8090 proof mode until generated Rust supports --port dynamically.",
+    },
+    {
+        "needle": ["disable --now", "systemctl", "timed out"],
+        "root_cause": "bare_metal_systemd_stop_timeout",
+        "layer": "runtime",
+        "repair_hint": "Kill first, stop/disable separately, reset failed; never use disable --now.",
+    },
+    {
+        "needle": ["scp upload failed"],
+        "root_cause": "bare_metal_scp_upload_failed",
+        "layer": "release_upload",
+        "repair_hint": "Upload to /tmp first, then sudo mv into release path after stopping candidate.",
+    },
+    {
+        "needle": ["public/index.html", "public", "no such file"],
+        "root_cause": "bare_metal_static_assets_missing",
+        "layer": "release_packaging",
+        "repair_hint": "Upload generated-pingora-proxy/public with each release.",
+    },
+    {
+        "needle": ["nginx", "404"],
+        "root_cause": "bare_metal_nginx_public_route_not_active",
+        "layer": "edge_setup",
+        "repair_hint": "Generate NGINX default_server config, disable default site, reload nginx.",
+    },
+    {
+        "needle": ["candidate failed health check", "404"],
+        "root_cause": "bare_metal_health_check_wrong_path",
+        "layer": "verification",
+        "repair_hint": "Health check /api/ for proxy route and separately verify / homepage.",
+    },
+]
+
+
+def classify_bare_metal_root_cause(error: str | None) -> dict:
+    text = str(error or "").lower()
+
+    for item in BARE_METAL_ROOT_CAUSE_PATTERNS:
+        needles = item["needle"]
+        if all(str(needle).lower() in text for needle in needles):
+            return {
+                "root_cause": item["root_cause"],
+                "layer": item["layer"],
+                "repair_hint": item["repair_hint"],
+                "matched": needles,
+            }
+
+    return {
+        "root_cause": "bare_metal_unknown_failure",
+        "layer": "unknown",
+        "repair_hint": "Inspect SSH, systemd, NGINX, gateway runtime state, public assets, and upstream backend.",
+        "matched": [],
+    }
+
+
+
+def classify_environment_health_failure(error: str, runtime: str | None = None) -> dict:
+    text = str(error or "").lower()
+    runtime = str(runtime or "").lower()
+
+    if "__edge_health" in text and "404" in text and runtime in {"local", "direct", "local_direct"}:
+        return {
+            "root_cause": "local_edge_health_endpoint_mismatch",
+            "layer": "environment_readiness",
+            "severity": "high",
+            "summary": "Local runtime was checked using /__edge_health, but the generated local Pingora runtime does not serve that endpoint.",
+            "repair_hint": "Use / or /api/ as the local readiness URL, or generate /__edge_health in Rust for all runtimes.",
+            "repair_action": "replace_local_edge_health_wait_with_homepage_or_api",
+        }
+
+    if "public_nginx_homepage" in text and ("404" in text or "not found" in text):
+        return {
+            "root_cause": "bare_metal_static_homepage_missing",
+            "layer": "release_packaging",
+            "severity": "high",
+            "summary": "Bare-metal active release is missing public/index.html or systemd is not running from the release directory.",
+            "repair_hint": "Upload generated-pingora-proxy/public/ to /opt/pingora-ai/releases/<color>/public and ensure WorkingDirectory is release dir.",
+            "repair_action": "upload_bare_metal_static_assets",
+        }
+
+    if "host.docker.internal" in text and runtime in {"bare_metal_linux", "linux"}:
+        return {
+            "root_cause": "docker_host_address_leaked_to_bare_metal",
+            "layer": "runtime_addressing",
+            "severity": "critical",
+            "summary": "Docker-only host.docker.internal address leaked into native Linux deployment.",
+            "repair_hint": "Rewrite host.docker.internal to 127.0.0.1 or a private Linux address for bare-metal Linux.",
+            "repair_action": "normalize_bare_metal_upstreams",
+        }
+
+    return {
+        "root_cause": "unknown_environment_health_failure",
+        "layer": "environment_readiness",
+        "severity": "medium",
+        "summary": "Environment health failure could not be classified by known patterns.",
+        "repair_hint": "Inspect runtime, health URL, NGINX route, backend health, and release assets.",
+        "repair_action": None,
+    }
+
+
+
+
+
+
+def classify_high_priority_runtime_failure(runtime: str, operation: str, error: str) -> dict:
+    text = str(error or "").lower()
+    rt = str(runtime or "").lower()
+
+    if rt in {"docker_host", "docker"} and "502" in text and "/api" in text:
+        return {
+            "matched": True,
+            "runtime": runtime,
+            "operation": operation,
+            "incident_id": "docker_backend_port_unreachable",
+            "category": "docker_backend_health",
+            "root_cause": "docker_backend_port_unreachable",
+            "summary": "Docker gateway returned 502 because the expected host backend port was not reachable during verification.",
+            "repair_hint": "Start required host backend ports before Docker verification and confirm host.docker.internal reachability.",
+            "repair_action": "start_missing_demo_backends_for_config",
+            "safe_to_auto_repair": True,
+            "confidence": 0.99,
+            "score": 99,
+        }
+
+    return {"matched": False}
+
+
+def classify_from_reliability_knowledge(
+    error: str,
+    runtime: str | None = None,
+    operation: str = "deploy",
+) -> dict:
+    """
+    Classify deployment/runtime failures using the existing SQLite
+    reliability_knowledge table.
+
+    Source DB:
+      data/reliability_reports.sqlite3
+
+    This lets the root-cause agent learn from observability history instead
+    of relying only on hardcoded rules.
+    """
+    import json
+    import sqlite3
+    from pathlib import Path
+
+    high_priority = classify_high_priority_runtime_failure(runtime, operation, error)
+    if high_priority.get("matched"):
+        return high_priority
+
+    db_path = Path("data/reliability_reports.sqlite3")
+    text = str(error or "").lower()
+
+    if not db_path.exists():
+        return {
+            "matched": False,
+            "runtime": runtime,
+            "operation": operation,
+            "root_cause": "unknown_environment_failure",
+            "repair_action": None,
+            "safe_to_auto_repair": False,
+            "confidence": 0.0,
+            "reason": "reliability_reports.sqlite3 not found",
+        }
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT pattern_id, category, root_cause, summary, repair_hint, markers_json
+            FROM reliability_knowledge
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    best = None
+    best_score = 0
+
+    for row in rows:
+        try:
+            marker_data = json.loads(row["markers_json"] or "{}")
+        except Exception:
+            marker_data = {}
+
+        # Backward compatibility:
+        # Older rows may store markers_json as a plain list.
+        # Newer rows store {"markers": [...], "repair_action": "..."}.
+        if isinstance(marker_data, list):
+            markers = marker_data
+            marker_data = {
+                "markers": markers,
+                "repair_action": None,
+                "safe_to_auto_repair": False,
+            }
+        elif isinstance(marker_data, dict):
+            markers = marker_data.get("markers") or []
+        else:
+            markers = []
+            marker_data = {
+                "markers": [],
+                "repair_action": None,
+                "safe_to_auto_repair": False,
+            }
+
+        score = sum(1 for marker in markers if str(marker).lower() in text)
+
+        if score > best_score:
+            best_score = score
+            best = (row, marker_data)
+
+    if not best or best_score <= 0:
+        if runtime in {"docker_host", "docker"}:
+            docker_guess = classify_docker_backend_health_failure(error)
+            if docker_guess.get("matched"):
+                return docker_guess
+
+        return {
+            "matched": False,
+            "runtime": runtime,
+            "operation": operation,
+            "root_cause": "unknown_environment_failure",
+            "repair_action": None,
+            "safe_to_auto_repair": False,
+            "confidence": 0.0,
+            "score": 0,
+        }
+
+    row, marker_data = best
+
+    return {
+        "matched": True,
+        "runtime": runtime,
+        "operation": operation,
+        "incident_id": row["pattern_id"],
+        "category": row["category"],
+        "root_cause": row["root_cause"],
+        "summary": row["summary"],
+        "repair_hint": row["repair_hint"],
+        "repair_action": marker_data.get("repair_action"),
+        "safe_to_auto_repair": bool(marker_data.get("safe_to_auto_repair")),
+        "confidence": min(0.55 + best_score * 0.15, 0.99),
+        "score": best_score,
+    }
+
+
+def classify_docker_backend_health_failure(error: str) -> dict:
+    text = str(error or "").lower()
+
+    if (
+        "docker_bluegreen_deploy" in text
+        and "502" in text
+        and "random uses all backends" in text
+    ):
+        return {
+            "matched": True,
+            "runtime": "docker_host",
+            "operation": "deploy",
+            "root_cause": "docker_host_backend_ports_unhealthy_or_missing",
+            "category": "docker_backend_health",
+            "summary": "Docker gateway deployed, but one or more host backend ports were unreachable, causing 502s and algorithm distribution failure.",
+            "repair_hint": "Start/verify all expected host backend ports before Docker verification, especially 9101, 9102, and 9103.",
+            "repair_action": "start_missing_demo_backends_for_config",
+            "safe_to_auto_repair": True,
+            "confidence": 0.98,
+        }
+
+    return {
+        "matched": False,
+        "root_cause": "unknown_docker_backend_health_failure",
+        "repair_action": None,
+        "safe_to_auto_repair": False,
+        "confidence": 0.0,
+    }

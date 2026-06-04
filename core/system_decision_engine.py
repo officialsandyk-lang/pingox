@@ -9,6 +9,7 @@ from typing import Any
 SUPPORTED_RUNTIME_STRATEGIES = {
     ("local", "direct"),
     ("docker_host", "bluegreen"),
+    ("bare_metal_linux", "bluegreen"),
 }
 
 VALID_ALGORITHMS = {
@@ -60,6 +61,8 @@ def _runtime(value: Any) -> str:
     text = str(value or "local").strip().lower()
     if text in {"docker", "docker-host", "docker_host"}:
         return "docker_host"
+    if text in {"linux", "bare-metal", "bare_metal", "bare-metal-linux", "bare_metal_linux"}:
+        return "bare_metal_linux"
     if text in {"local", "direct"}:
         return "local"
     return text
@@ -68,7 +71,7 @@ def _runtime(value: Any) -> str:
 def _strategy(value: Any, runtime: str) -> str:
     text = str(value or "").strip().lower()
     if not text:
-        return "bluegreen" if runtime == "docker_host" else "direct"
+        return "bluegreen" if runtime in {"docker_host", "bare_metal_linux"} else "direct"
     if text in {"bluegreen", "blue-green", "blue_green"}:
         return "bluegreen"
     if text in {"direct", "local"}:
@@ -200,7 +203,7 @@ def decide_runtime(config: dict[str, Any]) -> list[SystemDecision]:
             "runtime_strategy",
             f"Runtime/strategy is {runtime}/{strategy}." if ok else f"Unsupported runtime/strategy {runtime}/{strategy}.",
             severity="high",
-            required_action=None if ok else "Use local/direct or docker_host/bluegreen.",
+            required_action=None if ok else "Use local/direct, docker_host/bluegreen, or bare_metal_linux/bluegreen.",
             evidence={"runtime": runtime, "strategy": strategy},
         )
     ]
@@ -295,16 +298,62 @@ def decide_routes(config: dict[str, Any]) -> list[SystemDecision]:
 def decide_algorithms(config: dict[str, Any]) -> list[SystemDecision]:
     decisions: list[SystemDecision] = []
 
+    multi_backend_algorithms = {
+        "random",
+        "round_robin",
+        "weighted_round_robin",
+        "least_connections",
+        "ip_hash",
+    }
+
     for route in config.get("routes", []) or []:
         if not isinstance(route, dict):
             continue
 
         path = _path(route.get("path"))
-        if path == "/":
+        route_type = route.get("type") or route.get("route_type")
+
+        # Static homepage is not a load-balanced proxy route.
+        if path == "/" or route_type == "static":
+            decisions.append(
+                _decision(
+                    True,
+                    "algorithm_integrity",
+                    f"{path} is static; skipping load-balancer algorithm validation.",
+                    severity="low",
+                    required_action=None,
+                    evidence={"path": path, "route_type": route_type or "static"},
+                )
+            )
             continue
 
         upstreams = _legacy_upstreams_from_route(route)
-        algo = _algorithm(route.get("balancing"), len(upstreams))
+
+        # Important: use the explicit requested algorithm first.
+        # Do not silently downgrade random/round_robin to single when there is only one backend.
+        raw_algo = str(
+            route.get("balancing")
+            or route.get("algorithm")
+            or ""
+        ).strip().lower().replace("-", "_")
+
+        aliases = {
+            "rr": "round_robin",
+            "roundrobin": "round_robin",
+            "weighted": "weighted_round_robin",
+            "weighted_rr": "weighted_round_robin",
+            "wrr": "weighted_round_robin",
+            "iphash": "ip_hash",
+            "least_conn": "least_connections",
+            "least_connection": "least_connections",
+        }
+
+        requested_algo = aliases.get(raw_algo, raw_algo)
+
+        if requested_algo:
+            algo = requested_algo
+        else:
+            algo = _algorithm(route.get("balancing"), len(upstreams))
 
         decisions.append(
             _decision(
@@ -313,9 +362,39 @@ def decide_algorithms(config: dict[str, Any]) -> list[SystemDecision]:
                 f"{path} uses algorithm {algo}.",
                 severity="high",
                 required_action=None if algo in VALID_ALGORITHMS else "normalize_algorithm",
-                evidence={"path": path, "algorithm": algo},
+                evidence={
+                    "path": path,
+                    "algorithm": algo,
+                    "raw_algorithm": raw_algo,
+                    "upstream_count": len(upstreams),
+                },
             )
         )
+
+        # Core load-balancer knowledge rule:
+        # multi-backend algorithms are not meaningful/safe on a single-upstream route.
+        if algo in multi_backend_algorithms and len(upstreams) < 2:
+            decisions.append(
+                _decision(
+                    False,
+                    "algorithm_integrity",
+                    (
+                        f"Cannot set {path} algorithm to {algo}: "
+                        f"route has only {len(upstreams)} upstream. "
+                        "Add at least two upstreams first."
+                    ),
+                    severity="high",
+                    required_action="add_at_least_two_upstreams_before_multi_backend_algorithm",
+                    evidence={
+                        "path": path,
+                        "algorithm": algo,
+                        "upstream_count": len(upstreams),
+                        "upstreams": upstreams,
+                        "multi_backend_algorithms": sorted(multi_backend_algorithms),
+                    },
+                )
+            )
+            continue
 
         if algo == "single":
             decisions.append(
@@ -353,30 +432,6 @@ def decide_algorithms(config: dict[str, Any]) -> list[SystemDecision]:
                         "all_weighted_objects": all_weighted_objects,
                         "has_real_weight": has_real_weight,
                     },
-                )
-            )
-
-        if algo == "ip_hash":
-            decisions.append(
-                _decision(
-                    len(upstreams) >= 2,
-                    "algorithm_integrity",
-                    f"{path} ip_hash should have at least two upstreams.",
-                    severity="medium",
-                    required_action=None if len(upstreams) >= 2 else "add_upstream_or_use_single",
-                    evidence={"path": path, "upstream_count": len(upstreams)},
-                )
-            )
-
-        if algo == "least_connections":
-            decisions.append(
-                _decision(
-                    len(upstreams) >= 2,
-                    "algorithm_integrity",
-                    f"{path} least_connections should have at least two upstreams.",
-                    severity="medium",
-                    required_action=None if len(upstreams) >= 2 else "add_upstream_or_use_single",
-                    evidence={"path": path, "upstream_count": len(upstreams)},
                 )
             )
 

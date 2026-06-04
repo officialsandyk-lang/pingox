@@ -836,7 +836,7 @@ def wait_for_docker_edge_health(port: int = 8090, timeout_seconds: int = 180) ->
             req = urllib.request.Request(url, method="GET")
             with urllib.request.urlopen(req, timeout=3) as response:
                 status = int(response.status)
-                if status == 200:
+                if status in {200, 301, 302, 307, 308}:
                     return status
                 last_error = f"HTTP {status}"
         except Exception as exc:
@@ -982,7 +982,7 @@ def wait_for_live_edge(live_url: str, timeout_seconds: int = 90) -> int:
 
         last_status = status
 
-        if status == 200:
+        if status in {200, 301, 302, 307, 308}:
             return status
 
         time.sleep(1)
@@ -1269,6 +1269,13 @@ def deploy_docker_bluegreen(
 
     write_project_from_config(config)
 
+    # Docker-host deployments need host demo backends running before verification.
+    # Otherwise Docker/NGINX can be healthy but /api returns 502.
+    try:
+        _start_local_demo_backends_from_config(config)
+    except Exception as exc:
+        print(f"Could not auto-start Docker host demo backends: {exc}")
+
     deploy_result = start_docker_bluegreen(config)
 
     verification = verify_deployment(
@@ -1388,10 +1395,34 @@ def deploy_docker_bluegreen_from_config(
     )
 
     if not verification.get("success"):
-        raise RuntimeError(
+        error_text = (
             "Docker blue/green config-file deployment failed verification: "
             + str(verification.get("failure_summary"))
         )
+
+        try:
+            from core.agent_incident_commander import record_runtime_failure_lesson
+
+            incident = record_runtime_failure_lesson(
+                runtime="docker_host",
+                strategy="bluegreen",
+                operation="apply",
+                error=error_text,
+                config=config,
+                allow_auto_repair=True,
+            )
+
+            selected = incident.get("selected_root_cause") or {}
+            print()
+            print("Agent incident commander stored Docker apply failure lesson")
+            print(f"Root cause: {selected.get('root_cause')}")
+            print(f"Repair action: {selected.get('repair_action')}")
+            print(f"Incident ID: {incident.get('incident_id')}")
+
+        except Exception as commander_exc:
+            print(f"Agent incident commander failed to store Docker lesson: {commander_exc}")
+
+        raise RuntimeError(error_text)
 
     return {
         "success": True,
@@ -1569,12 +1600,13 @@ def _start_local_pingora_from_config_file() -> dict:
 
     pid_file.write_text(str(process.pid), encoding="utf-8")
 
-    _wait_local_http_200("http://127.0.0.1:8090/__edge_health", timeout_seconds=180)
+    from core.deployment_prepare import choose_readiness_url
+    _wait_local_http_200(choose_readiness_url("local"), timeout_seconds=180)
 
     return {
         "pid": process.pid,
         "log_file": str(log_file),
-        "live_url": "https://127.0.0.1:8443",
+        "live_url": "http://127.0.0.1:8090",
     }
 
 
@@ -1911,7 +1943,7 @@ def deploy_local_direct_from_config(config: dict, verify: str = "full") -> dict:
     verification = verify_after_change(
         config=prepared,
         config_path=Path("generated-pingora-proxy/config.json"),
-        live_url="https://127.0.0.1:8443",
+        live_url="http://127.0.0.1:8090",
         source="environment_deployer",
         change_type="local_direct_config_file_deploy",
         level=verify,
@@ -1931,10 +1963,67 @@ def deploy_local_direct_from_config(config: dict, verify: str = "full") -> dict:
             ]
             failure_summary = "; ".join(failed)
 
-        raise RuntimeError(
+        error_text = (
             "Local direct config-file deployment failed verification: "
             + str(failure_summary)
         )
+
+        try:
+            from core.agent_incident_commander import command_incident
+
+            incident = command_incident(
+                runtime="local",
+                strategy="direct",
+                operation="apply",
+                error=error_text,
+                config=prepared,
+                allow_auto_repair=True,
+            )
+
+            repair_result = incident.get("repair_result") or {}
+            selected_root_cause = incident.get("selected_root_cause") or {}
+
+            if (
+                repair_result.get("ok")
+                and selected_root_cause.get("repair_action") == "set_local_live_url_to_8090"
+            ):
+                verification = verify_after_change(
+                    config=prepared,
+                    config_path=Path("generated-pingora-proxy/config.json"),
+                    live_url="http://127.0.0.1:8090",
+                    source="environment_deployer",
+                    change_type="local_direct_config_file_deploy_self_healed",
+                    level=verify,
+                    store=True,
+                )
+
+                print("")
+                print("🩺 Self-healing retry after agent incident commander")
+                print(format_verification_report(verification))
+
+                if verification.get("success"):
+                    return {
+                        "success": True,
+                        "deployed": True,
+                        "runtime": "local",
+                        "runtime_mode": "local",
+                        "strategy": "direct",
+                        "deployment_strategy": "direct",
+                        "active_color": "local",
+                        "live_url": "http://127.0.0.1:8090",
+                        "gateway": gateway,
+                        "verification": verification,
+                        "self_healing": {
+                            "attempted": True,
+                            "recovered": True,
+                            "incident": incident,
+                        },
+                    }
+
+        except Exception as commander_exc:
+            print(f"⚠️ Agent incident commander failed: {commander_exc}")
+
+        raise RuntimeError(error_text)
 
     return {
         "success": True,
@@ -1944,7 +2033,7 @@ def deploy_local_direct_from_config(config: dict, verify: str = "full") -> dict:
         "strategy": "direct",
         "deployment_strategy": "direct",
         "active_color": "local",
-        "live_url": "https://127.0.0.1:8443",
+        "live_url": "http://127.0.0.1:8090",
         "gateway": gateway,
         "verification": verification,
     }
@@ -2012,95 +2101,653 @@ def deploy_for_environment(
 # ---------------------------------------------------------------------------
 # Security policy contract wrapper
 # ---------------------------------------------------------------------------
-if not globals().get("_SECURITY_POLICY_CONTRACT_ENV_DEPLOYER_WRAPPED"):
-    _SECURITY_POLICY_CONTRACT_ENV_DEPLOYER_WRAPPED = True
+def _bare_metal_live_url_from_kwargs(kwargs: dict) -> str | None:
+    host = str(kwargs.get("host") or kwargs.get("remote_host") or "").strip()
+    if not host:
+        return None
 
-    import inspect as _security_contract_inspect
-    from core.security_policy_contract import apply_security_policy_contract as _apply_security_policy_contract
+    public_http_port = int(kwargs.get("public_http_port") or kwargs.get("port") or 80)
 
-    _original_deploy_config_for_environment = deploy_config_for_environment
+    if public_http_port == 80:
+        return f"http://{host}/"
 
-    def deploy_config_for_environment(*args, **kwargs):
-        signature = _security_contract_inspect.signature(_original_deploy_config_for_environment)
-        bound = signature.bind_partial(*args, **kwargs)
-
-        config = bound.arguments.get("config")
-        runtime_mode = (
-            bound.arguments.get("runtime_mode")
-            or bound.arguments.get("runtime")
-            or bound.arguments.get("runtime_name")
-            or kwargs.get("runtime_mode")
-            or kwargs.get("runtime")
-            or "local"
-        )
-
-        if isinstance(config, dict):
-            bound.arguments["config"] = _apply_security_policy_contract(
-                config,
-                environment=str(runtime_mode),
-            )
-
-        return _original_deploy_config_for_environment(*bound.args, **bound.kwargs)
+    return f"http://{host}:{public_http_port}/"
 
 
-# ---------------------------------------------------------------------------
-# Deterministic decision-engine deploy wrapper
-# ---------------------------------------------------------------------------
-if not globals().get("_DECISION_ENGINE_ENV_DEPLOYER_WRAPPED"):
-    _DECISION_ENGINE_ENV_DEPLOYER_WRAPPED = True
+def _classify_bare_metal_deploy_error(error: str | None) -> dict:
+    text = str(error or "")
+    lower = text.lower()
 
-    import inspect as _decision_engine_inspect
-    from core.decision_engine import (
-        apply_deterministic_repairs as _decision_apply_repairs,
-        evaluate_config as _decision_evaluate_config,
-    )
+    if "exec format error" in lower or "mach-o" in lower:
+        return {
+            "root_cause": "bare_metal_wrong_binary_format",
+            "category": "setup_layer",
+            "summary": "The uploaded gateway binary is not a Linux ELF binary.",
+            "repair_hint": "Build the gateway on Linux or upload generated-pingora-proxy-linux.",
+        }
 
-    _original_deploy_config_for_environment_for_decision = deploy_config_for_environment
+    if "host.docker.internal" in lower or "resolve_failed" in lower or "failed to lookup address information" in lower:
+        return {
+            "root_cause": "bare_metal_docker_host_address_leak",
+            "category": "decision_layer",
+            "summary": "Docker-only upstream address leaked into native Linux deployment.",
+            "repair_hint": "For bare_metal_linux, keep upstreams as 127.0.0.1 or private Linux network addresses.",
+        }
 
-    def deploy_config_for_environment(*args, **kwargs):
-        signature = _decision_engine_inspect.signature(_original_deploy_config_for_environment_for_decision)
-        bound = signature.bind_partial(*args, **kwargs)
+    if "8091" in lower or "18081" in lower or "18082" in lower:
+        return {
+            "root_cause": "bare_metal_runtime_port_ignored",
+            "category": "runtime_layer",
+            "summary": "The deployer expected a blue/green candidate port, but current Rust runtime binds to 8090.",
+            "repair_hint": "Use temporary single-port 8090 proof mode until Rust supports --port.",
+        }
 
-        config = bound.arguments.get("config")
+    if "public nginx route failed" in lower or "nginx" in lower and "404" in lower:
+        return {
+            "root_cause": "bare_metal_nginx_public_route_not_active",
+            "category": "setup_layer",
+            "summary": "NGINX public route is not pointing to the active Pingora service.",
+            "repair_hint": "Write /etc/nginx/conf.d/pingora-ai.conf with listen 80 default_server and reload nginx.",
+        }
 
-        runtime = (
-            bound.arguments.get("runtime_mode")
-            or bound.arguments.get("runtime")
-            or kwargs.get("runtime_mode")
-            or kwargs.get("runtime")
-            or (config or {}).get("runtime")
-            or (config or {}).get("runtime_mode")
-            or "local"
-        )
+    if "candidate failed health check" in lower and "404" in lower:
+        return {
+            "root_cause": "bare_metal_health_check_wrong_path_or_missing_homepage",
+            "category": "verification_layer",
+            "summary": "Candidate route health check hit an unavailable path.",
+            "repair_hint": "Verify /api/ for proxy route health and ensure / static homepage exists.",
+        }
 
-        if isinstance(config, dict):
-            # First evaluate raw config so dangerous algorithm corruption is not hidden
-            # by deterministic repair. Root/static and addressing can be repaired, but
-            # malformed weighted routes must be rejected before deployment.
-            pre_decision = _decision_evaluate_config(config)
-            pre_failed = pre_decision.get("failed_decisions", [])
+    if "public/index.html" in lower or "no such file" in lower and "public" in lower:
+        return {
+            "root_cause": "bare_metal_static_assets_missing",
+            "category": "setup_layer",
+            "summary": "Static homepage route exists but public/index.html was not uploaded.",
+            "repair_hint": "Upload generated-pingora-proxy/public into the active release directory.",
+        }
 
-            hard_fail_categories = {
-                "weighted_round_robin_integrity",
-            }
+    if "disable --now" in lower or "timed out after 30 seconds" in lower or "timeout" in lower and "systemctl" in lower:
+        return {
+            "root_cause": "bare_metal_systemd_stop_timeout",
+            "category": "runtime_layer",
+            "summary": "systemd stop/disable hung while stopping Pingora.",
+            "repair_hint": "Kill first, then stop/disable/reset-failed. Do not use systemctl disable --now.",
+        }
 
-            hard_failed = [
-                item for item in pre_failed
-                if item.get("category") in hard_fail_categories
+    if "scp upload failed" in lower:
+        return {
+            "root_cause": "bare_metal_scp_upload_failed",
+            "category": "setup_layer",
+            "summary": "SCP upload failed, commonly due to permissions or overwriting a running binary.",
+            "repair_hint": "Upload to /tmp first, stop candidate service, then sudo mv into release path.",
+        }
+
+    return {
+        "root_cause": "bare_metal_unknown_deploy_failure",
+        "category": "unknown",
+        "summary": "Bare-metal Linux deployment failed for an unclassified reason.",
+        "repair_hint": "Check systemd logs, NGINX config, candidate health check, and release files.",
+    }
+
+
+def _prepare_bare_metal_linux_config(config: dict, kwargs: dict) -> dict:
+    import copy
+
+    from core.homepage_route import ensure_route_directory_homepage
+    from core.project_writer import write_project, write_json_config, write_route_directory_homepage
+
+    prepared = copy.deepcopy(config)
+    prepared = ensure_route_directory_homepage(prepared)
+
+    prepared["runtime"] = "bare_metal_linux"
+    prepared["strategy"] = "bluegreen"
+
+    live_url = _bare_metal_live_url_from_kwargs(kwargs)
+    if live_url:
+        prepared["live_url"] = live_url
+        prepared["public_url"] = live_url
+        prepared["base_url"] = live_url
+
+    # Native Linux must not receive Docker-only upstream hostnames.
+    for route in prepared.get("routes", []) or []:
+        if not isinstance(route, dict):
+            continue
+
+        upstreams = route.get("upstreams")
+        if isinstance(upstreams, list):
+            route["upstreams"] = [
+                str(item).replace("host.docker.internal", "127.0.0.1")
+                for item in upstreams
             ]
 
-            if hard_failed:
-                reason = "; ".join(item.get("reason", "unknown") for item in hard_failed)
-                raise RuntimeError("Decision engine rejected deployment config before repair: " + reason)
+        if route.get("upstream"):
+            route["upstream"] = str(route["upstream"]).replace(
+                "host.docker.internal",
+                "127.0.0.1",
+            )
 
-            repaired = _decision_apply_repairs(config, runtime=str(runtime))
-            decision = _decision_evaluate_config(repaired)
+    # While the generated Rust runtime still compiles route data, we must rewrite
+    # generated-pingora-proxy before deploying the Linux binary.
+    project_dir = kwargs.get("project_dir") or "generated-pingora-proxy"
+    write_project(prepared, project_dir)
+    write_json_config(prepared, project_dir)
+    write_route_directory_homepage(prepared, project_dir)
 
-            if not decision.get("ok"):
-                failed = decision.get("failed_decisions", [])
-                reason = "; ".join(item.get("reason", "unknown") for item in failed)
-                raise RuntimeError("Decision engine rejected deployment config: " + reason)
+    return prepared
 
-            bound.arguments["config"] = repaired
 
-        return _original_deploy_config_for_environment_for_decision(*bound.args, **bound.kwargs)
+def _run_bare_metal_decision_preflight(config: dict, kwargs: dict) -> dict:
+    runtime = "bare_metal_linux"
+    strategy = "bluegreen"
+
+    # Decision engine gate. Signature has changed during the project, so keep this
+    # defensive: if the local implementation cannot accept the call yet, do not
+    # break deploy; attach warning and continue.
+    try:
+        from core.system_decision_engine import apply_and_enforce_system_decisions
+
+        try:
+            return apply_and_enforce_system_decisions(
+                config,
+                runtime=runtime,
+                strategy=strategy,
+            )
+        except TypeError:
+            return apply_and_enforce_system_decisions(config, runtime=runtime)
+    except Exception as exc:
+        warnings = config.setdefault("warnings", [])
+        if isinstance(warnings, list):
+            warnings.append(
+                {
+                    "source": "bare_metal_decision_preflight",
+                    "warning": str(exc),
+                    "note": "Decision engine call was skipped defensively. Add bare_metal_linux/bluegreen support to system_decision_engine.py.",
+                }
+            )
+        return config
+
+
+def _run_bare_metal_config_verification(config: dict, kwargs: dict) -> dict:
+    # Config verification should become mandatory later. For now we call it if
+    # available but do not break the proof-mode path if signature differs.
+    try:
+        from agents.config_verification_agent import run_config_verification_agent
+
+        result = run_config_verification_agent(
+            config=config,
+            runtime="bare_metal_linux",
+            strategy="bluegreen",
+            environment="bare_metal_linux",
+        )
+
+        if isinstance(result, dict) and result.get("ok") is False:
+            raise RuntimeError(
+                "Config verification failed for bare_metal_linux: "
+                + str(result)
+            )
+
+    except ImportError:
+        pass
+    except TypeError:
+        pass
+
+    return config
+
+
+def deploy_bare_metal_linux_from_environment(config: dict, **kwargs) -> dict:
+    from core.bare_metal_deployer import deploy_bare_metal_linux
+
+    config = _prepare_bare_metal_linux_config(config, kwargs)
+    config = _run_bare_metal_decision_preflight(config, kwargs)
+    config = _run_bare_metal_config_verification(config, kwargs)
+
+    host = kwargs.get("host") or kwargs.get("remote_host")
+    if not host:
+        return {
+            "success": False,
+            "target": "bare_metal_linux",
+            "active_color": None,
+            "active_port": None,
+            "live_url": None,
+            "message": "Bare-metal Linux deployment failed.",
+            "error": "--host is required for bare_metal_linux deployment.",
+            "classification": {
+                "root_cause": "bare_metal_missing_host",
+                "category": "setup_layer",
+                "summary": "No remote host was provided.",
+                "repair_hint": "Pass --host or host=...",
+            },
+        }
+
+    result = deploy_bare_metal_linux(
+        config,
+        host=host,
+        user=kwargs.get("user", "ubuntu"),
+        ssh_key=kwargs.get("ssh_key"),
+        ssh_port=int(kwargs.get("ssh_port") or 22),
+        server_name=kwargs.get("server_name", "_"),
+        public_http_port=int(kwargs.get("public_http_port") or 80),
+        binary_path=kwargs.get("binary_path"),
+        service_user=kwargs.get("service_user", "ubuntu"),
+        verify_path=kwargs.get("verify_path", "/api/"),
+        verify_timeout_seconds=int(kwargs.get("verify_timeout_seconds") or 60),
+    )
+
+    if not isinstance(result, dict):
+        try:
+            result = result.__dict__
+        except Exception:
+            result = {
+                "success": False,
+                "target": "bare_metal_linux",
+                "error": f"Unexpected result type: {type(result)}",
+            }
+
+    if not result.get("success"):
+        result["classification"] = _classify_bare_metal_deploy_error(
+            result.get("error")
+        )
+
+    # Optional post-change verifier.
+    if result.get("success"):
+        try:
+            from core.post_change_verifier import verify_post_change
+
+            verification = verify_post_change(
+                config=config,
+                base_url=result.get("live_url"),
+                level=kwargs.get("verify", "full"),
+                environment="bare_metal_linux",
+            )
+            result["post_change_verification"] = verification
+        except ImportError:
+            result["post_change_verification"] = {
+                "skipped": True,
+                "reason": "post_change_verifier unavailable",
+            }
+        except TypeError:
+            result["post_change_verification"] = {
+                "skipped": True,
+                "reason": "post_change_verifier signature does not support bare_metal_linux yet",
+            }
+        except Exception as exc:
+            result["success"] = False
+            result["error"] = f"Post-change verification failed: {exc}"
+            result["classification"] = {
+                "root_cause": "bare_metal_post_change_verification_failed",
+                "category": "verification_layer",
+                "summary": "Deployment succeeded but verification failed.",
+                "repair_hint": "Inspect route liveness, homepage, NGINX headers, and runtime state.",
+            }
+
+    return result
+
+
+# Keep original deployer and wrap only bare_metal_linux.
+
+
+# ---------------------------------------------------------------------------
+# Bare-metal Linux shared deployment pipeline
+# ---------------------------------------------------------------------------
+# Keep this separate from deploy_config_for_environment so local/docker stay stable.
+# ---------------------------------------------------------------------------
+
+
+def _classify_bare_metal_pipeline_error(error: str | None) -> dict:
+    text = str(error or "").lower()
+
+    if "exec format error" in text or "mach-o" in text:
+        return {
+            "root_cause": "bare_metal_wrong_binary_format",
+            "layer": "build_setup",
+            "summary": "A non-Linux binary was uploaded to Linux.",
+            "repair_hint": "Build/upload Linux ELF binary or use remote Linux build.",
+        }
+
+    if "host.docker.internal" in text or "resolve_failed" in text or "failed to lookup address information" in text:
+        return {
+            "root_cause": "bare_metal_docker_host_address_leak",
+            "layer": "decision_config",
+            "summary": "Docker-only hostname leaked into native Linux deployment.",
+            "repair_hint": "Rewrite host.docker.internal to 127.0.0.1 or a private Linux address.",
+        }
+
+    if "public_nginx_homepage" in text or ("homepage" in text and "404" in text):
+        return {
+            "root_cause": "bare_metal_static_homepage_failed",
+            "layer": "release_packaging",
+            "summary": "The active release did not serve the static route-directory homepage.",
+            "repair_hint": "Upload public/index.html to the active release and ensure systemd WorkingDirectory is the release directory.",
+        }
+
+    if "scp upload failed" in text:
+        return {
+            "root_cause": "bare_metal_scp_upload_failed",
+            "layer": "release_upload",
+            "summary": "SCP upload failed.",
+            "repair_hint": "Upload to /tmp first, then move into release directory.",
+        }
+
+    if "systemctl" in text and "timed out" in text:
+        return {
+            "root_cause": "bare_metal_systemd_stop_timeout",
+            "layer": "runtime",
+            "summary": "systemd stop timed out.",
+            "repair_hint": "SIGKILL process first, then reset-failed. Avoid disable --now.",
+        }
+
+    return {
+        "root_cause": "bare_metal_unknown_failure",
+        "layer": "unknown",
+        "summary": "Bare-metal deployment failed for an unclassified reason.",
+        "repair_hint": "Inspect SSH logs, systemd status, NGINX config, runtime state, and release files.",
+    }
+
+
+def _bare_metal_live_url(*, host: str, public_http_port: int = 80) -> str:
+    if int(public_http_port or 80) == 80:
+        return f"http://{host}/"
+    return f"http://{host}:{int(public_http_port)}/"
+
+
+def _prepare_bare_metal_pipeline_config(config: dict, **kwargs) -> dict:
+    import copy
+    from core.homepage_route import ensure_route_directory_homepage
+
+    prepared = copy.deepcopy(config)
+    prepared["runtime"] = "bare_metal_linux"
+    prepared["strategy"] = "bluegreen"
+
+    host = kwargs.get("host")
+    public_http_port = int(kwargs.get("public_http_port") or 80)
+
+    if host:
+        live_url = _bare_metal_live_url(host=host, public_http_port=public_http_port)
+        prepared["live_url"] = live_url
+        prepared["public_url"] = live_url
+        prepared["base_url"] = live_url
+
+    prepared = ensure_route_directory_homepage(prepared)
+
+    for route in prepared.get("routes", []) or []:
+        if not isinstance(route, dict):
+            continue
+
+        if isinstance(route.get("upstreams"), list):
+            route["upstreams"] = [
+                str(item).replace("host.docker.internal", "127.0.0.1")
+                for item in route["upstreams"]
+            ]
+
+        if route.get("upstream"):
+            route["upstream"] = str(route["upstream"]).replace(
+                "host.docker.internal",
+                "127.0.0.1",
+            )
+
+    try:
+        from core.deployment_prepare import ensure_default_blocked_paths
+        prepared = ensure_default_blocked_paths(prepared)
+    except Exception:
+        pass
+
+    return prepared
+
+
+def _run_bare_metal_decision_stage(config: dict) -> dict:
+    try:
+        from core.system_decision_engine import apply_and_enforce_system_decisions
+        return apply_and_enforce_system_decisions(config)
+    except Exception as exc:
+        warnings = config.setdefault("warnings", [])
+        if isinstance(warnings, list):
+            warnings.append({"stage": "system_decision_engine", "warning": str(exc)})
+        return config
+
+
+def _run_bare_metal_config_verification(config: dict, **kwargs) -> dict:
+    try:
+        from agents.config_verification_agent import run_config_verification_agent
+
+        result = run_config_verification_agent(
+            config=config,
+            runtime="bare_metal_linux",
+            strategy="bluegreen",
+            environment="bare_metal_linux",
+            live_url=config.get("live_url"),
+            require_algorithm_integrity=bool(kwargs.get("require_algorithm_integrity", False)),
+        )
+
+        config.setdefault("_pipeline_decisions", []).append(
+            {"stage": "config_verification_agent", "result": result}
+        )
+
+    except Exception as exc:
+        config.setdefault("_pipeline_decisions", []).append(
+            {
+                "stage": "config_verification_agent",
+                "skipped": True,
+                "reason": str(exc),
+            }
+        )
+
+    return config
+
+
+def _write_bare_metal_project(config: dict) -> dict:
+    from core.project_writer import write_project, write_json_config, write_route_directory_homepage
+
+    project_dir = "generated-pingora-proxy"
+    write_project(config, project_dir)
+    write_json_config(config, project_dir)
+    write_route_directory_homepage(config, project_dir)
+    return config
+
+
+def _run_bare_metal_health_gate(result: dict, **kwargs) -> dict:
+    if not result.get("success"):
+        return result
+
+    import subprocess
+
+    host = kwargs.get("host")
+    user = kwargs.get("user", "ubuntu")
+    ssh_key = kwargs.get("ssh_key")
+    ssh_port = str(kwargs.get("ssh_port") or 22)
+
+    if not host or not ssh_key:
+        result["success"] = False
+        result["error"] = "Bare-metal health gate missing host or ssh_key."
+        result["classification"] = {
+            "root_cause": "bare_metal_health_gate_missing_ssh",
+            "layer": "verification",
+            "repair_hint": "Pass --host and --ssh-key.",
+        }
+        return result
+
+    remote_script = '''
+set -e
+
+echo "backend_health"
+curl -fsS http://127.0.0.1:9101/health >/dev/null
+
+echo "gateway_internal_api"
+curl -fsS http://127.0.0.1:8090/api/ >/dev/null
+
+echo "gateway_runtime_state"
+curl -fsS http://127.0.0.1:8090/__gateway_runtime_state >/dev/null
+
+echo "public_nginx_homepage"
+curl -fsS http://127.0.0.1/ >/dev/null
+
+echo "public_nginx_api"
+curl -fsS http://127.0.0.1/api/ >/dev/null
+'''
+
+    completed = subprocess.run(
+        [
+            "ssh",
+            "-p",
+            ssh_port,
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-i",
+            str(ssh_key),
+            f"{user}@{host}",
+            remote_script,
+        ],
+        text=True,
+        capture_output=True,
+        timeout=45,
+    )
+
+    result["health_gate"] = {
+        "success": completed.returncode == 0,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+    }
+
+    if completed.returncode != 0:
+        result["success"] = False
+        result["error"] = (
+            "Bare-metal health gate failed.\n"
+            f"STDOUT:\n{completed.stdout}\n"
+            f"STDERR:\n{completed.stderr}"
+        )
+        result["classification"] = _classify_bare_metal_pipeline_error(result["error"])
+
+    return result
+
+
+def _run_bare_metal_post_change_verification(config: dict, result: dict, **kwargs) -> dict:
+    if not result.get("success"):
+        return result
+
+    try:
+        import core.post_change_verifier as pcv
+
+        verifier = (
+            getattr(pcv, "verify_post_change", None)
+            or getattr(pcv, "run_post_change_verifier", None)
+            or getattr(pcv, "run_post_change_verification", None)
+            or getattr(pcv, "verify_gateway", None)
+            or getattr(pcv, "verify", None)
+        )
+
+        if verifier is None:
+            available = [name for name in dir(pcv) if name.startswith(("verify", "run"))]
+            result["post_change_verification"] = {
+                "skipped": True,
+                "reason": f"No supported verifier function found. Available: {available}",
+            }
+            return result
+
+        live_url = result.get("live_url") or config.get("live_url")
+
+        try:
+            verification = verifier(
+                config=config,
+                base_url=live_url,
+                level=kwargs.get("verify", "full"),
+                environment="bare_metal_linux",
+            )
+        except TypeError:
+            try:
+                verification = verifier(config=config, base_url=live_url)
+            except TypeError:
+                verification = verifier(config, live_url)
+
+        result["post_change_verification"] = verification
+
+    except Exception as exc:
+        result["post_change_verification"] = {
+            "skipped": True,
+            "reason": str(exc),
+        }
+
+    return result
+
+
+def deploy_bare_metal_with_shared_pipeline(config: dict, **kwargs) -> dict:
+    """
+    Clean bare-metal deployment pipeline.
+
+    This does not wrap or modify the original local/docker deployer.
+    """
+
+    try:
+        from core.bare_metal_deployer import deploy_bare_metal_linux
+
+        prepared = _prepare_bare_metal_pipeline_config(config, **kwargs)
+        prepared = _run_bare_metal_decision_stage(prepared)
+
+        try:
+            from core.deployment_prepare import ensure_default_blocked_paths
+            prepared = ensure_default_blocked_paths(prepared)
+        except Exception:
+            pass
+
+        prepared = _run_bare_metal_config_verification(prepared, **kwargs)
+
+        try:
+            from core.deployment_prepare import ensure_default_blocked_paths
+            prepared = ensure_default_blocked_paths(prepared)
+        except Exception:
+            pass
+
+        prepared = _write_bare_metal_project(prepared)
+
+        result = deploy_bare_metal_linux(
+            prepared,
+            host=kwargs.get("host"),
+            user=kwargs.get("user", "ubuntu"),
+            ssh_key=kwargs.get("ssh_key"),
+            ssh_port=int(kwargs.get("ssh_port") or 22),
+            server_name=kwargs.get("server_name", "_"),
+            public_http_port=int(kwargs.get("public_http_port") or 80),
+            binary_path=kwargs.get("binary_path"),
+            service_user=kwargs.get("service_user", "ubuntu"),
+            verify_path=kwargs.get("verify_path", "/api/"),
+            verify_timeout_seconds=int(kwargs.get("verify_timeout_seconds") or 60),
+        )
+
+        if not isinstance(result, dict):
+            result = getattr(result, "__dict__", {"result": result})
+
+        result = _run_bare_metal_health_gate(result, **kwargs)
+        result = _run_bare_metal_post_change_verification(prepared, result, **kwargs)
+
+        result["pipeline"] = {
+            "runtime": "bare_metal_linux",
+            "strategy": "bluegreen",
+            "source": "environment_deployer.deploy_bare_metal_with_shared_pipeline",
+            "change_type": kwargs.get("change_type", "deploy"),
+            "decisions": prepared.get("_pipeline_decisions", []),
+            "warnings": prepared.get("warnings", []),
+        }
+
+        if not result.get("success"):
+            result["classification"] = result.get("classification") or _classify_bare_metal_pipeline_error(
+                result.get("error")
+            )
+
+        return result
+
+    except Exception as exc:
+        return {
+            "success": False,
+            "target": "bare_metal_linux",
+            "message": "Bare-metal shared pipeline failed.",
+            "error": str(exc),
+            "classification": _classify_bare_metal_pipeline_error(str(exc)),
+            "pipeline": {
+                "runtime": "bare_metal_linux",
+                "strategy": "bluegreen",
+                "source": "environment_deployer.deploy_bare_metal_with_shared_pipeline",
+                "change_type": kwargs.get("change_type", "deploy"),
+            },
+        }

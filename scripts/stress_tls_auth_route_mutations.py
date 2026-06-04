@@ -249,16 +249,16 @@ def main() -> int:
     assert_true("duplicate add kept /coupons", "/coupons" in route_paths(), str(route_paths()))
     assert_algorithm_integrity("random")
 
-    run(["pingora-ai", "edit", "/api", "--algorithm", "round_robin"], timeout=1800)
+    run(["pingora-ai", "edit", "/api", "--algorithm", "round_robin", "--confirm-route-mutation"], timeout=1800)
     verify_full("after edit /api round_robin")
     assert_algorithm_integrity("round_robin")
 
-    run(["pingora-ai", "edit", "/api", "--algorithm", "random"], timeout=1800)
+    run(["pingora-ai", "edit", "/api", "--algorithm", "random", "--confirm-route-mutation"], timeout=1800)
     verify_full("after edit /api random")
     assert_algorithm_integrity("random")
 
     for route in list(TEST_ROUTES.keys()):
-        run(["pingora-ai", "remove", route], timeout=1800)
+        run(["pingora-ai", "remove", route, "--confirm-route-mutation"], timeout=1800)
         assert_true(f"{route} absent from config after remove", route not in route_paths(), str(route_paths()))
         assert_route_removed(route)
         verify_full(f"after remove {route}")

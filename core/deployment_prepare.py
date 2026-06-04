@@ -231,3 +231,115 @@ if not globals().get("_SECURITY_POLICY_CONTRACT_DEPLOYMENT_PREPARE_WRAPPED"):
         "prepare_for_deployment",
     ]:
         _wrap_prepare_function(_name)
+
+
+
+# ---------------------------------------------------------------------------
+# Bare-metal Linux preparation rules
+# ---------------------------------------------------------------------------
+
+def prepare_bare_metal_linux_config(config: dict, *, host: str | None = None, public_http_port: int = 80) -> dict:
+    """
+    Prevent known bare-metal issues before deployment.
+
+    Rules:
+    - Ensure / route-directory homepage exists.
+    - Ensure live_url points to the Linux host, not localhost:8080.
+    - Rewrite host.docker.internal to native Linux address.
+    - Keep runtime/strategy explicit.
+    """
+
+    from core.homepage_route import ensure_route_directory_homepage
+
+    config = ensure_route_directory_homepage(config)
+
+    config["runtime"] = "bare_metal_linux"
+    config["strategy"] = "bluegreen"
+
+    if host:
+        live_url = f"http://{host}/" if int(public_http_port or 80) == 80 else f"http://{host}:{public_http_port}/"
+        config["live_url"] = live_url
+        config["public_url"] = live_url
+        config["base_url"] = live_url
+
+    for route in config.get("routes", []) or []:
+        if not isinstance(route, dict):
+            continue
+
+        if isinstance(route.get("upstreams"), list):
+            route["upstreams"] = [
+                str(item).replace("host.docker.internal", "127.0.0.1")
+                for item in route["upstreams"]
+            ]
+
+        if route.get("upstream"):
+            route["upstream"] = str(route["upstream"]).replace(
+                "host.docker.internal",
+                "127.0.0.1",
+            )
+
+    return config
+
+
+
+# ---------------------------------------------------------------------------
+# Shared security defaults
+# ---------------------------------------------------------------------------
+
+DEFAULT_BLOCKED_PATHS = [
+    "/.env",
+    "/.git",
+    "/admin.php",
+    "/phpmyadmin",
+    "/wp-admin",
+    "/wp-login.php",
+]
+
+
+def ensure_default_blocked_paths(config: dict) -> dict:
+    if not isinstance(config, dict):
+        return config
+
+    security = config.setdefault("security", {})
+    blocked = security.setdefault("blocked_paths", [])
+
+    if not isinstance(blocked, list):
+        blocked = []
+        security["blocked_paths"] = blocked
+
+    existing = set(str(item).strip() for item in blocked)
+
+    for path in DEFAULT_BLOCKED_PATHS:
+        if path not in existing:
+            blocked.append(path)
+
+    return config
+
+
+
+def choose_readiness_url(runtime: str, config: dict | None = None) -> str:
+    runtime = str(runtime or "local").lower()
+
+    if runtime in {"local", "direct", "local_direct"}:
+        return "http://127.0.0.1:8090/"
+
+    if runtime in {"docker_host", "docker"}:
+        # Docker NGINX edge may expose a dedicated edge health endpoint.
+        return "http://127.0.0.1:8090/__edge_health"
+
+    if runtime in {"bare_metal_linux", "linux"}:
+        return "http://127.0.0.1/api/"
+
+    return "http://127.0.0.1:8090/"
+
+
+def repair_environment_readiness_url(runtime: str, url: str) -> str:
+    runtime = str(runtime or "local").lower()
+    url = str(url or "")
+
+    if runtime in {"local", "direct", "local_direct"} and "__edge_health" in url:
+        return "http://127.0.0.1:8090/"
+
+    return url
+
+

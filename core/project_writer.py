@@ -1,4 +1,5 @@
 from __future__ import annotations
+from core.homepage_route import ensure_route_directory_homepage
 
 import html
 import json
@@ -172,6 +173,7 @@ def get_static_index(config: dict[str, Any]) -> str:
 
 
 def write_json_config(config: dict[str, Any], project_dir: str | Path) -> Path:
+    config = ensure_route_directory_homepage(config)
     project_path = Path(project_dir)
     project_path.mkdir(parents=True, exist_ok=True)
 
@@ -185,6 +187,7 @@ def write_json_config(config: dict[str, Any], project_dir: str | Path) -> Path:
 
 
 def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Path) -> Path:
+    config = ensure_route_directory_homepage(config)
     """
     Always generate the route-directory homepage from config.
 
@@ -212,6 +215,13 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
         default=8090,
     )
 
+    base_url = str(
+        config.get("live_url")
+        or config.get("public_url")
+        or config.get("base_url")
+        or f"http://127.0.0.1:{port}/"
+    ).rstrip("/") + "/"
+
     routes = config.get("routes") or []
 
     if not isinstance(routes, list):
@@ -236,7 +246,7 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
         upstream_text = route_display_upstreams(route)
 
         url_path = "/" if path == "/" else path.rstrip("/") + "/"
-        url = f"http://127.0.0.1:{port}{url_path}"
+        url = base_url.rstrip("/") + url_path
 
         rows.append(
             f"""
@@ -376,7 +386,7 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
     <p>This page is served directly by the generated Pingora static webserver.</p>
 
     <div class="meta">
-      <div class="meta-item">Live URL: <code>http://127.0.0.1:{port}/</code></div>
+      <div class="meta-item">Live URL: <code>{html.escape(base_url)}</code></div>
       <div class="meta-item">Total routes: <strong>{len(normalized_routes)}</strong></div>
       <div class="meta-item">Runtime: <code>{html.escape(str(config.get("runtime") or config.get("runtime_mode") or "local"))}</code></div>
       <div class="meta-item">Strategy: <code>{html.escape(str(config.get("strategy") or config.get("deployment_strategy") or "direct"))}</code></div>
@@ -791,6 +801,7 @@ def _pw_build_routes_function_from_config(config):
 
 
 def rewrite_rust_build_routes(config, project_dir):
+    config = ensure_route_directory_homepage(config)
     project_path = Path(project_dir)
     main_rs = project_path / "src" / "main.rs"
 
@@ -829,6 +840,7 @@ def write_project(
     project_dir: str | Path = DEFAULT_PROJECT_DIR,
     **_: Any,
 ) -> Path:
+    config = ensure_route_directory_homepage(config)
     """
     Write/update a generated gateway project.
 
@@ -898,6 +910,7 @@ def write(config: dict[str, Any], project_dir: str | Path = DEFAULT_PROJECT_DIR,
 
 
 def render_main_rs(config: dict[str, Any]) -> str:
+    config = ensure_route_directory_homepage(config)
     """
     Compatibility function used by core.compose_writer.
 
