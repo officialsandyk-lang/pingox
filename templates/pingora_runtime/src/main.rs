@@ -26,12 +26,23 @@ struct UpstreamConfig {
 }
 
 #[derive(Clone, Debug)]
+struct CacheConfig {
+    enabled: bool,
+    ttl_seconds: u64,
+    methods: Vec<String>,
+    cache_key: String,
+    bypass_headers: Vec<String>,
+    stale_while_revalidate_seconds: u64,
+}
+
+#[derive(Clone, Debug)]
 struct RouteConfig {
     path: String,
     route_type: String,
     root: String,
     index: String,
     balancing: String,
+    cache: Option<CacheConfig>,
     upstreams: Vec<UpstreamConfig>,
 }
 
@@ -99,6 +110,20 @@ fn current_unix_ms() -> u128 {
 
 fn runtime_state_key(route_path: &str, upstream_address: &str) -> String {
     format!("{}|{}", route_path, upstream_address)
+}
+
+fn default_cache_config() -> CacheConfig {
+    CacheConfig {
+        enabled: false,
+        ttl_seconds: 30,
+        methods: vec!["GET".to_string()],
+        cache_key: "method:path:query".to_string(),
+        bypass_headers: vec![
+            "authorization".to_string(),
+            "x-api-key".to_string(),
+        ],
+        stale_while_revalidate_seconds: 0,
+    }
 }
 
 fn json_escape(value: &str) -> String {
@@ -900,6 +925,7 @@ fn build_routes() -> Vec<RouteConfig> {
         root: "public".to_string(),
         index: "index.html".to_string(),
         balancing: "single".to_string(),
+        cache: Some(default_cache_config()),
         upstreams: vec![
         ],
     },
@@ -909,6 +935,7 @@ fn build_routes() -> Vec<RouteConfig> {
         root: "public".to_string(),
         index: "index.html".to_string(),
         balancing: "single".to_string(),
+        cache: Some(default_cache_config()),
         upstreams: vec![
         UpstreamConfig {
             address: "127.0.0.1:9101".to_string(),
