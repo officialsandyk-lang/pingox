@@ -3,6 +3,7 @@ use bytes::Bytes;
 use pingora::http::ResponseHeader;
 use pingora::prelude::*;
 use std::collections::HashMap;
+use std::env;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
@@ -11,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+const GATEWAY_LISTEN_PORT: u16 = 8090;
 const HEALTH_CHECK_PATH: &str = "/health";
 const HEALTH_INTERVAL_SECONDS: u64 = 5;
 const HEALTH_TIMEOUT_SECONDS: u64 = 2;
@@ -928,6 +930,34 @@ fn build_security() -> SecurityConfig {
     }
 }
 
+fn resolve_listen_port() -> u16 {
+    let args = env::args().collect::<Vec<_>>();
+
+    for index in 0..args.len() {
+        if args[index] == "--port" {
+            if let Some(value) = args.get(index + 1) {
+                if let Ok(port) = value.parse::<u16>() {
+                    return port;
+                }
+            }
+        }
+
+        if let Some(value) = args[index].strip_prefix("--port=") {
+            if let Ok(port) = value.parse::<u16>() {
+                return port;
+            }
+        }
+    }
+
+    if let Ok(value) = env::var("PINGORA_AI_LISTEN_PORT") {
+        if let Ok(port) = value.parse::<u16>() {
+            return port;
+        }
+    }
+
+    GATEWAY_LISTEN_PORT
+}
+
 fn main() {
     let routes = build_routes();
     let security = build_security();
@@ -937,12 +967,15 @@ fn main() {
     let mut server = Server::new(None).unwrap();
     server.bootstrap();
 
+    let listen_port = resolve_listen_port();
+    let listen_addr = format!("0.0.0.0:{}", listen_port);
+
     let mut service = http_proxy_service(&server.configuration, proxy);
-    service.add_tcp("0.0.0.0:8090");
+    service.add_tcp(&listen_addr);
 
     server.add_service(service);
 
-    println!("🚀 Starting Pingora proxy on port 8090");
+    println!("🚀 Starting Pingora proxy on port {}", listen_port);
     println!("🩺 Runtime upstream health checks enabled");
     println!("📊 Runtime state endpoint: /__gateway_runtime_state");
 

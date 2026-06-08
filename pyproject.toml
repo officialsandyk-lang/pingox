@@ -31,3 +31,8 @@ exclude = [
     "generated-projects*",
     "runtime*"
 ]
+
+[tool.setuptools.package-data]
+pingora_ai = [
+    "runtime_bundle/**/*"
+]

@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>AI Pingora Gateway Route Directory</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f9fafb;
+      --card: #ffffff;
+      --text: #111827;
+      --muted: #4b5563;
+      --border: #e5e7eb;
+      --link: #2563eb;
+      --code-bg: #f3f4f6;
+      --badge-bg: #dcfce7;
+      --badge-text: #166534;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 0;
+      padding: 40px;
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    main {
+      max-width: 1180px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 32px;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.06);
+    }
+
+    h1 {
+      margin: 14px 0 12px;
+      font-size: 34px;
+      line-height: 1.15;
+    }
+
+    p {
+      color: var(--muted);
+      font-size: 16px;
+    }
+
+    code {
+      background: var(--code-bg);
+      padding: 2px 6px;
+      border-radius: 6px;
+      color: #111827;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 24px;
+      font-size: 15px;
+    }
+
+    th, td {
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+      padding: 12px 14px;
+      vertical-align: top;
+    }
+
+    th {
+      background: var(--code-bg);
+      color: #374151;
+      font-weight: 700;
+    }
+
+    a {
+      color: var(--link);
+      font-weight: 700;
+      text-decoration: none;
+    }
+
+    a:hover {
+      text-decoration: underline;
+    }
+
+    .badge {
+      display: inline-block;
+      background: var(--badge-bg);
+      color: var(--badge-text);
+      padding: 5px 11px;
+      border-radius: 999px;
+      font-weight: 700;
+      font-size: 14px;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 16px;
+    }
+
+    .meta-item {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+      background: #ffffff;
+    }
+
+    .muted {
+      color: var(--muted);
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <span class="badge">✅ Gateway live</span>
+    <h1>AI Pingora Gateway Route Directory</h1>
+
+    <p>This page is served directly by the generated Pingora static webserver.</p>
+
+    <div class="meta">
+      <div class="meta-item">Live URL: <code>http://192.168.252.2/</code></div>
+      <div class="meta-item">Total routes: <strong>2</strong></div>
+      <div class="meta-item">Runtime: <code>bare_metal_linux</code></div>
+      <div class="meta-item">Strategy: <code>bluegreen</code></div>
+    </div>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Route</th>
+          <th>Type</th>
+          <th>Balancing</th>
+          <th>Upstreams / Static file</th>
+        </tr>
+      </thead>
+      <tbody>
+        
+            <tr>
+              <td><a href="http://192.168.252.2/">/</a></td>
+              <td>static</td>
+              <td>single/static</td>
+              <td><code>public/index.html</code></td>
+            </tr>
+            
+            <tr>
+              <td><a href="http://192.168.252.2/api/">/api</a></td>
+              <td>proxy</td>
+              <td>single</td>
+              <td><code>127.0.0.1:9101</code></td>
+            </tr>
+            
+      </tbody>
+    </table>
+
+    <p class="muted">
+      This directory is regenerated from <code>config.json</code> on every project write/update.
+    </p>
+  </main>
+</body>
+</html>
