@@ -7,6 +7,7 @@ from typing import Any
 
 
 SUPPORTED_ALGORITHMS = {
+    "single",
     "random",
     "round_robin",
     "weighted_round_robin",

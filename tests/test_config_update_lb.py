@@ -115,3 +115,33 @@ def test_update_set_algorithm():
 
     assert result["changed"] is True
     assert result["config"]["routes"][0]["balancing"] == "round_robin"
+
+
+def test_update_repairs_stringified_upstream_dicts_when_editing_algorithm():
+    config = {
+        "port": 8088,
+        "routes": [
+            {
+                "path": "/api",
+                "upstream": "127.0.0.1:9101",
+                "balancing": "random",
+                "upstreams": [
+                    "{'address': '127.0.0.1:9101', 'weight': 1}",
+                    "{'address': '127.0.0.1:9102', 'weight': 1}",
+                ],
+            }
+        ],
+    }
+
+    result = apply_config_update(
+        config,
+        "set /api algorithm to round_robin",
+    )
+
+    route = result["config"]["routes"][0]
+
+    assert route["balancing"] == "round_robin"
+    assert route["upstreams"] == [
+        {"address": "127.0.0.1:9101", "weight": 1},
+        {"address": "127.0.0.1:9102", "weight": 1},
+    ]

@@ -1481,7 +1481,47 @@ def classify_high_priority_runtime_failure(runtime: str, operation: str, error: 
     text = str(error or "").lower()
     rt = str(runtime or "").lower()
 
-    if rt in {"docker_host", "docker"} and "502" in text and "/api" in text:
+    # Docker post-deploy transient concurrency/warm-up.
+    # This is NOT backend unreachable when the failure is a mixed concurrent
+    # verifier result such as 200/503/error. Backend-unreachable must only be
+    # used when backend health/reachability checks actually fail.
+    if (
+        rt in {"docker_host", "docker"}
+        and ("concurrent all 200" in text or "concurrent" in text)
+        and ("503" in text or "error" in text)
+    ):
+        return {
+            "matched": True,
+            "runtime": runtime,
+            "operation": operation,
+            "incident_id": "docker_post_deploy_transient_503_during_concurrency_warmup",
+            "category": "docker_post_deploy_concurrency",
+            "root_cause": "docker_post_deploy_transient_503_during_concurrency_warmup",
+            "summary": (
+                "Docker blue/green reached readiness, but immediate full-concurrency "
+                "verification saw transient 200/503/error responses before runtime "
+                "connection health fully converged."
+            ),
+            "repair_hint": (
+                "Wait for Docker runtime health convergence, warm routes, then retry "
+                "concurrent verification. Do not classify as backend unreachable unless "
+                "host/container backend health checks fail."
+            ),
+            "repair_action": "wait_for_runtime_health_then_retry_concurrent_verification",
+            "safe_to_auto_repair": True,
+            "confidence": 0.95,
+            "score": 95,
+        }
+
+    # Real Docker backend unreachable.
+    # Keep this narrow: use it for smoke/live-route 502 failures, not mixed
+    # post-deploy concurrency warm-up failures.
+    if (
+        rt in {"docker_host", "docker"}
+        and "502" in text
+        and "/api" in text
+        and "concurrent" not in text
+    ):
         return {
             "matched": True,
             "runtime": runtime,
@@ -1498,6 +1538,7 @@ def classify_high_priority_runtime_failure(runtime: str, operation: str, error: 
         }
 
     return {"matched": False}
+
 
 
 def classify_from_reliability_knowledge(
