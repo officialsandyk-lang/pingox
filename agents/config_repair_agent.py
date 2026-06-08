@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import re
 from typing import Any, Dict, Iterable, List, Tuple
+from core.cache_policy import normalize_config_cache_policies
 
 try:
     from langsmith import traceable
@@ -1017,5 +1018,7 @@ def repair_config(
     repaired = _restore_prompt_algorithms_after_merge(repaired, prompt)
 
     repaired = _ensure_static_webserver_route(repaired, prompt)
+
+    repaired = normalize_config_cache_policies(repaired)
 
     return repaired
