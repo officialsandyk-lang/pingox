@@ -64,6 +64,13 @@ def write_config_mirrors(config: dict[str, Any], project_dir: str | Path = DEFAU
 
 
 def assert_final_config_safe(config: dict[str, Any]) -> None:
+    """
+    Final deterministic safety check before deployment.
+
+    This must not enforce stale historical baselines such as /api=random.
+    A route with one upstream is valid as single. Multi-upstream routes must
+    use a valid load-balancing algorithm.
+    """
     routes = config.get("routes") or []
 
     if not isinstance(routes, list) or not routes:
@@ -80,32 +87,53 @@ def assert_final_config_safe(config: dict[str, Any]) -> None:
     if root.get("upstream") or root.get("backend") or root.get("upstreams"):
         raise RuntimeError("Final config root / still has backend/upstreams.")
 
-    route_map = {
-        _normalize_path(route.get("path")): route
-        for route in routes
-        if isinstance(route, dict)
+    valid_multi_algorithms = {
+        "random",
+        "round_robin",
+        "weighted_round_robin",
+        "ip_hash",
+        "least_connections",
     }
 
-    expected_algorithms = {
-        "/api": "random",
-        "/users": "round_robin",
-        "/orders": "weighted_round_robin",
-        "/payments": "ip_hash",
-        "/reports": "least_connections",
-    }
-
-    for path, expected in expected_algorithms.items():
-        route = route_map.get(path)
-
-        if not route:
+    for route in routes:
+        if not isinstance(route, dict):
             continue
 
-        actual = route.get("balancing")
+        path = _normalize_path(route.get("path"))
 
-        if actual != expected:
+        if path == "/" or str(route.get("type") or "").lower() == "static":
+            continue
+
+        upstreams = route.get("upstreams") or []
+
+        if route.get("upstream") and not upstreams:
+            upstreams = [route.get("upstream")]
+
+        if not isinstance(upstreams, list):
+            raise RuntimeError(f"Final config route {path} upstreams must be a list.")
+
+        upstream_count = len(upstreams)
+        actual = route.get("balancing") or route.get("algorithm")
+
+        if upstream_count <= 0:
+            raise RuntimeError(f"Final config route {path} has no upstreams.")
+
+        if upstream_count == 1:
+            if actual not in {None, "", "single"}:
+                raise RuntimeError(
+                    f"Final config route {path} has wrong algorithm: expected single, got {actual}"
+                )
+
+            route["balancing"] = "single"
+            route["upstream"] = upstreams[0]
+            route["upstreams"] = upstreams
+            continue
+
+        if actual not in valid_multi_algorithms:
             raise RuntimeError(
-                f"Final config route {path} has wrong algorithm: expected {expected}, got {actual}"
+                f"Final config route {path} has invalid multi-upstream algorithm: {actual}"
             )
+
 
 
 def prepare_config_for_deployment(

@@ -176,6 +176,7 @@ def infer_balanced_path_from_text(text: str) -> str | None:
     segment = str(text or "").strip()
 
     patterns = [
+        r"(^|\s)(/[a-zA-Z0-9/_\-.]*)\s+(?:weighted\s+round\s+robin|round\s+robin|least\s+connections?|ip\s+hash|random|sticky)\s+(?:across|between|over)\b",
         r"(?:load\s+balance|load[- ]?balance|balance)\s+(/[a-zA-Z0-9/_\-.]*)\s+(?:across|between|over)",
         r"(?:with|route|path|for)\s+(/[a-zA-Z0-9/_\-.]*)\s+(?:balanced|load\s+balanced|load\s+balance|using|across)",
         r"(^|\s)(/[a-zA-Z0-9/_\-.]*)\s+(?:balanced|load\s+balanced|load\s+balance|using)\b",
@@ -234,6 +235,18 @@ def _segment_has_load_balancer_intent(segment: str) -> bool:
 
     if "using random" in normalized:
         return True
+
+    if any(marker in normalized for marker in [" across ", " between ", " over "]):
+        if "weighted round robin" in normalized:
+            return True
+        if "round robin" in normalized:
+            return True
+        if "random" in normalized:
+            return True
+        if "least connection" in normalized or "least connections" in normalized:
+            return True
+        if "ip hash" in normalized or "sticky" in normalized:
+            return True
 
     if "using least connection" in normalized or "using least connections" in normalized:
         return True
@@ -603,11 +616,8 @@ def preflight_node(state: GraphState) -> dict:
         use_compose = False
 
     print("")
-    # Lock environment before printing/routing.
-    runtime = requested_runtime
-    runtime_mode = requested_runtime_mode
-    strategy = requested_strategy
-    deployment_strategy = requested_strategy
+    # Environment is already resolved from state for this preflight node.
+    deployment_strategy = strategy
 
     print(f"Runtime selected: {runtime}")
     print(f"Runtime mode: {runtime_mode}")

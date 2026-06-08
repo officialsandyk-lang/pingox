@@ -648,6 +648,148 @@ def check_add_route_noop_or_backend_conflict(args):
 # End add-route duplicate / backend-port guard
 # ---------------------------------------------------------------------
 
+def _normalize_route_path_for_guard(value):
+    path = str(value or "").strip()
+    if not path.startswith("/"):
+        path = "/" + path
+    if len(path) > 1:
+        path = path.rstrip("/")
+    return path or "/"
+
+
+def _route_upstream_count_for_guard(route):
+    upstreams = route.get("upstreams")
+
+    if isinstance(upstreams, list):
+        return len(upstreams)
+
+    if route.get("upstream") or route.get("backend"):
+        return 1
+
+    return 0
+
+
+def _find_route_for_guard(config, route_path):
+    wanted = _normalize_route_path_for_guard(route_path)
+
+    for route in config.get("routes") or []:
+        if not isinstance(route, dict):
+            continue
+
+        if _normalize_route_path_for_guard(route.get("path")) == wanted:
+            return route
+
+    return None
+
+
+def _algorithm_requires_multiple_upstreams_for_guard(algorithm):
+    return str(algorithm or "").strip().lower() in {
+        "random",
+        "round_robin",
+        "weighted_round_robin",
+        "ip_hash",
+        "least_connections",
+    }
+
+
+def _block_invalid_single_upstream_algorithm_edit(config, prompt):
+    """
+    Hard safety guard.
+
+    Confirmation means: user intentionally allows a safe route mutation.
+    Confirmation must not allow an invalid load-balancing algorithm.
+
+    A route with one upstream must stay single until more upstreams exist.
+    """
+    import json
+    import re
+
+    prompt_text = str(prompt or "")
+    lower = prompt_text.lower()
+
+    if "algorithm" not in lower and "round_robin" not in lower and "random" not in lower and "least_connections" not in lower and "ip_hash" not in lower and "weighted_round_robin" not in lower:
+        return None
+
+    route_match = re.search(r"(/[-a-zA-Z0-9_./]+)", prompt_text)
+    if not route_match:
+        return None
+
+    route_path = _normalize_route_path_for_guard(route_match.group(1))
+
+    algorithm = None
+    for candidate in [
+        "weighted_round_robin",
+        "least_connections",
+        "round_robin",
+        "random",
+        "ip_hash",
+        "single",
+    ]:
+        if candidate in lower:
+            algorithm = candidate
+            break
+
+    if not algorithm:
+        return None
+
+    route = _find_route_for_guard(config, route_path)
+    if not route:
+        return None
+
+    upstream_count = _route_upstream_count_for_guard(route)
+
+    if upstream_count <= 1 and _algorithm_requires_multiple_upstreams_for_guard(algorithm):
+        result = {
+            "success": True,
+            "deployed": False,
+            "changed": False,
+            "understood": True,
+            "reason": "algorithm_requires_multiple_upstreams",
+            "message": (
+                f"⚠️ Cannot set {route_path} to {algorithm} because the route has "
+                f"{upstream_count} upstream. Add at least 2 upstreams first, or keep algorithm as single. "
+                "No deployment was made."
+            ),
+            "route": route_path,
+            "requested_algorithm": algorithm,
+            "upstream_count": upstream_count,
+            "change_summary": [
+                f"Blocked invalid algorithm edit: {route_path} has {upstream_count} upstream"
+            ],
+        }
+
+        print(result["message"])
+        print(json.dumps(result, indent=2))
+        return result
+
+    return None
+
+
+
+def _common_invalid_algorithm_preflight(args) -> dict | None:
+    """
+    Environment-wide guard.
+
+    Applies before Docker/local/Linux deployment. A confirmation flag confirms
+    user intent, but it must not bypass load-balancer validity rules.
+    """
+    try:
+        prompt = " ".join(args.prompt).strip()
+    except Exception:
+        prompt = str(getattr(args, "prompt", "") or "")
+
+    try:
+        config = load_config()
+    except Exception:
+        try:
+            config = load_current_config()
+        except Exception:
+            return None
+
+    return _block_invalid_single_upstream_algorithm_edit(config, prompt)
+
+
+
 def deploy_docker_bluegreen_update(args: argparse.Namespace) -> dict[str, Any]:
     add_route_guard = check_add_route_noop_or_backend_conflict(args)
     if add_route_guard is not None:
@@ -699,7 +841,33 @@ def deploy_docker_bluegreen_update(args: argparse.Namespace) -> dict[str, Any]:
         }
 
     current = load_config()
+
+    # Hard stop before backup/build/deploy:
+    # confirmation allows intentional safe mutation, not invalid algorithms.
+    invalid_algorithm_guard = _block_invalid_single_upstream_algorithm_edit(
+        current,
+        prompt,
+    )
+    if invalid_algorithm_guard is not None:
+        return invalid_algorithm_guard
+
     backup = create_backup(reason="before_docker_bluegreen_update")
+
+    if backup:
+        try:
+            from core.backup_registry import record_backup
+
+            record_backup(
+                backup_path=backup,
+                reason="before_docker_bluegreen_update",
+                runtime="docker_host",
+                strategy="bluegreen",
+                route_change=prompt,
+                valid_before_backup=True,
+                evidence={"stage": "after_decision_integrity_preflight"},
+            )
+        except Exception:
+            pass
 
     mutable_paths = route_mutation_paths(prompt)
 
@@ -952,6 +1120,16 @@ def main() -> int:
     if runtime_mode == "docker_host" and strategy == "bluegreen":
         args = parse_args()
 
+        invalid_algorithm_guard = _common_invalid_algorithm_preflight(args)
+        if invalid_algorithm_guard is not None:
+            print("")
+            print("📋 Update summary:")
+            for item in invalid_algorithm_guard.get("change_summary", []):
+                print(f"⚠️ {item}")
+            print("")
+            print(json.dumps(invalid_algorithm_guard, indent=2, default=str)[:6000])
+            return 0
+
         print("🛠️ AI Pingora Gateway Docker Update")
         print(f"Runtime: {runtime}")
         print(f"Strategy: {strategy}")
@@ -969,7 +1147,18 @@ def main() -> int:
 
         return 0 if result.get("success") else 2
 
-    # Local/direct and old flows stay untouched.
+    # Local/direct/Linux legacy flows also get the same invalid algorithm guard.
+    args = parse_args()
+    invalid_algorithm_guard = _common_invalid_algorithm_preflight(args)
+    if invalid_algorithm_guard is not None:
+        print("")
+        print("📋 Update summary:")
+        for item in invalid_algorithm_guard.get("change_summary", []):
+            print(f"⚠️ {item}")
+        print("")
+        print(json.dumps(invalid_algorithm_guard, indent=2, default=str)[:6000])
+        return 0
+
     return delegate_to_legacy()
 
 

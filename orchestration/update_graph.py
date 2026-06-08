@@ -1436,6 +1436,189 @@ def run_cargo_check(
 
 
 # ---------------------------------------------------------------------
+
+def _is_systemd_native_update(config: dict[str, Any]) -> bool:
+    return bool(config.get("_systemd") or config.get("systemd"))
+
+
+def _restart_systemd_runtime_after_update(config: dict[str, Any], project_dir: Path) -> dict[str, Any]:
+    """
+    Native public-port update path.
+
+    When Pingora-AI owns port 80 through systemd, update must rebuild the promoted
+    project and restart pingora-ai-runtime. It must not try to start a second
+    foreground gateway on port 80.
+    """
+    import subprocess
+
+    subprocess.run(
+        ["cargo", "build", "--release"],
+        cwd=str(project_dir),
+        check=True,
+    )
+
+    from core.native_service import install_systemd_service
+
+    port = int(config.get("port") or config.get("public_port") or config.get("listen_port") or 80)
+
+    result = install_systemd_service(
+        project_dir=project_dir,
+        port=port,
+        service_user=str(config.get("service_user") or "ubuntu"),
+    )
+
+    if not result.get("success"):
+        raise RuntimeError(f"Failed to restart systemd runtime after update: {result}")
+
+    return {
+        "success": True,
+        "deployed": True,
+        "update_mode": "local_direct_systemd",
+        "active_color": "local",
+        "live_url": f"http://127.0.0.1:{port}",
+        "restart_performed": True,
+        "gateway": result,
+    }
+
+
+
+
+def _is_native_systemd_bluegreen_update(config: dict[str, Any]) -> bool:
+    """
+    Native production update mode.
+
+    When the active gateway owns a public port through systemd, update/add/edit/remove
+    must not try to start another same-port process. It should use the existing
+    candidate/blue-green deployment path where possible.
+    """
+    if not isinstance(config, dict):
+        return False
+
+    return bool(config.get("_systemd") or config.get("systemd")) and int(
+        config.get("port") or config.get("public_port") or config.get("listen_port") or 0
+    ) in {80, 443}
+
+
+def run_native_systemd_bluegreen_deploy(
+    *,
+    config: dict[str, Any],
+    project_dir: Path,
+    active_color: str,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """
+    Use existing blue/green-capable deploy path for native systemd/public-port updates.
+
+    This intentionally avoids local same-port restart.
+    """
+    # Prefer existing bare-metal deployer if present.
+    deployer_cls = _get_callable(
+        "core.bare_metal.deployer",
+        ["BareMetalDeployer", "BareMetalDeploymentManager", "Deployer"],
+    )
+
+    deploy_fn = _get_callable(
+        "core.bare_metal.deployer",
+        [
+            "deploy_config_bluegreen",
+            "deploy_bluegreen",
+            "deploy_candidate",
+            "deploy",
+        ],
+    )
+
+    # Function style deployer.
+    if deploy_fn is not None:
+        attempts = [
+            lambda: deploy_fn(config=config, project_dir=project_dir, active_color=active_color, run_id=run_id),
+            lambda: deploy_fn(config=config, project_dir=project_dir, active_color=active_color),
+            lambda: deploy_fn(config=config, project_dir=project_dir),
+            lambda: deploy_fn(config=config),
+            lambda: deploy_fn(config),
+        ]
+
+        last_error: Exception | None = None
+        for attempt in attempts:
+            try:
+                result = attempt()
+                if not isinstance(result, dict):
+                    result = {"success": True, "deployed": True}
+                result.setdefault("success", True)
+                result.setdefault("deployed", result.get("success", True))
+                result.setdefault("update_mode", "native_systemd_bluegreen")
+                result.setdefault("active_color", result.get("active_color") or active_color)
+                result.setdefault("live_url", result.get("live_url") or _live_url_for_config(config))
+                return result
+            except TypeError as exc:
+                last_error = exc
+                continue
+
+        raise last_error or RuntimeError("Native systemd blue/green deploy function failed.")
+
+    # Class style deployer fallback.
+    if deployer_cls is not None:
+        deployer = deployer_cls()
+        for method_name in ("deploy_bluegreen", "deploy", "apply", "run"):
+            method = getattr(deployer, method_name, None)
+            if method is None:
+                continue
+
+            attempts = [
+                lambda: method(config=config, project_dir=project_dir, active_color=active_color, run_id=run_id),
+                lambda: method(config=config, project_dir=project_dir, active_color=active_color),
+                lambda: method(config=config, project_dir=project_dir),
+                lambda: method(config=config),
+                lambda: method(config),
+            ]
+
+            last_error: Exception | None = None
+            for attempt in attempts:
+                try:
+                    result = attempt()
+                    if not isinstance(result, dict):
+                        result = {"success": True, "deployed": True}
+                    result.setdefault("success", True)
+                    result.setdefault("deployed", result.get("success", True))
+                    result.setdefault("update_mode", "native_systemd_bluegreen")
+                    result.setdefault("active_color", result.get("active_color") or active_color)
+                    result.setdefault("live_url", result.get("live_url") or _live_url_for_config(config))
+                    return result
+                except TypeError as exc:
+                    last_error = exc
+                    continue
+
+            raise last_error or RuntimeError("Native systemd blue/green deploy class method failed.")
+
+    # Last fallback: systemd restart, not zero-downtime.
+    # This keeps update functional but marks it clearly.
+    from core.native_service import install_systemd_service
+    import subprocess
+
+    subprocess.run(["cargo", "build", "--release"], cwd=str(project_dir), check=True)
+
+    port = int(config.get("port") or config.get("public_port") or config.get("listen_port") or 80)
+    service_result = install_systemd_service(
+        project_dir=project_dir,
+        port=port,
+        service_user=str(config.get("service_user") or "ubuntu"),
+    )
+
+    if not service_result.get("success"):
+        raise RuntimeError(f"Native systemd restart fallback failed: {service_result}")
+
+    return {
+        "success": True,
+        "deployed": True,
+        "active_color": "local",
+        "live_url": f"http://127.0.0.1:{port}",
+        "update_mode": "native_systemd_restart_fallback",
+        "restart_performed": True,
+        "zero_downtime": False,
+        "gateway": service_result,
+    }
+
+
+
 # Local direct deploy helpers
 # ---------------------------------------------------------------------
 
@@ -2074,6 +2257,13 @@ def run_update_graph(
         if isinstance(updated_config, dict) and isinstance(updated_config.get("security"), dict):
             fallback_base_config["security"] = deepcopy(updated_config["security"])
 
+        # Hard guard before mutating route algorithms from prompt.
+        from core.update_decision_guard import validate_prompt_algorithm_edits
+        validate_prompt_algorithm_edits(
+            fallback_base_config,
+            _fallback_parse_algorithm_edits(prompt),
+        )
+
         route_mutated_config, prompt_route_changes = _apply_prompt_route_mutations(
             fallback_base_config,
             prompt,
@@ -2152,10 +2342,29 @@ def run_update_graph(
         final_config["strategy"] = resolved_strategy
         final_config["deployment_strategy"] = resolved_strategy
 
+        # Preserve native systemd/public-port flags from the active config.
+        for _key in (
+            "port",
+            "public_port",
+            "listen_port",
+            "live_url",
+            "_systemd",
+            "systemd",
+            "_replace_edge",
+            "replace_edge",
+            "service_user",
+        ):
+            if _key in active_config:
+                final_config[_key] = active_config[_key]
+
         final_config = apply_local_production_security_profile(
             final_config,
             environment=resolved_runtime,
         )
+
+        stage = "update_decision_guard"
+        from core.update_decision_guard import validate_update_decisions
+        validate_update_decisions(final_config)
 
         stage = "config_preflight"
         run_config_preflight(final_config, resolved_runtime, resolved_strategy)
@@ -2187,12 +2396,21 @@ def run_update_graph(
                 run_id=run_id,
             )
         elif _is_local_direct(resolved_runtime, resolved_strategy):
-            stage = "local_direct_deploy"
-            deploy_result = run_local_direct_deploy(
-                config=final_config,
-                project_dir=project_dir,
-                run_id=run_id,
-            )
+            if _is_native_systemd_bluegreen_update(final_config):
+                stage = "native_systemd_bluegreen_deploy"
+                deploy_result = run_native_systemd_bluegreen_deploy(
+                    config=final_config,
+                    project_dir=project_dir,
+                    active_color=active_color,
+                    run_id=run_id,
+                )
+            else:
+                stage = "local_direct_deploy"
+                deploy_result = run_local_direct_deploy(
+                    config=final_config,
+                    project_dir=project_dir,
+                    run_id=run_id,
+                )
         else:
             raise RuntimeError(
                 f"Unsupported update deployment mode: runtime={resolved_runtime}, strategy={resolved_strategy}. "

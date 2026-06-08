@@ -103,53 +103,54 @@ def _get_summary(result: dict[str, Any]) -> list[str]:
 
 def _print_update_summary(result: dict[str, Any]) -> None:
     summary = _get_summary(result)
+    success = bool(result.get("success"))
 
     print()
     print("📋 Update summary:")
 
     if not summary:
-        print("ℹ️ No effective config changes detected.")
+        if success:
+            print("ℹ️ No effective config changes detected.")
+        else:
+            print("❌ Update did not complete successfully.")
         return
 
     for item in summary:
         text = str(item).strip()
-
         if not text:
             continue
 
-        lower = text.lower()
-
-        if lower.startswith("removed route"):
-            print(f"✅ {text}")
-        elif lower.startswith("added route"):
-            print(f"✅ {text}")
-        elif lower.startswith("updated route"):
-            print(f"✅ {text}")
-        elif lower.startswith("removed backend"):
-            print(f"✅ {text}")
-        elif lower.startswith("added backend"):
-            print(f"✅ {text}")
-        elif lower.startswith("configured load balancer"):
-            print(f"✅ {text}")
-        elif lower.startswith("set ") and "algorithm" in lower:
-            print(f"✅ {text}")
-        elif lower.startswith("security changed"):
-            print(f"✅ {text}")
-        elif "already absent" in lower:
-            print(f"ℹ️ {text}")
-        elif "already exists" in lower:
-            print(f"ℹ️ {text}")
-        elif "already existed" in lower:
-            print(f"ℹ️ {text}")
-        elif "duplicate" in lower:
-            print(f"ℹ️ {text}")
-        elif "no effective" in lower:
-            print(f"ℹ️ {text}")
+        if success:
+            lower = text.lower()
+            if "already exists" in lower or "no effective" in lower or "no deployment" in lower:
+                print(f"ℹ️ {text}")
+            else:
+                print(f"✅ {text}")
         else:
-            print(f"ℹ️ {text}")
+            print(f"❌ {text}")
 
 
-def _print_deploy_status(result: dict[str, Any]) -> None:
+def _print_deployment_status(result: dict[str, Any]) -> None:
+    success = bool(result.get("success"))
+
+    if not success:
+        print()
+        print("❌ Update blocked or failed. No successful deployment was completed.")
+
+        error = result.get("error")
+        if error:
+            print(f"Reason: {error}")
+
+        failed_node = result.get("failed_node")
+        if failed_node:
+            print(f"Stage: {failed_node}")
+
+        reliability_report = result.get("reliability_report")
+        if reliability_report and not error:
+            print(str(reliability_report)[:2000])
+
+        return
+
     active_color = (
         result.get("active_color")
         or result.get("color")
@@ -165,17 +166,25 @@ def _print_deploy_status(result: dict[str, Any]) -> None:
     deployed = (
         result.get("deployed")
         or result.get("deployment_success")
-        or result.get("success")
     )
 
     if deployed is False:
         print()
-        print("⚠️ Update completed, but deployment may not have succeeded.")
+        print("ℹ️ No deployment was needed.")
         return
+
+    update_mode = str(result.get("update_mode") or "update")
 
     if active_color:
         print()
-        print("✅ Update deployed with blue/green switching")
+
+        if "restart_fallback" in update_mode or "systemd" in update_mode:
+            print("✅ Update deployed with systemd runtime restart")
+        elif "bluegreen" in update_mode or "bluegreen" in str(result.get("strategy", "")):
+            print("✅ Update deployed with blue/green switching")
+        else:
+            print("✅ Update deployed")
+
         print(f"Active color: {active_color}")
         print(f"Live URL: {live_url}")
 
@@ -226,7 +235,7 @@ def main() -> int:
 
     result = _run_update_flow(effective_prompt)
 
-    _print_deploy_status(result)
+    _print_deployment_status(result)
     _print_update_summary(result)
 
     return 0

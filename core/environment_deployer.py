@@ -406,18 +406,45 @@ def next_color() -> str:
 
 def atomic_write_text(path: Path, content: str) -> None:
     """
-    Write text safely to avoid Nginx reading a partially written config during reload.
+    Write text while preserving the inode used by Docker Desktop file mounts.
+
+    Single-file bind mounts can keep a stale or broken view when the host file is
+    replaced via rename. For NGINX config, update the existing file in place and
+    let reload_nginx_edge retry nginx -t until Docker has synced the full file.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(content, encoding="utf-8")
-    tmp_path.replace(path)
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _edge_api_key_for_nginx() -> str:
+    env_key = os.getenv("PINGORA_EDGE_API_KEY", "").strip()
+    if env_key:
+        return env_key
+
+    env_path = PROJECT_ROOT / ".env"
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            key, raw_value = line.split("=", 1)
+            if key.strip() == "PINGORA_EDGE_API_KEY":
+                value = raw_value.strip().strip('"').strip("'")
+                if value:
+                    return value
+
+    return "dev-local-secret"
+
 
 def write_nginx_conf(active_color: str, gateway_port: int) -> None:
     DOCKER_DIR.mkdir(parents=True, exist_ok=True)
 
     service_name = f"gateway-{active_color}"
-    expected_api_key = os.getenv("PINGORA_EDGE_API_KEY", "dev-local-secret")
+    expected_api_key = _edge_api_key_for_nginx()
 
     nginx_conf = f"""events {{}}
 
@@ -523,10 +550,66 @@ http {{
     atomic_write_text(DOCKER_DIR / "nginx.conf", nginx_conf)
 
 
+def _docker_edge_type() -> str:
+    return os.getenv("PINGORA_AI_EDGE_TYPE", "").strip().lower()
+
+
+def _docker_pingora_edge_enabled() -> bool:
+    return _docker_edge_type() == "pingora"
+
+
+def _docker_edge_live_url() -> str:
+    if _docker_pingora_edge_enabled():
+        return "http://127.0.0.1:80"
+    return "https://127.0.0.1:8443"
+
+
+def _docker_edge_readiness_url(port: int = DOCKER_BLUEGREEN_GATEWAY_PORT) -> str:
+    if _docker_pingora_edge_enabled():
+        return "http://127.0.0.1:80/"
+    return f"http://127.0.0.1:{port}/__edge_health"
+
+
 def write_compose(active_color: str, gateway_port: int) -> Path:
     DOCKER_DIR.mkdir(parents=True, exist_ok=True)
 
     compose = DOCKER_DIR / "docker-compose.yml"
+
+    edge_upstream = f"http://gateway-{active_color}:{gateway_port}"
+
+    if _docker_pingora_edge_enabled():
+        edge_block = f"""  gateway-edge:
+    build:
+      context: .
+      dockerfile: Dockerfile.pingora-edge
+    container_name: ai-pingora-gateway-edge
+    ports:
+      - "80:80"
+    environment:
+      PINGORA_EDGE_LISTEN: "0.0.0.0:80"
+      PINGORA_EDGE_UPSTREAM: "{edge_upstream}"
+    depends_on:
+      - gateway-blue
+      - gateway-green
+    networks:
+      - ai_pingora_net
+"""
+    else:
+        edge_block = """  gateway-edge:
+    image: nginx:alpine
+    container_name: ai-pingora-gateway-edge
+    ports:
+      - "8090:80"
+      - "8443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ../data/tls:/etc/nginx/tls:ro
+    depends_on:
+      - gateway-blue
+      - gateway-green
+    networks:
+      - ai_pingora_net
+"""
 
     # Build context is relative to docker-bluegreen/
     compose.write_text(
@@ -553,21 +636,7 @@ def write_compose(active_color: str, gateway_port: int) -> Path:
     networks:
       - ai_pingora_net
 
-  gateway-edge:
-    image: nginx:alpine
-    container_name: ai-pingora-gateway-edge
-    ports:
-      - "8090:80"
-      - "8443:443"
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
-      - ../data/tls:/etc/nginx/tls:ro
-    depends_on:
-      - gateway-blue
-      - gateway-green
-    networks:
-      - ai_pingora_net
-
+{edge_block}
 
 networks:
   ai_pingora_net:
@@ -683,6 +752,22 @@ def docker_compose_up_with_conflict_repair(timeout: int = 600) -> subprocess.Com
 
     return retry
 
+
+def _apply_docker_public_url_metadata(config: dict[str, Any]) -> dict[str, Any]:
+    """
+    Docker blue/green may keep the generated gateway listening internally on 8090,
+    but the public Docker Pingora edge is exposed on standard port 80.
+
+    Do not change listen_port/proxy_port here. Those are internal container ports.
+    Only fix user-facing/public metadata used by homepage/verifier.
+    """
+    if _docker_pingora_edge_enabled():
+        config["live_url"] = "http://127.0.0.1:80/"
+        config["public_url"] = "http://127.0.0.1:80/"
+        config["base_url"] = "http://127.0.0.1:80/"
+    return config
+
+
 def start_docker_bluegreen(config: dict[str, Any]) -> dict[str, Any]:
     require_docker()
 
@@ -692,12 +777,14 @@ def start_docker_bluegreen(config: dict[str, Any]) -> dict[str, Any]:
     config["port"] = DOCKER_BLUEGREEN_GATEWAY_PORT
     config["listen_port"] = DOCKER_BLUEGREEN_GATEWAY_PORT
     config["proxy_port"] = DOCKER_BLUEGREEN_GATEWAY_PORT
+    config = _apply_docker_public_url_metadata(config)
 
     port = DOCKER_BLUEGREEN_GATEWAY_PORT
     color = next_color()
 
     write_dockerfile()
-    write_nginx_conf(color, port)
+    if not _docker_pingora_edge_enabled():
+        write_nginx_conf(color, port)
     compose_file = write_compose(color, port)
 
     # For first stable Docker test, avoid false port conflicts from local direct gateway.
@@ -757,8 +844,8 @@ def start_docker_bluegreen(config: dict[str, Any]) -> dict[str, Any]:
 
     save_state(color)
 
-    readiness_url = f"http://127.0.0.1:{port}/__edge_health"
-    live_url = "https://127.0.0.1:8443"
+    readiness_url = _docker_edge_readiness_url(port)
+    live_url = _docker_edge_live_url()
 
     try:
         status_code = wait_for_docker_edge_health(port, timeout_seconds=180)
@@ -828,7 +915,7 @@ def wait_for_docker_edge_health(port: int = 8090, timeout_seconds: int = 180) ->
     import urllib.request
     import urllib.error
 
-    url = f"http://127.0.0.1:{port}/__edge_health"
+    url = _docker_edge_readiness_url(port)
     deadline = time.time() + timeout_seconds
     last_error = None
 
@@ -869,8 +956,11 @@ def reload_nginx_edge():
       pread() returned only N bytes instead of M
 
     Fix:
-    Validate the host config, docker cp it to a non-mounted temp file inside the
-    container, test that temp config, then reload NGINX using that temp config.
+    Validate the host config, keep a temp copy inside the container for
+    diagnostics, then test and reload the default NGINX config path. Reloading
+    with "-c /tmp/..." only validates the temp file; the already-running master
+    keeps using its original config path and the blue/green switch does not
+    take effect.
     """
     nginx_path = DOCKER_DIR / "nginx.conf"
     container_tmp_conf = "/tmp/ai-pingora-nginx.conf"
@@ -890,7 +980,7 @@ def reload_nginx_edge():
     if copy_result.returncode != 0:
         return copy_result
 
-    test_result = run_command(
+    temp_test_result = run_command(
         [
             "docker",
             "exec",
@@ -903,8 +993,29 @@ def reload_nginx_edge():
         timeout=30,
     )
 
-    if test_result.returncode != 0:
-        return test_result
+    if temp_test_result.returncode != 0:
+        return temp_test_result
+
+    last_test = temp_test_result
+    for _attempt in range(20):
+        default_test = run_command(
+            [
+                "docker",
+                "exec",
+                "ai-pingora-gateway-edge",
+                "nginx",
+                "-t",
+            ],
+            timeout=30,
+        )
+
+        last_test = default_test
+        if default_test.returncode == 0:
+            break
+
+        time.sleep(1)
+    else:
+        return last_test
 
     return run_command(
         [
@@ -914,8 +1025,6 @@ def reload_nginx_edge():
             "nginx",
             "-s",
             "reload",
-            "-c",
-            container_tmp_conf,
         ],
         timeout=30,
     )
@@ -1044,6 +1153,7 @@ def start_docker_bluegreen_transactional(config: dict[str, Any]) -> dict[str, An
     config["port"] = DOCKER_BLUEGREEN_GATEWAY_PORT
     config["listen_port"] = DOCKER_BLUEGREEN_GATEWAY_PORT
     config["proxy_port"] = DOCKER_BLUEGREEN_GATEWAY_PORT
+    config = _apply_docker_public_url_metadata(config)
 
     port = DOCKER_BLUEGREEN_GATEWAY_PORT
 
@@ -1173,22 +1283,6 @@ def start_docker_bluegreen_transactional(config: dict[str, Any]) -> dict[str, An
                 "Nginx reload failed. Rolled back edge to old colour.\n"
                 f"Root cause: {root_cause}\n"
                 f"STDOUT:\n{reload.stdout}\n\nSTDERR:\n{reload.stderr}"
-            )
-
-        # Docker Desktop/macOS safety:
-        # nginx -s reload can report success while old workers still serve the
-        # previous upstream target. Restarting only the edge container forces
-        # workers to load the active candidate config without touching blue/green.
-        restart = run_command(
-            ["docker", "restart", "ai-pingora-gateway-edge"],
-            timeout=60,
-        )
-
-        if restart.returncode != 0:
-            rollback_edge_to_color(old_color, port)
-            raise RuntimeError(
-                "Nginx edge restart failed after reload. Rolled back edge to old colour.\n"
-                f"STDOUT:\n{restart.stdout}\n\nSTDERR:\n{restart.stderr}"
             )
 
         wait_for_docker_edge_health(port=8090, timeout_seconds=90)
@@ -1572,7 +1666,45 @@ def _start_local_demo_backends_from_config(config: dict) -> None:
     )
 
 
+
+def choose_readiness_url(runtime: str = "local", config: dict | None = None) -> str:
+    """
+    Resolve local readiness/live URL.
+    Keep this top-level so local runtime helpers do not shadow it.
+    """
+    config = config or {}
+
+    try:
+        port = int(
+            config.get("port")
+            or config.get("public_port")
+            or config.get("listen_port")
+            or 8090
+        )
+    except Exception:
+        port = 8090
+
+    if runtime == "local":
+        return f"http://127.0.0.1:{port}"
+
+    return f"http://127.0.0.1:{port}"
+
+
 def _start_local_pingora_from_config_file() -> dict:
+    _choose_readiness_url = globals().get("choose_readiness_url")
+    if _choose_readiness_url is None:
+        def _choose_readiness_url(runtime: str = "local", config: dict | None = None) -> str:
+            config = config or {}
+            try:
+                port = int(
+                    config.get("port")
+                    or config.get("public_port")
+                    or config.get("listen_port")
+                    or 8090
+                )
+            except Exception:
+                port = 8090
+            return f"http://127.0.0.1:{port}"
     import os
     import subprocess
     from pathlib import Path
@@ -1590,11 +1722,13 @@ def _start_local_pingora_from_config_file() -> dict:
     env.setdefault("RUST_BACKTRACE", "1")
 
     with log_file.open("w", encoding="utf-8") as fh:
-        process = subprocess.Popen(
+        live_url = _choose_readiness_url("local")
+
+    process = subprocess.Popen(
             ["cargo", "run", "--release"],
             cwd=str(project_dir),
-            stdout=fh,
-            stderr=subprocess.STDOUT,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             env=env,
             text=True,
         )
@@ -1602,14 +1736,13 @@ def _start_local_pingora_from_config_file() -> dict:
     pid_file.write_text(str(process.pid), encoding="utf-8")
 
     from core.deployment_prepare import choose_readiness_url
-    _wait_local_http_200(choose_readiness_url("local"), timeout_seconds=180)
+    _wait_local_http_200(_choose_readiness_url("local"), timeout_seconds=180)
 
     return {
         "pid": process.pid,
         "log_file": str(log_file),
-        "live_url": "http://127.0.0.1:8090",
+        "live_url": live_url,
     }
-
 
 
 def _apply_local_config_file_security_defaults(config: dict) -> dict:
@@ -1907,6 +2040,106 @@ def _system_decision_preflight_or_raise(config: dict, runtime: str, prompt: str 
         allow_repair=True,
     )
 
+
+
+def preserve_native_runtime_flags(original: dict, prepared: dict) -> dict:
+    """
+    _prepare_local_direct_config_file may normalize local config back to defaults.
+    Preserve explicit CLI/user runtime flags such as --public-port 80,
+    --systemd, and --replace-edge after preparation.
+    """
+    if not isinstance(original, dict) or not isinstance(prepared, dict):
+        return prepared
+
+    for key in (
+        "port",
+        "public_port",
+        "listen_port",
+        "live_url",
+        "_systemd",
+        "systemd",
+        "_replace_edge",
+        "replace_edge",
+        "service_user",
+    ):
+        if key in original:
+            prepared[key] = original[key]
+
+    # If user requested a public port, keep all port aliases aligned.
+    requested_port = (
+        original.get("port")
+        or original.get("public_port")
+        or original.get("listen_port")
+    )
+
+    if requested_port is not None:
+        try:
+            requested_port = int(requested_port)
+            if 1 <= requested_port <= 65535:
+                prepared["port"] = requested_port
+                prepared["public_port"] = requested_port
+                prepared["listen_port"] = requested_port
+                prepared["live_url"] = f"http://127.0.0.1:{requested_port}/"
+        except Exception:
+            pass
+
+    return prepared
+
+
+def maybe_prepare_native_public_port(config: dict) -> dict:
+    """
+    If local runtime is asked to bind to privileged public port 80/443,
+    optionally stop nginx and later start the generated binary through systemd.
+    """
+    result = {
+        "enabled": False,
+        "port": None,
+        "replace_edge_result": None,
+    }
+
+    try:
+        port = int(config.get("port") or config.get("public_port") or config.get("listen_port") or 8090)
+    except Exception:
+        port = 8090
+
+    result["port"] = port
+
+    if port >= 1024:
+        return result
+
+    result["enabled"] = True
+
+    replace_edge = bool(config.get("replace_edge") or config.get("_replace_edge"))
+    try:
+        from core.native_service import stop_nginx_if_requested
+        edge = stop_nginx_if_requested(port, replace_edge=replace_edge)
+        result["replace_edge_result"] = edge
+        if edge.get("blocked"):
+            raise RuntimeError(edge.get("message"))
+    except Exception as exc:
+        raise RuntimeError(f"Cannot prepare native public port {port}: {exc}") from exc
+
+    return result
+
+
+def maybe_install_systemd_runtime(config: dict) -> dict | None:
+    if not bool(config.get("systemd") or config.get("_systemd")):
+        return None
+
+    try:
+        port = int(config.get("port") or config.get("public_port") or config.get("listen_port") or 8090)
+    except Exception:
+        port = 8090
+
+    from core.native_service import install_systemd_service
+
+    return install_systemd_service(
+        project_dir=GENERATED_PROJECT_DIR,
+        port=port,
+        service_user=str(config.get("service_user") or "ubuntu"),
+    )
+
+
 def deploy_local_direct_from_config(config: dict, verify: str = "full") -> dict:
     """
     Config-file deployment for local/direct runtime.
@@ -1927,6 +2160,11 @@ def deploy_local_direct_from_config(config: dict, verify: str = "full") -> dict:
 
     prepared = _prepare_local_direct_config_file(config)
     prepared = _apply_local_config_file_security_defaults(prepared)
+    prepared = preserve_native_runtime_flags(config, prepared)
+
+    # Native public port mode:
+    # Allows Pingora-AI to own port 80/443 directly like nginx when --systemd is used.
+    native_port_result = maybe_prepare_native_public_port(prepared)
 
     # Generate Rust project/homepage/config from the local-safe config.
     write_project_from_config(prepared)
@@ -1937,14 +2175,39 @@ def deploy_local_direct_from_config(config: dict, verify: str = "full") -> dict:
     _write_local_json("gateway_config.json", prepared)
 
     _start_local_demo_backends_from_config(prepared)
-    gateway = _start_local_pingora_from_config_file()
+
+    live_port = int(prepared.get("port") or prepared.get("public_port") or prepared.get("listen_port") or 8090)
+    live_url = f"http://127.0.0.1:{live_port}"
+
+    systemd_result = None
+    if bool(prepared.get("_systemd") or prepared.get("systemd")):
+        # Build release binary first so systemd can run the compiled Pingora runtime.
+        subprocess.run(
+            ["cargo", "build", "--release"],
+            cwd=str(GENERATED_PROJECT_DIR),
+            check=True,
+        )
+
+        systemd_result = maybe_install_systemd_runtime(prepared)
+
+        if not systemd_result or not systemd_result.get("success"):
+            raise RuntimeError(f"Failed to start Pingora-AI systemd runtime: {systemd_result}")
+
+        gateway = {
+            "mode": "systemd",
+            "service": "pingora-ai-runtime",
+            "systemd": systemd_result,
+            "native_port": native_port_result,
+        }
+    else:
+        gateway = _start_local_pingora_from_config_file()
 
     from core.post_change_verifier import format_verification_report, verify_after_change
 
     verification = verify_after_change(
         config=prepared,
         config_path=Path("generated-pingora-proxy/config.json"),
-        live_url="http://127.0.0.1:8090",
+        live_url=live_url,
         source="environment_deployer",
         change_type="local_direct_config_file_deploy",
         level=verify,
@@ -2011,7 +2274,7 @@ def deploy_local_direct_from_config(config: dict, verify: str = "full") -> dict:
                         "strategy": "direct",
                         "deployment_strategy": "direct",
                         "active_color": "local",
-                        "live_url": "http://127.0.0.1:8090",
+                        "live_url": live_url,
                         "gateway": gateway,
                         "verification": verification,
                         "self_healing": {
@@ -2034,10 +2297,29 @@ def deploy_local_direct_from_config(config: dict, verify: str = "full") -> dict:
         "strategy": "direct",
         "deployment_strategy": "direct",
         "active_color": "local",
-        "live_url": "http://127.0.0.1:8090",
+        "live_url": live_url,
         "gateway": gateway,
         "verification": verification,
     }
+
+
+def _raise_if_system_decision_rejection_warning(warnings: list[dict[str, Any]]) -> None:
+    """
+    System decision rejection is not a warning.
+
+    If the decision engine says a config is rejected, deployment must stop
+    before local/Docker/Linux execution.
+    """
+    for item in warnings or []:
+        if not isinstance(item, dict):
+            continue
+
+        stage = str(item.get("stage") or "").strip().lower()
+        warning = str(item.get("warning") or "")
+
+        if stage == "system_decision_engine" and "rejected config" in warning.lower():
+            raise RuntimeError(warning)
+
 
 def deploy_config_for_environment(
     *,
@@ -2195,9 +2477,12 @@ def _prepare_bare_metal_linux_config(config: dict, kwargs: dict) -> dict:
     import copy
 
     from core.homepage_route import ensure_route_directory_homepage
+    from core.lb_config import default_health_check
     from core.project_writer import write_project, write_json_config, write_route_directory_homepage
 
     prepared = copy.deepcopy(config)
+    prepared.pop("warnings", None)
+    prepared.pop("_pipeline_decisions", None)
     prepared = ensure_route_directory_homepage(prepared)
 
     prepared["runtime"] = "bare_metal_linux"
@@ -2216,16 +2501,34 @@ def _prepare_bare_metal_linux_config(config: dict, kwargs: dict) -> dict:
 
         upstreams = route.get("upstreams")
         if isinstance(upstreams, list):
-            route["upstreams"] = [
-                str(item).replace("host.docker.internal", "127.0.0.1")
-                for item in upstreams
-            ]
+            fixed_upstreams = []
+            for item in upstreams:
+                if isinstance(item, dict):
+                    fixed_item = dict(item)
+                    for key in ("address", "upstream", "backend"):
+                        if fixed_item.get(key):
+                            fixed_item[key] = str(fixed_item[key]).replace(
+                                "host.docker.internal",
+                                "127.0.0.1",
+                            )
+                    fixed_upstreams.append(fixed_item)
+                else:
+                    fixed_upstreams.append(
+                        str(item).replace("host.docker.internal", "127.0.0.1")
+                    )
+            route["upstreams"] = fixed_upstreams
 
         if route.get("upstream"):
             route["upstream"] = str(route["upstream"]).replace(
                 "host.docker.internal",
                 "127.0.0.1",
             )
+
+        route_type = str(route.get("type") or route.get("route_type") or "").lower()
+        if normalize_path(route.get("path")) != "/" and route_type not in {"static", "web", "webserver", "web_server"}:
+            route.setdefault("type", "proxy")
+            route.setdefault("route_type", "proxy")
+            route.setdefault("health_check", default_health_check())
 
     # While the generated Rust runtime still compiles route data, we must rewrite
     # generated-pingora-proxy before deploying the Linux binary.
@@ -2241,31 +2544,20 @@ def _run_bare_metal_decision_preflight(config: dict, kwargs: dict) -> dict:
     runtime = "bare_metal_linux"
     strategy = "bluegreen"
 
-    # Decision engine gate. Signature has changed during the project, so keep this
-    # defensive: if the local implementation cannot accept the call yet, do not
-    # break deploy; attach warning and continue.
-    try:
-        from core.system_decision_engine import apply_and_enforce_system_decisions
+    # Fatal decision gate. Do not deploy if the deterministic system decision
+    # engine rejects the config.
+    from core.system_decision_engine import apply_and_enforce_system_decisions
 
-        try:
-            return apply_and_enforce_system_decisions(
-                config,
-                runtime=runtime,
-                strategy=strategy,
-            )
-        except TypeError:
-            return apply_and_enforce_system_decisions(config, runtime=runtime)
+    try:
+        return apply_and_enforce_system_decisions(
+            config,
+            runtime=runtime,
+            strategy=strategy,
+        )
+    except TypeError:
+        return apply_and_enforce_system_decisions(config, runtime=runtime)
     except Exception as exc:
-        warnings = config.setdefault("warnings", [])
-        if isinstance(warnings, list):
-            warnings.append(
-                {
-                    "source": "bare_metal_decision_preflight",
-                    "warning": str(exc),
-                    "note": "Decision engine call was skipped defensively. Add bare_metal_linux/bluegreen support to system_decision_engine.py.",
-                }
-            )
-        return config
+        raise RuntimeError(f"System decision engine rejected config: {exc}") from exc
 
 
 def _run_bare_metal_config_verification(config: dict, kwargs: dict) -> dict:
@@ -2454,8 +2746,11 @@ def _bare_metal_live_url(*, host: str, public_http_port: int = 80) -> str:
 def _prepare_bare_metal_pipeline_config(config: dict, **kwargs) -> dict:
     import copy
     from core.homepage_route import ensure_route_directory_homepage
+    from core.lb_config import default_health_check
 
     prepared = copy.deepcopy(config)
+    prepared.pop("warnings", None)
+    prepared.pop("_pipeline_decisions", None)
     prepared["runtime"] = "bare_metal_linux"
     prepared["strategy"] = "bluegreen"
 
@@ -2475,16 +2770,34 @@ def _prepare_bare_metal_pipeline_config(config: dict, **kwargs) -> dict:
             continue
 
         if isinstance(route.get("upstreams"), list):
-            route["upstreams"] = [
-                str(item).replace("host.docker.internal", "127.0.0.1")
-                for item in route["upstreams"]
-            ]
+            fixed_upstreams = []
+            for item in route["upstreams"]:
+                if isinstance(item, dict):
+                    fixed_item = dict(item)
+                    for key in ("address", "upstream", "backend"):
+                        if fixed_item.get(key):
+                            fixed_item[key] = str(fixed_item[key]).replace(
+                                "host.docker.internal",
+                                "127.0.0.1",
+                            )
+                    fixed_upstreams.append(fixed_item)
+                else:
+                    fixed_upstreams.append(
+                        str(item).replace("host.docker.internal", "127.0.0.1")
+                    )
+            route["upstreams"] = fixed_upstreams
 
         if route.get("upstream"):
             route["upstream"] = str(route["upstream"]).replace(
                 "host.docker.internal",
                 "127.0.0.1",
             )
+
+        route_type = str(route.get("type") or route.get("route_type") or "").lower()
+        if normalize_path(route.get("path")) != "/" and route_type not in {"static", "web", "webserver", "web_server"}:
+            route.setdefault("type", "proxy")
+            route.setdefault("route_type", "proxy")
+            route.setdefault("health_check", default_health_check())
 
     try:
         from core.deployment_prepare import ensure_default_blocked_paths
@@ -2496,14 +2809,19 @@ def _prepare_bare_metal_pipeline_config(config: dict, **kwargs) -> dict:
 
 
 def _run_bare_metal_decision_stage(config: dict) -> dict:
+    """
+    Fatal deterministic decision gate for bare_metal_linux.
+
+    A rejected config must never be downgraded to a warning. This protects
+    Linux/systemd from deploying invalid route mutations such as setting
+    round_robin on a one-upstream route.
+    """
+    from core.system_decision_engine import apply_and_enforce_system_decisions
+
     try:
-        from core.system_decision_engine import apply_and_enforce_system_decisions
         return apply_and_enforce_system_decisions(config)
     except Exception as exc:
-        warnings = config.setdefault("warnings", [])
-        if isinstance(warnings, list):
-            warnings.append({"stage": "system_decision_engine", "warning": str(exc)})
-        return config
+        raise RuntimeError(f"System decision engine rejected config: {exc}") from exc
 
 
 def _run_bare_metal_config_verification(config: dict, **kwargs) -> dict:
@@ -2545,6 +2863,113 @@ def _write_bare_metal_project(config: dict) -> dict:
     return config
 
 
+def _auto_build_bare_metal_binary_enabled(kwargs: dict) -> bool:
+    requested = kwargs.get("auto_build_binary")
+
+    if requested is not None:
+        return bool(requested)
+
+    value = str(os.getenv("PINGORA_AI_BARE_METAL_AUTO_BUILD", "1")).strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def _build_bare_metal_linux_binary(binary_path: str | Path | None, **kwargs) -> dict[str, Any]:
+    if not binary_path:
+        raise RuntimeError("Bare-metal Linux binary path is required for auto-build.")
+
+    if not _auto_build_bare_metal_binary_enabled(kwargs):
+        return {
+            "success": True,
+            "skipped": True,
+            "reason": "PINGORA_AI_BARE_METAL_AUTO_BUILD disabled",
+            "binary_path": str(binary_path),
+        }
+
+    if not shutil.which("docker"):
+        raise RuntimeError(
+            "Bare-metal Linux auto-build requires Docker. "
+            "Install Docker or set PINGORA_AI_BARE_METAL_AUTO_BUILD=0 to use the existing --binary-path."
+        )
+
+    project_dir = GENERATED_PROJECT_DIR
+    output_path = Path(binary_path).expanduser()
+    if not output_path.is_absolute():
+        output_path = PROJECT_ROOT / output_path
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    write_dockerfile()
+
+    platform = str(os.getenv("PINGORA_AI_LINUX_BUILD_PLATFORM", "linux/amd64")).strip() or "linux/amd64"
+    image = str(os.getenv("PINGORA_AI_LINUX_BUILD_IMAGE", "pingora-ai-gateway-linux-amd64")).strip()
+    container = f"pingora-ai-extract-{int(time.time())}-{os.getpid()}"
+
+    build = run_command(
+        [
+            "docker",
+            "build",
+            "--platform",
+            platform,
+            "-t",
+            image,
+            str(project_dir),
+        ],
+        cwd=PROJECT_ROOT,
+        timeout=1800,
+    )
+
+    if build.returncode != 0:
+        raise RuntimeError(
+            "Bare-metal Linux Docker build failed.\n"
+            f"STDOUT:\n{build.stdout[-4000:]}\n\n"
+            f"STDERR:\n{build.stderr[-4000:]}"
+        )
+
+    create = run_command(
+        ["docker", "create", "--name", container, image],
+        cwd=PROJECT_ROOT,
+        timeout=120,
+    )
+
+    if create.returncode != 0:
+        raise RuntimeError(
+            "Could not create extraction container for Linux binary.\n"
+            f"STDOUT:\n{create.stdout[-2000:]}\n\n"
+            f"STDERR:\n{create.stderr[-2000:]}"
+        )
+
+    try:
+        copy = run_command(
+            [
+                "docker",
+                "cp",
+                f"{container}:/app/target/release/generated-pingora-proxy",
+                str(output_path),
+            ],
+            cwd=PROJECT_ROOT,
+            timeout=120,
+        )
+
+        if copy.returncode != 0:
+            raise RuntimeError(
+                "Could not copy Linux binary from extraction container.\n"
+                f"STDOUT:\n{copy.stdout[-2000:]}\n\n"
+                f"STDERR:\n{copy.stderr[-2000:]}"
+            )
+
+    finally:
+        run_command(["docker", "rm", "-f", container], cwd=PROJECT_ROOT, timeout=60)
+
+    output_path.chmod(0o755)
+
+    return {
+        "success": True,
+        "binary_path": str(output_path),
+        "platform": platform,
+        "image": image,
+    }
+
+
 def _run_bare_metal_health_gate(result: dict, **kwargs) -> dict:
     if not result.get("success"):
         return result
@@ -2566,17 +2991,19 @@ def _run_bare_metal_health_gate(result: dict, **kwargs) -> dict:
         }
         return result
 
-    remote_script = '''
+    active_port = int(result.get("active_port") or 8090)
+
+    remote_script = f'''
 set -e
 
 echo "backend_health"
 curl -fsS http://127.0.0.1:9101/health >/dev/null
 
 echo "gateway_internal_api"
-curl -fsS http://127.0.0.1:8090/api/ >/dev/null
+curl -fsS http://127.0.0.1:{active_port}/api/ >/dev/null
 
 echo "gateway_runtime_state"
-curl -fsS http://127.0.0.1:8090/__gateway_runtime_state >/dev/null
+curl -fsS http://127.0.0.1:{active_port}/__gateway_runtime_state >/dev/null
 
 echo "public_nginx_homepage"
 curl -fsS http://127.0.0.1/ >/dev/null
@@ -2632,7 +3059,8 @@ def _run_bare_metal_post_change_verification(config: dict, result: dict, **kwarg
         import core.post_change_verifier as pcv
 
         verifier = (
-            getattr(pcv, "verify_post_change", None)
+            getattr(pcv, "verify_after_change", None)
+            or getattr(pcv, "verify_post_change", None)
             or getattr(pcv, "run_post_change_verifier", None)
             or getattr(pcv, "run_post_change_verification", None)
             or getattr(pcv, "verify_gateway", None)
@@ -2649,18 +3077,29 @@ def _run_bare_metal_post_change_verification(config: dict, result: dict, **kwarg
 
         live_url = result.get("live_url") or config.get("live_url")
 
-        try:
+        if verifier is getattr(pcv, "verify_after_change", None):
             verification = verifier(
                 config=config,
-                base_url=live_url,
+                config_path=GENERATED_PROJECT_DIR / "config.json",
+                live_url=live_url,
+                source="environment_deployer",
+                change_type="bare_metal_linux_deploy",
                 level=kwargs.get("verify", "full"),
-                environment="bare_metal_linux",
+                store=True,
             )
-        except TypeError:
+        else:
             try:
-                verification = verifier(config=config, base_url=live_url)
+                verification = verifier(
+                    config=config,
+                    live_url=live_url,
+                    level=kwargs.get("verify", "full"),
+                    environment="bare_metal_linux",
+                )
             except TypeError:
-                verification = verifier(config, live_url)
+                try:
+                    verification = verifier(config=config, base_url=live_url)
+                except TypeError:
+                    verification = verifier(config, live_url)
 
         result["post_change_verification"] = verification
 
@@ -2701,6 +3140,12 @@ def deploy_bare_metal_with_shared_pipeline(config: dict, **kwargs) -> dict:
             pass
 
         prepared = _write_bare_metal_project(prepared)
+        binary_build_kwargs = dict(kwargs)
+        binary_build_kwargs.pop("binary_path", None)
+        binary_build = _build_bare_metal_linux_binary(
+            kwargs.get("binary_path"),
+            **binary_build_kwargs,
+        )
 
         result = deploy_bare_metal_linux(
             prepared,
@@ -2729,6 +3174,7 @@ def deploy_bare_metal_with_shared_pipeline(config: dict, **kwargs) -> dict:
             "change_type": kwargs.get("change_type", "deploy"),
             "decisions": prepared.get("_pipeline_decisions", []),
             "warnings": prepared.get("warnings", []),
+            "binary_build": binary_build,
         }
 
         if not result.get("success"):

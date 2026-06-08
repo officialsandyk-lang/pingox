@@ -9,6 +9,28 @@ from core.deployment_state import COLORS, PROJECT_STORE_DIR
 EDGE_ROUTER_DIR = PROJECT_STORE_DIR / "edge-router"
 EDGE_NETWORK = "pingora-edge-net"
 EDGE_CONTAINER_NAME = "pingora-edge-router"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def edge_api_key_for_nginx() -> str:
+    env_key = os.getenv("PINGORA_EDGE_API_KEY", "").strip()
+    if env_key:
+        return env_key
+
+    env_path = PROJECT_ROOT / ".env"
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            key, raw_value = line.split("=", 1)
+            if key.strip() == "PINGORA_EDGE_API_KEY":
+                value = raw_value.strip().strip('"').strip("'")
+                if value:
+                    return value
+
+    return "dev-local-secret"
 
 
 def public_port_from_config(config: dict[str, Any]) -> int:
@@ -125,7 +147,7 @@ def write_edge_router_files(active_color: str, config: dict[str, Any]) -> Path:
     bind_host = public_bind_host_from_config(config)
 
     https_port = int(config.get("https_port") or os.getenv("PINGORA_TLS_HTTPS_PORT", "8443"))
-    expected_api_key = os.getenv("PINGORA_EDGE_API_KEY", "dev-local-secret")
+    expected_api_key = edge_api_key_for_nginx()
 
     upstream_host = f"pingora-{active_color}"
 
@@ -240,5 +262,4 @@ networks:
     compose_path.write_text(compose_yml, encoding="utf-8")
 
     return compose_path
-
 

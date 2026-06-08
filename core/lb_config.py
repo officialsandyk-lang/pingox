@@ -71,6 +71,16 @@ def normalize_upstream_address(value: Any) -> str:
     if not text:
         raise ValueError("Upstream address is empty.")
 
+    if text.startswith("{") and text.endswith("}"):
+        try:
+            import ast
+
+            parsed = ast.literal_eval(text)
+            if isinstance(parsed, dict):
+                return normalize_upstream_address(parsed)
+        except Exception:
+            pass
+
     if re.fullmatch(r"\d{2,5}", text):
         return f"127.0.0.1:{text}"
 
@@ -117,6 +127,24 @@ def upstream_entry(address: Any, weight: int = 1) -> Dict[str, Any]:
         "address": normalize_upstream_address(address),
         "weight": int(weight or 1),
     }
+
+
+def default_health_check() -> Dict[str, Any]:
+    return {
+        "enabled": True,
+        "path": "/health",
+        "interval_seconds": 5,
+        "timeout_seconds": 2,
+        "healthy_threshold": 2,
+        "unhealthy_threshold": 3,
+    }
+
+
+def ensure_proxy_route_defaults(route: Dict[str, Any]) -> Dict[str, Any]:
+    route.setdefault("type", "proxy")
+    route.setdefault("route_type", "proxy")
+    route.setdefault("health_check", default_health_check())
+    return route
 
 
 def _route_uses_backend_alias(route: Dict[str, Any]) -> bool:
@@ -316,6 +344,7 @@ def add_route_or_backend(
         if preserve_backend_alias:
             new_route["backend"] = address
 
+        ensure_proxy_route_defaults(new_route)
         routes.append(new_route)
 
         return merge_duplicate_routes(updated), True, f"Added route: {path} -> {address}"
@@ -355,6 +384,7 @@ def add_route_or_backend(
     if preserve_backend_alias or "backend" in route:
         route["backend"] = address
 
+    ensure_proxy_route_defaults(route)
     route.pop("upstreams", None)
     route.pop("balancing", None)
 
@@ -484,6 +514,7 @@ def replace_route_upstreams(
         if preserve_backend_alias:
             route["backend"] = unique[0]
 
+        ensure_proxy_route_defaults(route)
         updated.setdefault("routes", []).append(route)
 
     before = extract_upstream_addresses(route)
@@ -491,6 +522,7 @@ def replace_route_upstreams(
     algorithm_name = normalize_algorithm(algorithm)
 
     set_route_upstreams(route, unique, balancing=algorithm_name)
+    ensure_proxy_route_defaults(route)
 
     after = extract_upstream_addresses(route)
     after_algorithm = route.get("balancing")
@@ -546,4 +578,3 @@ def normalize_algorithm(value):
 
     default = globals().get("DEFAULT_BALANCING", "round_robin")
     return aliases.get(text, default)
-

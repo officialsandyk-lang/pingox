@@ -160,22 +160,53 @@ def get_work_dir() -> Path:
     return work_dir
 
 
+def add_linux_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--host", default=None, help="Linux server host/IP.")
+    parser.add_argument("--user", default="ubuntu", help="SSH user.")
+    parser.add_argument("--ssh-key", default=None, help="Path to SSH private key.")
+    parser.add_argument("--ssh-port", type=int, default=22, help="SSH port.")
+    parser.add_argument("--server-name", default="_", help=argparse.SUPPRESS)
+    parser.add_argument("--public-http-port", type=int, default=80, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--binary-path",
+        default="generated-pingora-proxy/target/release/generated-pingora-proxy-linux",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--service-user", default="ubuntu", help=argparse.SUPPRESS)
+    parser.add_argument("--verify", default="full", help=argparse.SUPPRESS)
+
+
+
 def apply_runtime_shortcuts(args: argparse.Namespace) -> None:
+    """
+    Normalize runtime flags once.
+
+    --docker: docker_host + bluegreen, no systemd/native public-port flags.
+    --linux: bare_metal_linux + bluegreen, no local systemd flags.
+    --local: local + direct, may use --public-port/--systemd/--replace-edge.
+    """
+    if getattr(args, "linux", False):
+        args.target = "linux"
+        args.runtime = "bare_metal_linux"
+        args.strategy = "bluegreen"
+        args.systemd = False
+        args.replace_edge = False
+        return
+
     if getattr(args, "docker", False):
         args.target = "docker_host"
         args.runtime = "docker_host"
         args.strategy = "bluegreen"
+        args.systemd = False
+        args.replace_edge = False
+        args.public_port = None
+        return
 
     if getattr(args, "local", False):
         args.target = "local"
         args.runtime = "local"
         args.strategy = "direct"
-
-    if getattr(args, "linux", False):
-        args.target = "linux"
-        args.runtime = "bare_metal_linux"
-        args.strategy = "bluegreen"
-
+        return
 
 
 def enforce_requested_environment(config: dict, args: argparse.Namespace) -> dict:
@@ -250,6 +281,200 @@ def run_command(command: list[str], cwd: Path) -> int:
     return process.returncode
 
 
+def _load_current_gateway_config(project_root: Path) -> dict:
+    candidates = [
+        project_root / "generated-pingora-proxy" / "config.json",
+        project_root / "active_config.json",
+        project_root / "gateway_config.json",
+        project_root / "data" / "api_plans" / "latest_config.json",
+    ]
+
+    for path in candidates:
+        if not path.exists():
+            continue
+
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        if isinstance(data, dict) and isinstance(data.get("routes"), list):
+            return data
+
+    raise SystemExit(
+        "Cannot find an existing gateway config to update. "
+        "Run `pingora-ai apply --linux ...` first."
+    )
+
+
+def _check_update_noop_or_conflict(prompt: str, args: argparse.Namespace) -> dict | None:
+    from update import check_add_route_noop_or_backend_conflict
+
+    guard_args = argparse.Namespace(**vars(args))
+    guard_args.prompt = [prompt]
+    return check_add_route_noop_or_backend_conflict(guard_args)
+
+
+def run_bare_metal_update_prompt(
+    prompt: str,
+    args: argparse.Namespace,
+    *,
+    confirm_route_mutation: bool = False,
+) -> int:
+    if not getattr(args, "host", None):
+        raise SystemExit("--host is required for Linux add/edit/remove.")
+
+    if not getattr(args, "ssh_key", None):
+        raise SystemExit("--ssh-key is required for Linux add/edit/remove.")
+
+    from agents.config_update_agent import apply_config_update
+    from core.environment_deployer import apply_profiles, create_backup
+    from core.mutation_decision import enforce_mutation_decision
+    from update import (
+        assert_untouched_routes_preserved,
+        preserve_untouched_routes,
+        route_mutation_paths,
+    )
+
+    project_root = require_project_root()
+    current = _load_current_gateway_config(project_root)
+
+    # Linux/bare-metal early decision-integrity gate.
+    # This must run before mutation decision, backup, SSH, build, or deploy.
+    # --confirm-route-mutation confirms user intent; it must not bypass
+    # deterministic load-balancer validity rules.
+    try:
+        from core.decision_integrity import validate_algorithm_decision
+
+        route_path = getattr(args, "path", None)
+        algorithm = getattr(args, "algorithm", None)
+
+        if route_path and algorithm:
+            normalized_route = normalize_path(route_path)
+
+            upstream_count = 0
+            for route in current.get("routes") or []:
+                if not isinstance(route, dict):
+                    continue
+
+                if normalize_path(route.get("path") or "/") != normalized_route:
+                    continue
+
+                upstreams = route.get("upstreams")
+                if isinstance(upstreams, list):
+                    upstream_count = len(upstreams)
+                elif route.get("upstream") or route.get("backend"):
+                    upstream_count = 1
+                break
+
+            validate_algorithm_decision(
+                route=normalized_route,
+                algorithm=algorithm,
+                upstream_count=upstream_count,
+                runtime="bare_metal_linux",
+                strategy="bluegreen",
+                stage="cli_linux_update_preflight",
+            )
+
+    except RuntimeError as exc:
+        print("")
+        print("🧠 Decision integrity check")
+        print("Decision: reject")
+        print("Stage: cli_linux_update_preflight")
+        print("Reason: algorithm_requires_multiple_upstreams")
+        print("")
+        print(f"⚠️ {exc}")
+        print("No deployment was made.")
+        return 0
+
+    no_change = _check_update_noop_or_conflict(prompt, args)
+    if no_change is not None:
+        print("")
+        print(no_change.get("message", "No deployment needed."))
+        print("")
+        print(json.dumps(no_change, indent=2))
+        return 0 if no_change.get("success") else 2
+
+    enforce_mutation_decision(
+        prompt=prompt,
+        config=current,
+        confirmed=bool(confirm_route_mutation),
+    )
+
+    mutable_paths = route_mutation_paths(prompt)
+
+    current_profiled = apply_profiles(
+        current,
+        runtime_mode="bare_metal_linux",
+        strategy="bluegreen",
+    )
+
+    update_result = apply_config_update(current, prompt)
+    updated = update_result.get("config") or current
+
+    updated = preserve_untouched_routes(
+        current,
+        updated,
+        mutable_paths,
+    )
+
+    updated.setdefault("port", current.get("port", 8080))
+    updated.setdefault("security", current.get("security", {}))
+
+    updated = apply_profiles(
+        updated,
+        runtime_mode="bare_metal_linux",
+        strategy="bluegreen",
+    )
+
+    updated = preserve_untouched_routes(
+        current_profiled,
+        updated,
+        mutable_paths,
+    )
+
+    assert_untouched_routes_preserved(
+        current_profiled,
+        updated,
+        mutable_paths,
+    )
+
+    updated["runtime"] = "bare_metal_linux"
+    updated["runtime_mode"] = "bare_metal_linux"
+    updated["strategy"] = "bluegreen"
+    updated["deployment_strategy"] = "bluegreen"
+
+    backup = create_backup(reason="before_bare_metal_linux_update")
+
+    if backup:
+        try:
+            from core.backup_registry import record_backup
+
+            record_backup(
+                backup_path=backup,
+                reason="before_bare_metal_linux_update",
+                runtime="bare_metal_linux",
+                strategy="bluegreen",
+                route_change=prompt,
+                valid_before_backup=True,
+                evidence={"stage": "after_decision_integrity_preflight"},
+            )
+        except Exception:
+            pass
+
+    print("")
+    print("🛠️ AI Pingora Gateway Linux Update")
+    print(f"Runtime: {updated['runtime']}")
+    print(f"Strategy: {updated['strategy']}")
+    print("Route changes:")
+    for item in update_result.get("change_summary", []):
+        print(f"- {item}")
+    if backup:
+        print(f"Backup: {backup}")
+
+    return _deploy_bare_metal_from_cli(args, updated)
+
+
 def looks_like_route_delete(prompt: str) -> bool:
     text = prompt.lower()
 
@@ -265,15 +490,19 @@ def run_update_prompt(
     strategy: str,
     verify: str,
     confirm_route_mutation: bool = False,
+    cli_args: argparse.Namespace | None = None,
 ) -> int:
     if confirm_route_mutation and "CONFIRM ROUTE MUTATION" not in prompt:
         prompt = prompt + " CONFIRM ROUTE MUTATION"
 
     if runtime in {"bare_metal_linux", "linux"}:
-        raise SystemExit(
-            "Bare-metal add/edit/remove is not wired yet. "
-            "Use pingora-ai apply --linux for now, or implement a bare-metal mutation path "
-            "that updates config and calls deploy_bare_metal_with_shared_pipeline()."
+        if cli_args is None:
+            raise SystemExit("Internal error: Linux update requires CLI args.")
+
+        return run_bare_metal_update_prompt(
+            prompt,
+            cli_args,
+            confirm_route_mutation=confirm_route_mutation,
         )
 
     project_root = require_project_root()
@@ -554,6 +783,101 @@ Safety rule:
   destructive changes such as edit/remove need explicit confirmation.
 """.strip())
 
+def force_runtime_flags_into_config(config: dict, args, prompt: str = "") -> dict:
+    """
+    Final CLI runtime boundary.
+
+    Hosted planner output must never override explicit CLI runtime flags.
+    Cross-runtime flags are stripped here.
+    """
+    if not isinstance(config, dict):
+        return config
+
+    apply_runtime_shortcuts(args)
+
+    runtime = getattr(args, "runtime", None) or config.get("runtime") or "docker_host"
+
+    for key in (
+        "_systemd",
+        "systemd",
+        "_replace_edge",
+        "replace_edge",
+        "service_user",
+    ):
+        config.pop(key, None)
+
+    if runtime == "docker_host":
+        config["runtime"] = "docker_host"
+        config["runtime_mode"] = "docker_host"
+        config["strategy"] = "bluegreen"
+        config["deployment_strategy"] = "bluegreen"
+        config.pop("public_port", None)
+        config.pop("listen_port", None)
+        config["live_url"] = "https://127.0.0.1:8443/"
+        return config
+
+    if runtime in {"bare_metal_linux", "linux"}:
+        config["runtime"] = "bare_metal_linux"
+        config["runtime_mode"] = "bare_metal_linux"
+        config["strategy"] = "bluegreen"
+        config["deployment_strategy"] = "bluegreen"
+
+        requested_port = getattr(args, "public_port", None)
+        if requested_port:
+            config["public_port"] = int(requested_port)
+            config["listen_port"] = int(requested_port)
+
+        return config
+
+    config["runtime"] = "local"
+    config["runtime_mode"] = "local"
+    config["strategy"] = "direct"
+    config["deployment_strategy"] = "direct"
+
+    requested_port = getattr(args, "public_port", None)
+    if requested_port is None and "extract_requested_public_port" in globals():
+        requested_port = extract_requested_public_port(prompt)
+
+    port = int(requested_port or config.get("port") or config.get("public_port") or config.get("listen_port") or 8090)
+
+    config["port"] = port
+    config["public_port"] = port
+    config["listen_port"] = port
+    config["live_url"] = f"http://127.0.0.1:{port}/"
+
+    if bool(getattr(args, "systemd", False)):
+        config["_systemd"] = True
+        config["systemd"] = True
+
+    if bool(getattr(args, "replace_edge", False)):
+        config["_replace_edge"] = True
+        config["replace_edge"] = True
+
+    return config
+
+
+def repair_planner_config_from_prompt(config: dict, args: argparse.Namespace, prompt: str) -> dict:
+    """
+    Apply deterministic local prompt repairs after the planner API responds.
+
+    The hosted/API planner can return a syntactically valid but semantically
+    incomplete config, for example random /api with a single upstream even when
+    the prompt listed three backends. The CLI keeps runtime flags authoritative
+    and repairs prompt-derived route intent before decision guards or deploy.
+    """
+    if not isinstance(config, dict):
+        return config
+
+    from agents.config_repair_agent import repair_config
+    from orchestration.graph import lock_prompt_route_intent
+
+    repaired = repair_config(config, prompt=prompt)
+    repaired = lock_prompt_route_intent(repaired, prompt)
+    repaired = enforce_requested_environment(repaired, args)
+    repaired = ensure_route_directory_homepage(repaired)
+    return repaired
+
+
 def cmd_plan(args: argparse.Namespace) -> int:
     apply_runtime_shortcuts(args)
     prompt = join_prompt(args.prompt)
@@ -582,14 +906,13 @@ def cmd_plan(args: argparse.Namespace) -> int:
         work_dir = get_work_dir()
         existing_config = load_existing_config(work_dir)
 
-        response["config"] = enforce_requested_environment(response["config"], args)
+        response["config"] = repair_planner_config_from_prompt(response["config"], args, prompt)
         response["config"] = apply_lightweight_decision_gate(
             response["config"],
             args=args,
             operation="plan",
             production_mode=False,
         )
-        response["config"] = ensure_route_directory_homepage(response["config"])
 
         state_guard = apply_plan_state_guard(
             prompt=prompt,
@@ -692,6 +1015,307 @@ def _deploy_bare_metal_from_cli(args: argparse.Namespace, config: dict) -> int:
     print(f"Active port: {result.get('active_port')}")
     return 0
 
+def cmd_control_api(args: argparse.Namespace) -> int:
+    import os
+    import subprocess
+    import sys
+
+    token = getattr(args, "token", None) or os.getenv("PINGORA_AI_CONTROL_TOKEN") or "dev-local-control-token"
+    os.environ["PINGORA_AI_CONTROL_TOKEN"] = token
+
+    command = [
+        sys.executable,
+        "-m",
+        "uvicorn",
+        "pingora_ai.control_api:app",
+        "--host",
+        str(getattr(args, "host", "127.0.0.1")),
+        "--port",
+        str(getattr(args, "port", 8787)),
+    ]
+
+    if getattr(args, "reload", False):
+        command.append("--reload")
+
+    print("Starting Pingora AI Control API")
+    print(f"URL: http://{args.host}:{args.port}")
+    print("Token header: X-Pingora-Control-Token")
+    print("Mode: read-only phase 1")
+    print("")
+    return subprocess.call(command)
+
+
+
+def cmd_parity(args: argparse.Namespace) -> int:
+    from pingora_ai.parity_ops import run_parity_report
+
+    return run_parity_report()
+
+
+
+def cmd_health(args: argparse.Namespace) -> int:
+    from pingora_ai.gateway_ops import health_policy
+
+    if args.health_action == "policy":
+        return health_policy(path=getattr(args, "path", None))
+
+    print("Unknown health action.")
+    return 2
+
+
+def cmd_upstream(args: argparse.Namespace) -> int:
+    if args.upstream_action == "list":
+        from pingora_ai.parity_ops import run_upstream_list
+        return run_upstream_list()
+
+    if args.upstream_action in {"drain", "disable", "enable"}:
+        from pingora_ai.gateway_ops import upstream_state_change
+
+        return upstream_state_change(
+            action=args.upstream_action,
+            path=args.path,
+            backend=args.backend,
+            confirm=bool(getattr(args, "confirm_route_mutation", False)),
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
+
+    print("Unknown upstream action.")
+    return 2
+
+
+def cmd_backup(args: argparse.Namespace) -> int:
+    if args.backup_action == "list":
+        from pingora_ai.parity_ops import run_backup_list
+        return run_backup_list(limit=int(getattr(args, "limit", 20) or 20))
+
+    if args.backup_action == "restore":
+        from pingora_ai.gateway_ops import backup_restore
+        return backup_restore(
+            backup_name=args.backup_name,
+            confirm=bool(getattr(args, "confirm", False)),
+        )
+
+    print("Unknown backup action.")
+    return 2
+
+
+
+
+def _start_local_runtime() -> int:
+    """
+    Start generated Pingora runtime locally on 8080 with local upstream addresses.
+    Local only. Does not touch Docker or Linux.
+    """
+    import os
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    project = root / "generated-pingora-proxy"
+    main_rs = project / "src" / "main.rs"
+
+    from core.env_config_resolver import sync_env_configs, env_config_path
+    sync_env_configs(project / "config.json", project, environments=["local", "docker", "linux"])
+    config_path = env_config_path("local", project)
+
+    if not main_rs.exists():
+        print(f"❌ Missing generated runtime: {main_rs}")
+        return 1
+
+    print("🛑 Stopping any existing local runtime on 8080...")
+    subprocess.run(
+        "lsof -tiTCP:8080 -sTCP:LISTEN | xargs kill -9 2>/dev/null || true",
+        shell=True,
+        cwd=str(root),
+    )
+
+    print("🔁 Setting generated runtime upstreams to local address mode...")
+    rust_text = main_rs.read_text(encoding="utf-8")
+
+    backup = main_rs.with_suffix(".rs.bak-before-start-local-address-mode")
+    if not backup.exists():
+        backup.write_text(rust_text, encoding="utf-8")
+
+    rust_text = rust_text.replace("host.docker.internal:", "127.0.0.1:")
+    main_rs.write_text(rust_text, encoding="utf-8")
+
+    print("🧪 Checking generated Rust runtime...")
+    check = subprocess.run(
+        ["cargo", "check", "--manifest-path", str(project / "Cargo.toml")],
+        cwd=str(root),
+        text=True,
+    )
+
+    if check.returncode != 0:
+        print("❌ Local runtime cargo check failed.")
+        return check.returncode
+
+    demo_script = root / "scripts" / "demo_backends.py"
+    if demo_script.exists() and config_path.exists():
+        print("🚀 Starting local demo backends...")
+        subprocess.run(
+            [sys.executable, str(demo_script), "start", str(config_path)],
+            cwd=str(root),
+            text=True,
+        )
+
+    env = os.environ.copy()
+    env["PINGORA_AI_LISTEN_PORT"] = "8080"
+
+    log_dir = project / "tmp" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "local-pingora-8080.log"
+
+    print("🚀 Starting local Pingora runtime on 8080...")
+    with log_path.open("a", encoding="utf-8") as log:
+        process = subprocess.Popen(
+            ["cargo", "run"],
+            cwd=str(project),
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+
+    time.sleep(3)
+
+    status = subprocess.run(
+        ["bash", "-lc", "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/ || true"],
+        cwd=str(root),
+        text=True,
+        capture_output=True,
+    )
+
+    code = (status.stdout or "").strip()
+
+    try:
+        import json
+        state_path = root / "data" / "active_runtime_context.json"
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(
+            json.dumps(
+                {
+                    "runtime_context": "local",
+                    "address_mode": "local",
+                    "runtime": "local",
+                    "strategy": "direct",
+                    "base_url": "http://127.0.0.1:8080",
+                    "active_config_path": str(config_path),
+                    "source": "pingora-ai start --local",
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        print(f"✅ Active runtime context written: {state_path}")
+    except Exception as exc:
+        print(f"⚠️ Could not write active runtime context: {exc}")
+
+    print("")
+    print("✅ Local Pingora runtime start requested")
+    print("URL: http://127.0.0.1:8080/")
+    print("Dashboard: http://127.0.0.1:8080/?runtime_context=local&address_mode=local")
+    print(f"PID: {process.pid}")
+    print(f"Log: {log_path}")
+    print(f"HTTP status: {code}")
+
+    return 0 if code == "200" else 1
+
+def cmd_start(args: argparse.Namespace) -> int:
+    apply_runtime_shortcuts(args)
+
+    if getattr(args, "docker", False):
+        from pingora_ai.runtime_control import start_docker
+        return start_docker()
+
+    if getattr(args, "local", False):
+        return _start_local_runtime()
+
+    print("Choose a runtime: pingora-ai start --local or pingora-ai start --docker")
+    return 2
+
+
+def cmd_restart(args: argparse.Namespace) -> int:
+    apply_runtime_shortcuts(args)
+
+    if getattr(args, "docker", False):
+        from pingora_ai.runtime_control import restart_docker
+        return restart_docker()
+
+    print("For now, restart is implemented for --docker only.")
+    print("Use: pingora-ai restart --docker")
+    return 2
+
+
+def cmd_reload(args: argparse.Namespace) -> int:
+    apply_runtime_shortcuts(args)
+
+    if getattr(args, "docker", False):
+        from pingora_ai.runtime_control import reload_docker
+        return reload_docker()
+
+    print("For now, reload is implemented for --docker only.")
+    print("Use: pingora-ai reload --docker")
+    return 2
+
+
+
+def cmd_stop(args: argparse.Namespace) -> int:
+    apply_runtime_shortcuts(args)
+
+    from pingora_ai.runtime_control import stop_docker, stop_linux, stop_local
+
+    if getattr(args, "local", False):
+        return stop_local()
+
+    if getattr(args, "docker", False):
+        return stop_docker()
+
+    if getattr(args, "linux", False):
+        return stop_linux(args)
+
+    print("Please choose one environment: --local, --docker, or --linux.")
+    return 2
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    apply_runtime_shortcuts(args)
+
+    from pingora_ai.runtime_control import status_docker, status_linux, status_local
+
+    if getattr(args, "local", False):
+        return status_local()
+
+    if getattr(args, "docker", False):
+        return status_docker()
+
+    if getattr(args, "linux", False):
+        return status_linux(args)
+
+    print("Please choose one environment: --local, --docker, or --linux.")
+    return 2
+
+
+
+def cmd_test(args: argparse.Namespace) -> int:
+    from pingora_ai.test_runner import run_test_group
+
+    return run_test_group(
+        args.group,
+        with_live_docker=bool(getattr(args, "with_live_docker", False)),
+        with_live_linux=bool(getattr(args, "with_live_linux", False)),
+    )
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    from pingora_ai.test_runner import run_doctor
+
+    return run_doctor()
+
+
+
 def cmd_apply(args: argparse.Namespace) -> int:
     ensure_planner_available_or_explain()
     prompt = join_prompt(args.prompt)
@@ -729,7 +1353,7 @@ def cmd_apply(args: argparse.Namespace) -> int:
     plan_path = project_root / "data" / "api_plans" / "latest_plan.json"
     config_path = project_root / "data" / "api_plans" / "latest_config.json"
 
-    response["config"] = ensure_route_directory_homepage(response["config"])
+    response["config"] = repair_planner_config_from_prompt(response["config"], args, prompt)
 
     save_json(plan_path, response)
     save_json(config_path, response["config"])
@@ -773,6 +1397,7 @@ def cmd_update(args: argparse.Namespace) -> int:
         strategy=args.strategy,
         verify=args.verify,
         confirm_route_mutation=args.confirm_route_mutation,
+        cli_args=args,
     )
 
 
@@ -792,6 +1417,7 @@ def cmd_add(args: argparse.Namespace) -> int:
         strategy=args.strategy,
         verify=args.verify,
         confirm_route_mutation=False,
+        cli_args=args,
     )
 
 
@@ -823,6 +1449,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
         strategy=args.strategy,
         verify=args.verify,
         confirm_route_mutation=args.confirm_route_mutation,
+        cli_args=args,
     )
 
 
@@ -837,6 +1464,7 @@ def cmd_delete(args: argparse.Namespace) -> int:
         strategy=args.strategy,
         verify=args.verify,
         confirm_route_mutation=args.confirm_route_mutation,
+        cli_args=args,
     )
 
 
@@ -931,6 +1559,176 @@ def build_parser() -> argparse.ArgumentParser:
     )
     edge_enable.set_defaults(func=cmd_edge)
 
+    control_api_parser = subcommands.add_parser(
+        "control-api",
+        help="Run authenticated local dashboard control API.",
+        description="Run the authenticated local control API for dashboard operations. Phase 1 is read-only.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    control_api_parser.add_argument("--host", default="127.0.0.1")
+    control_api_parser.add_argument("--port", type=int, default=8787)
+    control_api_parser.add_argument("--token", default=None)
+    control_api_parser.add_argument("--reload", action="store_true")
+    control_api_parser.set_defaults(func=cmd_control_api)
+
+    parity_parser = subcommands.add_parser(
+        "parity",
+        help="Show Production Gateway Parity report.",
+        description=(
+            "Read-only report showing how close the current gateway is to the "
+            "Production Gateway Parity target. This does not deploy or mutate config."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parity_parser.set_defaults(func=cmd_parity)
+
+    health_parser = subcommands.add_parser(
+        "health",
+        help="Inspect or manage health-check policy.",
+        description="Health-check policy commands. Safe read-only policy view first.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    health_subcommands = health_parser.add_subparsers(dest="health_action", required=True)
+    health_policy_parser = health_subcommands.add_parser(
+        "policy",
+        help="Show health-check policy.",
+    )
+    health_policy_parser.add_argument("path", nargs="?", default=None)
+    health_policy_parser.set_defaults(func=cmd_health)
+
+    upstream_parser = subcommands.add_parser(
+        "upstream",
+        help="Inspect upstreams.",
+        description="Read-only upstream inspection commands.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    upstream_subcommands = upstream_parser.add_subparsers(dest="upstream_action", required=True)
+    upstream_list_parser = upstream_subcommands.add_parser(
+        "list",
+        help="List routes and upstreams.",
+    )
+    upstream_list_parser.set_defaults(func=cmd_upstream)
+
+    for action_name in ["drain", "disable", "enable"]:
+        action_parser = upstream_subcommands.add_parser(
+            action_name,
+            help=f"{action_name} an upstream backend.",
+        )
+        action_parser.add_argument("path", help="Route path, for example /api")
+        action_parser.add_argument("backend", help="Backend address, for example 127.0.0.1:9101")
+        action_parser.add_argument("--dry-run", action="store_true")
+        action_parser.add_argument("--confirm-route-mutation", action="store_true")
+        action_parser.set_defaults(func=cmd_upstream)
+
+    backup_parser = subcommands.add_parser(
+        "backup",
+        help="Inspect backups.",
+        description="Read-only backup inspection commands.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    backup_subcommands = backup_parser.add_subparsers(dest="backup_action", required=True)
+    backup_list_parser = backup_subcommands.add_parser(
+        "list",
+        help="List recent backups.",
+    )
+    backup_list_parser.add_argument("--limit", type=int, default=20)
+    backup_list_parser.set_defaults(func=cmd_backup)
+
+    backup_restore_parser = backup_subcommands.add_parser(
+        "restore",
+        help="Restore a backup into generated project files.",
+    )
+    backup_restore_parser.add_argument("backup_name")
+    backup_restore_parser.add_argument("--confirm", action="store_true")
+    backup_restore_parser.set_defaults(func=cmd_backup)
+
+    start_parser = subcommands.add_parser(
+        "start",
+        help="Start an existing gateway runtime.",
+        description="Start an existing gateway runtime. Currently implemented for --docker.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    add_runtime_flags(start_parser)
+    start_parser.set_defaults(func=cmd_start)
+
+    restart_parser = subcommands.add_parser(
+        "restart",
+        help="Restart a running gateway runtime.",
+        description="Restart a running gateway runtime. Currently implemented for --docker.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    add_runtime_flags(restart_parser)
+    restart_parser.set_defaults(func=cmd_restart)
+
+    reload_parser = subcommands.add_parser(
+        "reload",
+        help="Reload a running gateway runtime.",
+        description="Reload a gateway runtime. Currently implemented as safe Docker restart.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    add_runtime_flags(reload_parser)
+    reload_parser.set_defaults(func=cmd_reload)
+
+    stop_parser = subcommands.add_parser(
+        "stop",
+        help="Stop a running gateway runtime.",
+        description=(
+            "Stop a running gateway. You must choose --local, --docker, or --linux. "
+            "This stops runtime processes/containers only. It does not delete backups or configs."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    add_runtime_flags(stop_parser)
+    stop_parser.set_defaults(func=cmd_stop)
+
+    status_parser = subcommands.add_parser(
+        "status",
+        help="Show gateway runtime status.",
+        description=(
+            "Show status for a gateway runtime. You must choose --local, --docker, or --linux."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    add_runtime_flags(status_parser)
+    status_parser.set_defaults(func=cmd_status)
+
+    doctor_parser = subcommands.add_parser(
+        "doctor",
+        help="Check local pingora-ai setup health.",
+        description=(
+            "Check local pingora-ai setup health without deploying anything."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    doctor_parser.set_defaults(func=cmd_doctor)
+
+    test_parser = subcommands.add_parser(
+        "test",
+        help="Run safe test groups.",
+        description=(
+            "Run pingora-ai safety and functionality tests. "
+            "Live Docker/Linux tests require explicit opt-in flags."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    test_parser.add_argument(
+        "group",
+        choices=["decision", "edge", "linux", "docker", "linux-live", "all"],
+        nargs="?",
+        default="all",
+        help="Test group to run.",
+    )
+    test_parser.add_argument(
+        "--with-live-docker",
+        action="store_true",
+        help="Allow tests that may touch live Docker.",
+    )
+    test_parser.add_argument(
+        "--with-live-linux",
+        action="store_true",
+        help="Allow tests that may touch a live Linux server.",
+    )
+    test_parser.set_defaults(func=cmd_test)
 
     plan_parser = subcommands.add_parser(
         "plan",
@@ -975,6 +1773,25 @@ def build_parser() -> argparse.ArgumentParser:
     apply_parser.epilog = 'Apply examples:\n\n  Run with Docker, recommended:\n\n    pingora-ai apply --docker "create gateway with /api to 127.0.0.1:9101"\n\n  Run with Docker and 3 backend servers:\n\n    pingora-ai apply --docker "create gateway with /api random across 127.0.0.1:9101, 127.0.0.1:9102 and 127.0.0.1:9103"\n\n  Run directly on this computer:\n\n    pingora-ai apply --local "create gateway with /api to 127.0.0.1:9101"\n\n  Run on a Linux server:\n\n    pingora-ai apply --linux --host 1.2.3.4 --user ubuntu --ssh-key ~/.ssh/id_rsa "create gateway with /api to 127.0.0.1:9101"\n\nWhat apply does:\n\n  - creates a gateway config from your plain English request\n  - deploys it to Docker, this computer, or a Linux server\n  - checks that the gateway works\n'
     apply_parser.formatter_class = argparse.RawDescriptionHelpFormatter
 
+
+    apply_parser.add_argument(
+        "--public-port",
+        "--port",
+        dest="public_port",
+        type=int,
+        default=None,
+        help="Public/listen port for local native runtime, for example 80 or 8090.",
+    )
+    apply_parser.add_argument(
+        "--replace-edge",
+        action="store_true",
+        help="Allow local native runtime to replace Nginx/public edge when using --local.",
+    )
+    apply_parser.add_argument(
+        "--systemd",
+        action="store_true",
+        help="Run local native Pingora runtime through systemd, useful for privileged port 80.",
+    )
     apply_parser.set_defaults(func=cmd_apply)
 
     update_parser = subcommands.add_parser(
