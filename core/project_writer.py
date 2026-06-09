@@ -1368,6 +1368,7 @@ def _pw_route_to_rust(route):
         f"        root: {_pw_rust_string(root)}.to_string(),",
         f"        index: {_pw_rust_string(index)}.to_string(),",
         f"        balancing: {_pw_rust_string(balancing)}.to_string(),",
+        "        cache: Some(default_cache_config()),",
         "        upstreams: vec![",
     ]
 

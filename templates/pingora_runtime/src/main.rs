@@ -23,6 +23,11 @@ const UNHEALTHY_THRESHOLD: usize = 3;
 struct UpstreamConfig {
     address: String,
     weight: usize,
+    state: String,
+    enabled: bool,
+    draining: bool,
+    role: String,
+    backup: bool,
 }
 
 #[derive(Clone, Debug)]
