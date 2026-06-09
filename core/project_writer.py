@@ -1353,6 +1353,65 @@ def _pw_upstreams_for_rust(route):
     return []
 
 
+
+def _pw_rust_string_list(values: Any, fallback: list[str]) -> str:
+    if not isinstance(values, list) or not values:
+        values = fallback
+
+    cleaned = []
+    for value in values:
+        item = str(value or "").strip()
+        if item:
+            cleaned.append(item)
+
+    if not cleaned:
+        cleaned = fallback
+
+    return "vec![" + ", ".join(f'"{item}".to_string()' for item in cleaned) + "]"
+
+
+def _pw_cache_to_rust(route: dict[str, Any]) -> str:
+    cache = route.get("cache") if isinstance(route, dict) else None
+
+    if not isinstance(cache, dict):
+        return "Some(default_cache_config())"
+
+    enabled = "true" if bool(cache.get("enabled", False)) else "false"
+
+    try:
+        ttl_seconds = int(cache.get("ttl_seconds", 30))
+    except Exception:
+        ttl_seconds = 30
+    ttl_seconds = max(1, min(86400, ttl_seconds))
+
+    try:
+        stale_seconds = int(cache.get("stale_while_revalidate_seconds", 0))
+    except Exception:
+        stale_seconds = 0
+    stale_seconds = max(0, min(3600, stale_seconds))
+
+    cache_key = str(cache.get("cache_key") or "method:path:query").strip()
+    if cache_key not in {"method:path:query", "method:path"}:
+        cache_key = "method:path:query"
+
+    methods = _pw_rust_string_list(cache.get("methods"), ["GET"])
+    bypass_headers = _pw_rust_string_list(
+        cache.get("bypass_headers"),
+        ["authorization", "x-api-key"],
+    )
+
+    return (
+        "Some(CacheConfig { "
+        f"enabled: {enabled}, "
+        f"ttl_seconds: {ttl_seconds}, "
+        f"methods: {methods}, "
+        f'cache_key: "{cache_key}".to_string(), '
+        f"bypass_headers: {bypass_headers}, "
+        f"stale_while_revalidate_seconds: {stale_seconds}, "
+        "})"
+    )
+
+
 def _pw_route_to_rust(route):
     path = _pw_normalize_path(route.get("path") or "/")
     route_type = _pw_route_type_for_rust(route)
@@ -1368,7 +1427,7 @@ def _pw_route_to_rust(route):
         f"        root: {_pw_rust_string(root)}.to_string(),",
         f"        index: {_pw_rust_string(index)}.to_string(),",
         f"        balancing: {_pw_rust_string(balancing)}.to_string(),",
-        "        cache: Some(default_cache_config()),",
+        f"        cache: {_pw_cache_to_rust(route)},",
         "        upstreams: vec![",
     ]
 
