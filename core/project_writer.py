@@ -582,6 +582,13 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
         <p><a href="/__gateway_runtime_state">Open runtime state JSON</a></p>
       </div>
 
+      <div class="dash-card" id="cacheCounterCard">
+        <h2>Cache Counters</h2>
+        <p>Eligible GET/HEAD: <strong id="cacheEligibleCount">0</strong></p>
+        <p>Bypassed Auth/API-Key: <strong id="cacheBypassCount">0</strong></p>
+        <p class="muted">Live runtime cache gate counters only. No cached response serving yet.</p>
+      </div>
+
       <div class="dash-card">
         <h2>Edge Mode</h2>
         <p>Pingora-only edge</p>
@@ -895,6 +902,30 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
           }}
         }});
       }}
+
+      async function updateCacheCountersFromRuntimeState() {{
+        try {{
+          const response = await fetch("/__gateway_runtime_state", {{ cache: "no-store" }});
+          const data = await response.json();
+          const cache = data && data.cache ? data.cache : {{}};
+
+          const eligibleEl = document.getElementById("cacheEligibleCount");
+          const bypassEl = document.getElementById("cacheBypassCount");
+
+          if (eligibleEl) {{
+            eligibleEl.textContent = String(Number(cache.eligible || 0));
+          }}
+
+          if (bypassEl) {{
+            bypassEl.textContent = String(Number(cache.bypasses || 0));
+          }}
+        }} catch (err) {{
+          console.warn("cache counter refresh failed", err);
+        }}
+      }}
+
+      updateCacheCountersFromRuntimeState();
+      setInterval(updateCacheCountersFromRuntimeState, 5000);
     }})();
   </script>
 
