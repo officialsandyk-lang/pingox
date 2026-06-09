@@ -88,6 +88,8 @@ struct GeneratedProxy {
     security: SecurityConfig,
     rate_limiter: Arc<Mutex<HashMap<String, RateBucket>>>,
     runtime_state: Arc<Mutex<HashMap<String, RuntimeUpstreamState>>>,
+    cache_eligible: Arc<AtomicUsize>,
+    cache_bypasses: Arc<AtomicUsize>,
 }
 
 fn content_type_for_path(path: &PathBuf) -> &'static str {
@@ -220,6 +222,8 @@ impl GeneratedProxy {
             security,
             rate_limiter: Arc::new(Mutex::new(HashMap::new())),
             runtime_state,
+            cache_eligible: Arc::new(AtomicUsize::new(0)),
+            cache_bypasses: Arc::new(AtomicUsize::new(0)),
         };
 
         proxy.start_health_checker();
@@ -400,13 +404,15 @@ impl GeneratedProxy {
         }
 
         format!(
-            "{{\"ok\":true,\"health_check\":{{\"path\":\"{}\",\"interval_seconds\":{},\"timeout_seconds\":{},\"healthy_threshold\":{},\"unhealthy_threshold\":{}}},\"routes\":[{}]}}",
+            "{{\"ok\":true,\"health_check\":{{\"path\":\"{}\",\"interval_seconds\":{},\"timeout_seconds\":{},\"healthy_threshold\":{},\"unhealthy_threshold\":{}}},\"routes\":[{}],\"cache\":{{\"eligible\":{},\"bypasses\":{}}}}}",
             json_escape(HEALTH_CHECK_PATH),
             HEALTH_INTERVAL_SECONDS,
             HEALTH_TIMEOUT_SECONDS,
             HEALTHY_THRESHOLD,
             UNHEALTHY_THRESHOLD,
-            routes_json.join(",")
+            routes_json.join(","),
+            self.cache_eligible.load(Ordering::Relaxed),
+            self.cache_bypasses.load(Ordering::Relaxed)
         )
     }
 
@@ -619,6 +625,57 @@ impl GeneratedProxy {
         }
 
         hash % len
+    }
+
+    fn route_cache_enabled(route: &RouteConfig) -> bool {
+        route
+            .cache
+            .as_ref()
+            .map(|cache| cache.enabled)
+            .unwrap_or(false)
+    }
+
+    fn request_has_cache_bypass_headers(session: &Session, route: &RouteConfig) -> bool {
+        let mut bypass_headers = vec![
+            "authorization".to_string(),
+            "x-api-key".to_string(),
+        ];
+
+        if let Some(cache) = &route.cache {
+            for header in &cache.bypass_headers {
+                let normalized = header.to_lowercase();
+                if !bypass_headers.iter().any(|value| value == &normalized) {
+                    bypass_headers.push(normalized);
+                }
+            }
+        }
+
+        for header in bypass_headers {
+            if session.req_header().headers.get(header.as_str()).is_some() {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn record_cache_gate(&self, session: &Session, route: &RouteConfig) {
+        let method = session.req_header().method.as_str().to_uppercase();
+
+        if method != "GET" && method != "HEAD" {
+            return;
+        }
+
+        if !Self::route_cache_enabled(route) {
+            return;
+        }
+
+        if Self::request_has_cache_bypass_headers(session, route) {
+            self.cache_bypasses.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        self.cache_eligible.fetch_add(1, Ordering::Relaxed);
     }
 
     fn is_blocked_path(&self, path: &str) -> bool {
@@ -878,6 +935,8 @@ impl ProxyHttp for GeneratedProxy {
                 return Ok(true);
             }
         };
+
+        self.record_cache_gate(session, &route);
 
         if route.route_type == "static" {
             return self.serve_static_route(session, &route, &path).await;
