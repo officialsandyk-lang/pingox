@@ -587,8 +587,10 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
         <p>Hits: <strong id="cacheHitCount">0</strong></p>
         <p>Misses: <strong id="cacheMissCount">0</strong></p>
         <p>Entries: <strong id="cacheEntryCount">0</strong></p>
+        <p>Approx bytes: <strong id="cacheApproxBytes">0</strong></p>
         <p>Bypasses: <strong id="cacheBypassCount">0</strong></p>
         <p>Eligible GET/HEAD: <strong id="cacheEligibleCount">0</strong></p>
+        <p>Per-route stats: <strong id="cachePerRouteStats">none</strong></p>
         <p>Max entries: <strong id="cachePolicyMaxEntries">0</strong></p>
         <p>Max body bytes: <strong id="cachePolicyMaxBodyBytes">0</strong></p>
         <p>Enabled routes: <strong id="cachePolicyRoutes">none</strong></p>
@@ -984,6 +986,30 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
 
           if (entryEl) {{
             entryEl.textContent = String(Number(cache.entries || 0));
+          }}
+
+          const approxBytesEl = document.getElementById("cacheApproxBytes");
+          if (approxBytesEl) {{
+            approxBytesEl.textContent = String(Number(cache.approximate_bytes || 0));
+          }}
+
+          const perRouteStatsEl = document.getElementById("cachePerRouteStats");
+          if (perRouteStatsEl) {{
+            const perRouteStats = Array.isArray(cache.per_route_stats) ? cache.per_route_stats : [];
+            if (perRouteStats.length === 0) {{
+              perRouteStatsEl.textContent = "none";
+            }} else {{
+              perRouteStatsEl.textContent = perRouteStats.map((item) => {{
+                const path = item.path || "unknown";
+                const entries = Number(item.entries || 0);
+                const hits = Number(item.hits || 0);
+                const misses = Number(item.misses || 0);
+                const bypasses = Number(item.bypasses || 0);
+                const eligible = Number(item.eligible || 0);
+                const bytes = Number(item.approximate_bytes || 0);
+                return `${{path}}: entries ${{entries}}, hits ${{hits}}, misses ${{misses}}, bypasses ${{bypasses}}, eligible ${{eligible}}, bytes ${{bytes}}`;
+              }}).join(" | ");
+            }}
           }}
         }} catch (err) {{
           console.warn("cache counter refresh failed", err);
