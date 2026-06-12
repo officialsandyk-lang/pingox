@@ -26,9 +26,12 @@ def post_json(url: str, timeout: int = 5) -> dict:
 
 def backend_counts(n: int = 30) -> dict[str, int]:
     counts: dict[str, int] = {}
+    probe_id = int(time.time() * 1000)
 
-    for _ in range(n):
-        body = get_text(f"{BASE}{ROUTE}/")
+    for i in range(n):
+        # Cache-bust each request so this verifier measures live upstream
+        # selection, not cached backend evidence.
+        body = get_text(f"{BASE}{ROUTE}/?runtime_admin_probe={probe_id}_{i}")
         matches = re.findall(r'"backend_port"\s*:\s*(\d+)', body)
 
         if not matches:
