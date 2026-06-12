@@ -589,7 +589,13 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
         <p>Entries: <strong id="cacheEntryCount">0</strong></p>
         <p>Bypasses: <strong id="cacheBypassCount">0</strong></p>
         <p>Eligible GET/HEAD: <strong id="cacheEligibleCount">0</strong></p>
-        <p class="muted">Real local in-memory response cache. GET/HEAD only; Authorization and X-API-Key bypass cache.</p>
+        <p>Max entries: <strong id="cachePolicyMaxEntries">0</strong></p>
+        <p>Max body bytes: <strong id="cachePolicyMaxBodyBytes">0</strong></p>
+        <p>Enabled routes: <strong id="cachePolicyRoutes">none</strong></p>
+        <p>TTL: <strong id="cachePolicyTtl">none</strong></p>
+        <p>Methods: <strong id="cachePolicyMethods">none</strong></p>
+        <p>Bypass headers: <strong id="cachePolicyBypassHeaders">none</strong></p>
+        <p class="muted">Cache Policy: real local in-memory response cache. GET/HEAD only; Authorization and X-API-Key bypass cache.</p>
       </div>
 
       <div class="dash-card">
@@ -925,6 +931,40 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
           const hitEl = document.getElementById("cacheHitCount");
           const missEl = document.getElementById("cacheMissCount");
           const entryEl = document.getElementById("cacheEntryCount");
+          const policy = cache.policy || {{}};
+          const enabledRoutes = Array.isArray(policy.enabled_routes) ? policy.enabled_routes : [];
+          const firstRoute = enabledRoutes.length ? enabledRoutes[0] : {{}};
+
+          const maxEntriesEl = document.getElementById("cachePolicyMaxEntries");
+          const maxBodyBytesEl = document.getElementById("cachePolicyMaxBodyBytes");
+          const routesEl = document.getElementById("cachePolicyRoutes");
+          const ttlEl = document.getElementById("cachePolicyTtl");
+          const methodsEl = document.getElementById("cachePolicyMethods");
+          const bypassHeadersEl = document.getElementById("cachePolicyBypassHeaders");
+
+          if (maxEntriesEl) {{
+            maxEntriesEl.textContent = String(Number(policy.max_entries || 0));
+          }}
+
+          if (maxBodyBytesEl) {{
+            maxBodyBytesEl.textContent = String(Number(policy.max_body_bytes || 0));
+          }}
+
+          if (routesEl) {{
+            routesEl.textContent = enabledRoutes.map((item) => item.path || "").filter(Boolean).join(", ") || "none";
+          }}
+
+          if (ttlEl) {{
+            ttlEl.textContent = firstRoute.ttl_seconds ? String(firstRoute.ttl_seconds) + "s" : "none";
+          }}
+
+          if (methodsEl) {{
+            methodsEl.textContent = Array.isArray(firstRoute.methods) ? firstRoute.methods.join(", ") : "none";
+          }}
+
+          if (bypassHeadersEl) {{
+            bypassHeadersEl.textContent = Array.isArray(firstRoute.bypass_headers) ? firstRoute.bypass_headers.join(", ") : "none";
+          }}
 
           if (eligibleEl) {{
             eligibleEl.textContent = String(Number(cache.eligible || 0));

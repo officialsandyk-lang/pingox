@@ -39,8 +39,9 @@ def main() -> int:
         and "__gateway_runtime_admin/cache/clear" in text
         and "created_unix_ms" in text
         and "MAX_CACHE_ENTRIES" in text
+        and "\"policy\":{\"max_entries\":1024" in text
     ):
-        print("✅ Manual cache Step 6 + invalidation already present in generated Rust.")
+        print("✅ Manual cache Step 6 + invalidation + policy observability already present in generated Rust.")
         return 0
 
     if (
@@ -108,6 +109,17 @@ def main() -> int:
 """,
                 1,
             )
+
+
+        if "\"policy\":{\"max_entries\":1024" not in text:
+            old_policy_json = '        let cache_entries = self\n            .response_cache\n            .lock()\n            .map(|cache| cache.len())\n            .unwrap_or(0);\n\n        format!(\n            "{{\\"ok\\":true,\\"health_check\\":{{\\"path\\":\\"{}\\",\\"interval_seconds\\":{},\\"timeout_seconds\\":{},\\"healthy_threshold\\":{},\\"unhealthy_threshold\\":{}}},\\"routes\\":[{}],\\"cache\\":{{\\"eligible\\":{},\\"bypasses\\":{},\\"hits\\":{},\\"misses\\":{},\\"entries\\":{}}}}}",\n            json_escape(HEALTH_CHECK_PATH),\n            HEALTH_INTERVAL_SECONDS,\n            HEALTH_TIMEOUT_SECONDS,\n            HEALTHY_THRESHOLD,\n            UNHEALTHY_THRESHOLD,\n            routes_json.join(","),\n            self.cache_eligible.load(Ordering::Relaxed),\n            self.cache_bypasses.load(Ordering::Relaxed),\n            self.cache_hits.load(Ordering::Relaxed),\n            self.cache_misses.load(Ordering::Relaxed),\n            cache_entries\n        )\n'
+            new_policy_json = '        let cache_entries = self\n            .response_cache\n            .lock()\n            .map(|cache| cache.len())\n            .unwrap_or(0);\n\n        let mut cache_policy_routes = Vec::new();\n\n        for route in self.routes.iter() {\n            if let Some(cache) = &route.cache {\n                if cache.enabled {\n                    let methods_json = cache\n                        .methods\n                        .iter()\n                        .map(|method| format!("\\"{}.\\"", json_escape(method)).replace(".\\"", "\\""))\n                        .collect::<Vec<_>>()\n                        .join(",");\n\n                    let bypass_headers_json = cache\n                        .bypass_headers\n                        .iter()\n                        .map(|header| format!("\\"{}.\\"", json_escape(header)).replace(".\\"", "\\""))\n                        .collect::<Vec<_>>()\n                        .join(",");\n\n                    cache_policy_routes.push(format!(\n                        "{{\\"path\\":\\"{}\\",\\"ttl_seconds\\":{},\\"methods\\":[{}],\\"cache_key\\":\\"{}\\",\\"bypass_headers\\":[{}]}}",\n                        json_escape(&route.path),\n                        cache.ttl_seconds.clamp(1, 86400),\n                        methods_json,\n                        json_escape(&cache.cache_key),\n                        bypass_headers_json\n                    ));\n                }\n            }\n        }\n\n        format!(\n            "{{\\"ok\\":true,\\"health_check\\":{{\\"path\\":\\"{}\\",\\"interval_seconds\\":{},\\"timeout_seconds\\":{},\\"healthy_threshold\\":{},\\"unhealthy_threshold\\":{}}},\\"routes\\":[{}],\\"cache\\":{{\\"eligible\\":{},\\"bypasses\\":{},\\"hits\\":{},\\"misses\\":{},\\"entries\\":{},\\"policy\\":{{\\"max_entries\\":1024,\\"max_body_bytes\\":1048576,\\"enabled_routes\\":[{}]}}}}}}",\n            json_escape(HEALTH_CHECK_PATH),\n            HEALTH_INTERVAL_SECONDS,\n            HEALTH_TIMEOUT_SECONDS,\n            HEALTHY_THRESHOLD,\n            UNHEALTHY_THRESHOLD,\n            routes_json.join(","),\n            self.cache_eligible.load(Ordering::Relaxed),\n            self.cache_bypasses.load(Ordering::Relaxed),\n            self.cache_hits.load(Ordering::Relaxed),\n            self.cache_misses.load(Ordering::Relaxed),\n            cache_entries,\n            cache_policy_routes.join(",")\n        )\n'
+            if old_policy_json in text:
+                text = text.replace(old_policy_json, new_policy_json, 1)
+            elif "max_entries" in text and "max_body_bytes" in text and "enabled_routes" in text:
+                print("✅ runtime state cache policy observability already template-managed.")
+            else:
+                fail("Could not find runtime state cache JSON block for policy observability.")
 
         if "created_unix_ms: current_unix_ms()" not in text:
             text = text.replace(

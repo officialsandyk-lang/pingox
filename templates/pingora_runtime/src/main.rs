@@ -436,8 +436,39 @@ impl GeneratedProxy {
             .map(|cache| cache.len())
             .unwrap_or(0);
 
+        let mut cache_policy_routes = Vec::new();
+
+        for route in self.routes.iter() {
+            if let Some(cache) = &route.cache {
+                if cache.enabled {
+                    let methods_json = cache
+                        .methods
+                        .iter()
+                        .map(|method| format!("\"{}.\"", json_escape(method)).replace(".\"", "\""))
+                        .collect::<Vec<_>>()
+                        .join(",");
+
+                    let bypass_headers_json = cache
+                        .bypass_headers
+                        .iter()
+                        .map(|header| format!("\"{}.\"", json_escape(header)).replace(".\"", "\""))
+                        .collect::<Vec<_>>()
+                        .join(",");
+
+                    cache_policy_routes.push(format!(
+                        "{{\"path\":\"{}\",\"ttl_seconds\":{},\"methods\":[{}],\"cache_key\":\"{}\",\"bypass_headers\":[{}]}}",
+                        json_escape(&route.path),
+                        cache.ttl_seconds.clamp(1, 86400),
+                        methods_json,
+                        json_escape(&cache.cache_key),
+                        bypass_headers_json
+                    ));
+                }
+            }
+        }
+
         format!(
-            "{{\"ok\":true,\"health_check\":{{\"path\":\"{}\",\"interval_seconds\":{},\"timeout_seconds\":{},\"healthy_threshold\":{},\"unhealthy_threshold\":{}}},\"routes\":[{}],\"cache\":{{\"eligible\":{},\"bypasses\":{},\"hits\":{},\"misses\":{},\"entries\":{}}}}}",
+            "{{\"ok\":true,\"health_check\":{{\"path\":\"{}\",\"interval_seconds\":{},\"timeout_seconds\":{},\"healthy_threshold\":{},\"unhealthy_threshold\":{}}},\"routes\":[{}],\"cache\":{{\"eligible\":{},\"bypasses\":{},\"hits\":{},\"misses\":{},\"entries\":{},\"policy\":{{\"max_entries\":1024,\"max_body_bytes\":1048576,\"enabled_routes\":[{}]}}}}}}",
             json_escape(HEALTH_CHECK_PATH),
             HEALTH_INTERVAL_SECONDS,
             HEALTH_TIMEOUT_SECONDS,
@@ -448,7 +479,8 @@ impl GeneratedProxy {
             self.cache_bypasses.load(Ordering::Relaxed),
             self.cache_hits.load(Ordering::Relaxed),
             self.cache_misses.load(Ordering::Relaxed),
-            cache_entries
+            cache_entries,
+            cache_policy_routes.join(",")
         )
     }
 
