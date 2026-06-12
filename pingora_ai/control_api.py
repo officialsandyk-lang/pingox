@@ -271,7 +271,7 @@ def control_status(
     config = _load_active_config()
     routes = config.get("routes") or []
 
-    docker_status = _run(
+    docker_status_raw = _run(
         [
             "bash",
             "-lc",
@@ -280,6 +280,31 @@ def control_status(
         ],
         timeout=30,
     )
+
+    runtime_is_local = (
+        str(runtime_context).lower() == "local"
+        or str(address_mode).lower() == "local"
+    )
+
+    docker_lines = [
+        line for line in (docker_status_raw.get("stdout") or "").splitlines()
+        if line.strip()
+    ]
+    docker_active = len(docker_lines) > 1
+    docker_expected = not runtime_is_local
+
+    docker_status = {
+        **docker_status_raw,
+        "command_ok": docker_status_raw.get("returncode") == 0,
+        "active": docker_active,
+        "expected": docker_expected,
+        "ok": True if not docker_expected else docker_active,
+        "reason": (
+            "docker containers not required for local runtime"
+            if not docker_expected
+            else "docker runtime expected"
+        ),
+    }
 
     # base_url resolved by _resolve_runtime_context()
 
@@ -895,6 +920,166 @@ def control_lesson_learning_report(
 
     return lesson_learning_report(limit=limit)
 
+
+
+
+# ---------------------------------------------------------------------
+# Cache Control Agent local-only endpoints
+# ---------------------------------------------------------------------
+# Dry-run never mutates runtime. Confirmed clear is local-only first.
+
+@app.get("/__gateway_control/cache/clear/dry-run")
+def control_cache_clear_dry_run(
+    x_pingora_control_token: str | None = Header(default=None),
+    runtime_context: str = "local",
+    address_mode: str = "local",
+) -> dict[str, Any]:
+    _require_token(x_pingora_control_token)
+
+    runtime_context, address_mode, base_url = _resolve_runtime_context(runtime_context, address_mode)
+    local_allowed = runtime_context == "local" and address_mode == "local"
+
+    return {
+        "ok": local_allowed,
+        "agent": "cache_control_agent",
+        "mode": "dry_run_only",
+        "action": "clear_cache",
+        "runtime_context": runtime_context,
+        "address_mode": address_mode,
+        "runtime_url": base_url,
+        "decision": "allowed" if local_allowed else "blocked",
+        "reason": "Dry-run allowed. No cache entries will be cleared." if local_allowed else "Cache clear is local-only in this milestone.",
+        "would_clear_cache": local_allowed,
+        "requires_confirmation": True,
+        "will_not_execute": True,
+        "local_only": True,
+        "safety": {
+            "runtime_mutation": False,
+            "file_mutation": False,
+            "docker_apply": False,
+            "linux_deploy": False,
+            "restart": False,
+            "rollback": False,
+        },
+        "next_step": "Run confirmed clear only after reviewing this dry-run report." if local_allowed else "Switch to local runtime context first.",
+    }
+
+
+@app.get("/__gateway_control/cache/clear")
+def control_cache_clear_confirm(
+    x_pingora_control_token: str | None = Header(default=None),
+    confirm: bool = False,
+    runtime_context: str = "local",
+    address_mode: str = "local",
+) -> dict[str, Any]:
+    _require_token(x_pingora_control_token)
+
+    runtime_context, address_mode, base_url = _resolve_runtime_context(runtime_context, address_mode)
+
+    if runtime_context != "local" or address_mode != "local":
+        return {
+            "ok": False,
+            "agent": "cache_control_agent",
+            "mode": "confirmed_live_local",
+            "action": "clear_cache",
+            "decision": "blocked",
+            "reason": "Cache clear is local-only in this milestone.",
+            "runtime_context": runtime_context,
+            "address_mode": address_mode,
+            "requires_confirmation": True,
+            "will_not_execute": True,
+            "local_only": True,
+        }
+
+    if confirm is not True:
+        return {
+            "ok": False,
+            "agent": "cache_control_agent",
+            "mode": "confirmed_live_local",
+            "action": "clear_cache",
+            "decision": "blocked",
+            "reason": "Cache clear requires confirm=true.",
+            "runtime_context": runtime_context,
+            "address_mode": address_mode,
+            "requires_confirmation": True,
+            "will_not_execute": True,
+            "local_only": True,
+            "safety": {
+                "runtime_mutation": False,
+                "file_mutation": False,
+                "docker_apply": False,
+                "linux_deploy": False,
+                "restart": False,
+                "rollback": False,
+            },
+        }
+
+    import json
+    import urllib.error
+    import urllib.request
+
+    url = f"{base_url.rstrip('/')}/__gateway_runtime_admin/cache/clear"
+    req = urllib.request.Request(url, data=b"", method="POST")
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as res:
+            body = res.read().decode("utf-8", errors="replace")
+            try:
+                runtime_report = json.loads(body)
+            except Exception:
+                runtime_report = {"raw": body}
+
+        return {
+            "ok": bool(runtime_report.get("ok")),
+            "agent": "cache_control_agent",
+            "mode": "confirmed_live_local",
+            "action": "clear_cache",
+            "decision": "completed" if runtime_report.get("ok") else "failed",
+            "runtime_context": runtime_context,
+            "address_mode": address_mode,
+            "runtime_url": url,
+            "confirmed": True,
+            "local_only": True,
+            "live_runtime_mutation": True,
+            "cleared_entries": runtime_report.get("cleared_entries"),
+            "runtime_report": runtime_report,
+            "docker_apply": False,
+            "linux_deploy": False,
+            "restart": False,
+            "rollback": False,
+        }
+
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        return {
+            "ok": False,
+            "agent": "cache_control_agent",
+            "mode": "confirmed_live_local",
+            "action": "clear_cache",
+            "decision": "failed",
+            "runtime_url": url,
+            "error": f"HTTP {exc.code}: {body}",
+            "live_runtime_mutation": False,
+            "docker_apply": False,
+            "linux_deploy": False,
+            "restart": False,
+            "rollback": False,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "agent": "cache_control_agent",
+            "mode": "confirmed_live_local",
+            "action": "clear_cache",
+            "decision": "failed",
+            "runtime_url": url,
+            "error": str(exc),
+            "live_runtime_mutation": False,
+            "docker_apply": False,
+            "linux_deploy": False,
+            "restart": False,
+            "rollback": False,
+        }
 
 # ---------------------------------------------------------------------
 # Upstream State Agent dry-run endpoints

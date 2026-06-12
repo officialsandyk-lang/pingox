@@ -722,6 +722,14 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
           Live Enable Upstream
         </button>
 
+        <button type="button" class="cmd-btn warning" data-command="pingora-ai cache clear --dry-run" data-kind="api" data-endpoint="/__gateway_control/cache/clear/dry-run">
+          Clear Cache Dry Run
+        </button>
+
+        <button type="button" class="cmd-btn danger" data-command="pingora-ai cache clear --confirm" data-kind="api" data-endpoint="/__gateway_control/cache/clear?confirm=true">
+          Clear Cache Live
+        </button>
+
         <button type="button" class="cmd-btn warning" data-command="pingora-ai backup restore generated-pingora-proxy-stable-final-restore-dashboard-20260607T201416Z --dry-run" data-kind="api" data-endpoint="/__gateway_control/backup/restore/dry-run?backup=generated-pingora-proxy-stable-final-restore-dashboard-20260607T201416Z">
           Restore Backup Dry Run
         </button>
