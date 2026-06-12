@@ -71,6 +71,17 @@ struct RuntimeUpstreamState {
     last_checked_unix_ms: u128,
 }
 
+// PINGORA_AI_RUNTIME_ADMIN_TEMPLATE_INTEGRATED_V1
+#[derive(Clone, Debug)]
+struct RuntimeAdminUpstreamState {
+    state: String,
+    enabled: bool,
+    draining: bool,
+    role: String,
+    backup: bool,
+    updated_unix_ms: u128,
+}
+
 #[derive(Debug)]
 struct RateBucket {
     window_start: Instant,
@@ -109,6 +120,7 @@ struct GeneratedProxy {
     security: SecurityConfig,
     rate_limiter: Arc<Mutex<HashMap<String, RateBucket>>>,
     runtime_state: Arc<Mutex<HashMap<String, RuntimeUpstreamState>>>,
+    admin_upstream_state: Arc<Mutex<HashMap<String, RuntimeAdminUpstreamState>>>,
     cache_eligible: Arc<AtomicUsize>,
     cache_bypasses: Arc<AtomicUsize>,
     cache_hits: Arc<AtomicUsize>,
@@ -195,6 +207,26 @@ fn safe_static_path(root: &str, relative_path: &str, index: &str) -> Option<Path
     Some(path)
 }
 
+fn pingora_ai_upstream_state_enabled(state: &str, enabled: bool, draining: bool) -> bool {
+    if !enabled {
+        return false;
+    }
+
+    if draining {
+        return false;
+    }
+
+    !matches!(state.to_ascii_lowercase().as_str(), "disabled" | "draining" | "drain")
+}
+
+fn pingora_ai_upstream_role_is_backup(role: &str, backup: bool) -> bool {
+    if backup {
+        return true;
+    }
+
+    matches!(role.to_ascii_lowercase().as_str(), "backup" | "standby" | "secondary")
+}
+
 impl GeneratedProxy {
     fn new(routes: Vec<RouteConfig>, security: SecurityConfig) -> Self {
         let counters = routes
@@ -214,9 +246,11 @@ impl GeneratedProxy {
             .collect::<Vec<_>>();
 
         let runtime_state = Arc::new(Mutex::new(HashMap::new()));
+        let admin_upstream_state = Arc::new(Mutex::new(HashMap::new()));
 
         {
             let mut state = runtime_state.lock().unwrap();
+            let mut admin_state = admin_upstream_state.lock().unwrap();
 
             for route in &routes {
                 if route.route_type == "static" {
@@ -235,6 +269,18 @@ impl GeneratedProxy {
                             last_checked_unix_ms: 0,
                         },
                     );
+
+                    admin_state.insert(
+                        runtime_state_key(&route.path, &upstream.address),
+                        RuntimeAdminUpstreamState {
+                            state: upstream.state.clone(),
+                            enabled: upstream.enabled,
+                            draining: upstream.draining,
+                            role: upstream.role.clone(),
+                            backup: upstream.backup,
+                            updated_unix_ms: current_unix_ms(),
+                        },
+                    );
                 }
             }
         }
@@ -246,6 +292,7 @@ impl GeneratedProxy {
             security,
             rate_limiter: Arc::new(Mutex::new(HashMap::new())),
             runtime_state,
+            admin_upstream_state,
             cache_eligible: Arc::new(AtomicUsize::new(0)),
             cache_bypasses: Arc::new(AtomicUsize::new(0)),
             cache_hits: Arc::new(AtomicUsize::new(0)),
@@ -364,6 +411,141 @@ impl GeneratedProxy {
         Ok(true)
     }
 
+    fn query_param(query: &str, name: &str) -> Option<String> {
+        for part in query.split('&') {
+            let mut pieces = part.splitn(2, '=');
+            let key = pieces.next().unwrap_or("");
+            let value = pieces.next().unwrap_or("");
+
+            if key == name {
+                return Some(value.replace("%2F", "/").replace("%3A", ":"));
+            }
+        }
+
+        None
+    }
+
+    fn update_admin_upstream_state(&self, action: &str, route_path: &str, upstream_address: &str) -> (bool, String) {
+        let normalised = upstream_address
+            .replace("127.0.0.1:", "127.0.0.1:")
+            .replace("localhost:", "127.0.0.1:");
+
+        let route = match self.routes.iter().find(|route| route.path == route_path) {
+            Some(value) => value,
+            None => return (false, format!("route_not_found: {}", route_path)),
+        };
+
+        let target = match route.upstreams.iter().find(|upstream| {
+            upstream.address == upstream_address || upstream.address == normalised
+        }) {
+            Some(value) => value,
+            None => return (false, format!("upstream_not_found: {}", upstream_address)),
+        };
+
+        if action == "disable" || action == "drain" {
+            let active_primary_count = route.upstreams.iter().filter(|upstream| {
+                if upstream.address == target.address {
+                    return false;
+                }
+
+                self.upstream_allows_new_traffic_for_route(route, upstream)
+                    && !self.upstream_is_backup_for_route(route, upstream)
+            }).count();
+
+            if active_primary_count < 1 {
+                return (false, "cannot_disable_or_drain_last_active_primary".to_string());
+            }
+        }
+
+        let key = runtime_state_key(&route.path, &target.address);
+
+        let mut state = match self.admin_upstream_state.lock() {
+            Ok(guard) => guard,
+            Err(_) => return (false, "admin_state_lock_failed".to_string()),
+        };
+
+        let entry = state.entry(key).or_insert(RuntimeAdminUpstreamState {
+            state: target.state.clone(),
+            enabled: target.enabled,
+            draining: target.draining,
+            role: target.role.clone(),
+            backup: target.backup,
+            updated_unix_ms: current_unix_ms(),
+        });
+
+        match action {
+            "disable" => {
+                entry.state = "disabled".to_string();
+                entry.enabled = false;
+                entry.draining = false;
+            }
+            "drain" => {
+                entry.state = "draining".to_string();
+                entry.enabled = false;
+                entry.draining = true;
+            }
+            "enable" => {
+                entry.state = "enabled".to_string();
+                entry.enabled = true;
+                entry.draining = false;
+            }
+            _ => return (false, format!("unknown_action: {}", action)),
+        }
+
+        entry.updated_unix_ms = current_unix_ms();
+
+        (true, "updated_in_memory".to_string())
+    }
+
+    async fn serve_runtime_admin_upstream(&self, session: &mut Session, action: &str) -> Result<bool> {
+        let method = session.req_header().method.as_str().to_uppercase();
+
+        if method != "POST" {
+            return self.write_json_response(
+                session,
+                405,
+                "{\"ok\":false,\"error\":\"method_not_allowed\"}".to_string(),
+            ).await;
+        }
+
+        let query = session.req_header().uri.query().unwrap_or("");
+        let confirm = Self::query_param(query, "confirm").unwrap_or_default();
+
+        if confirm != "true" {
+            return self.write_json_response(
+                session,
+                400,
+                "{\"ok\":false,\"error\":\"confirm_true_required\"}".to_string(),
+            ).await;
+        }
+
+        let route = Self::query_param(query, "route").unwrap_or_else(|| "/api".to_string());
+        let upstream = Self::query_param(query, "upstream").unwrap_or_default();
+
+        if upstream.is_empty() {
+            return self.write_json_response(
+                session,
+                400,
+                "{\"ok\":false,\"error\":\"upstream_required\"}".to_string(),
+            ).await;
+        }
+
+        let (ok, message) = self.update_admin_upstream_state(action, &route, &upstream);
+
+        let status = if ok { 200 } else { 400 };
+        let body = format!(
+            "{{\"ok\":{},\"runtime_admin\":true,\"action\":\"{}\",\"route\":\"{}\",\"upstream\":\"{}\",\"message\":\"{}\",\"live_runtime_mutation\":{},\"restart\":false,\"docker_apply\":false}}",
+            ok,
+            json_escape(action),
+            json_escape(&route),
+            json_escape(&upstream),
+            json_escape(&message),
+            ok
+        );
+
+        self.write_json_response(session, status, body).await
+    }
+
     async fn serve_runtime_state(&self, session: &mut Session) -> Result<bool> {
         let body = self.runtime_state_json();
         self.write_json_response(session, 200, body).await
@@ -410,9 +592,26 @@ impl GeneratedProxy {
                     None => "null".to_string(),
                 };
 
+                let admin_item = self.admin_state_for_upstream(route, upstream);
+                let effective_state = admin_item.as_ref().map(|value| value.state.as_str()).unwrap_or(upstream.state.as_str());
+                let effective_enabled = admin_item.as_ref().map(|value| value.enabled).unwrap_or(upstream.enabled);
+                let effective_draining = admin_item.as_ref().map(|value| value.draining).unwrap_or(upstream.draining);
+                let effective_role = admin_item.as_ref().map(|value| value.role.as_str()).unwrap_or(upstream.role.as_str());
+                let effective_backup = admin_item.as_ref().map(|value| value.backup).unwrap_or(upstream.backup);
+                let live_admin_override = admin_item.is_some();
+
                 upstreams_json.push(format!(
-                    "{{\"address\":\"{}\",\"healthy\":{},\"consecutive_successes\":{},\"consecutive_failures\":{},\"last_status\":{},\"last_error\":{},\"last_checked_unix_ms\":{}}}",
+                    "{{\"address\":\"{}\",\"weight\":{},\"config_state\":\"{}\",\"effective_state\":\"{}\",\"state\":\"{}\",\"enabled\":{},\"draining\":{},\"role\":\"{}\",\"backup\":{},\"live_admin_override\":{},\"healthy\":{},\"consecutive_successes\":{},\"consecutive_failures\":{},\"last_status\":{},\"last_error\":{},\"last_checked_unix_ms\":{}}}",
                     json_escape(&upstream.address),
+                    upstream.weight,
+                    json_escape(&upstream.state),
+                    json_escape(effective_state),
+                    json_escape(effective_state),
+                    effective_enabled,
+                    effective_draining,
+                    json_escape(effective_role),
+                    effective_backup,
+                    live_admin_override,
                     item.healthy,
                     item.consecutive_successes,
                     item.consecutive_failures,
@@ -542,7 +741,48 @@ impl GeneratedProxy {
         state.get(&key).map(|item| item.healthy).unwrap_or(true)
     }
 
-    fn eligible_upstream_indices(&self, route_index: usize) -> Vec<usize> {
+    fn admin_state_for_upstream(&self, route: &RouteConfig, upstream: &UpstreamConfig) -> Option<RuntimeAdminUpstreamState> {
+        let key = runtime_state_key(&route.path, &upstream.address);
+
+        let state = match self.admin_upstream_state.lock() {
+            Ok(guard) => guard,
+            Err(_) => return None,
+        };
+
+        state.get(&key).cloned()
+    }
+
+    fn upstream_allows_new_traffic_for_route(&self, route: &RouteConfig, upstream: &UpstreamConfig) -> bool {
+        if let Some(admin) = self.admin_state_for_upstream(route, upstream) {
+            return pingora_ai_upstream_state_enabled(
+                &admin.state,
+                admin.enabled,
+                admin.draining,
+            );
+        }
+
+        pingora_ai_upstream_state_enabled(
+            &upstream.state,
+            upstream.enabled,
+            upstream.draining,
+        )
+    }
+
+    fn upstream_is_backup_for_route(&self, route: &RouteConfig, upstream: &UpstreamConfig) -> bool {
+        if let Some(admin) = self.admin_state_for_upstream(route, upstream) {
+            return pingora_ai_upstream_role_is_backup(
+                &admin.role,
+                admin.backup,
+            );
+        }
+
+        pingora_ai_upstream_role_is_backup(
+            &upstream.role,
+            upstream.backup,
+        )
+    }
+
+    fn eligible_upstream_indices_by_role(&self, route_index: usize, want_backup: bool) -> Vec<usize> {
         let route = match self.routes.get(route_index) {
             Some(value) => value,
             None => return Vec::new(),
@@ -553,6 +793,14 @@ impl GeneratedProxy {
             .iter()
             .enumerate()
             .filter_map(|(index, upstream)| {
+                if !self.upstream_allows_new_traffic_for_route(route, upstream) {
+                    return None;
+                }
+
+                if self.upstream_is_backup_for_route(route, upstream) != want_backup {
+                    return None;
+                }
+
                 if self.upstream_is_healthy(route, upstream) {
                     Some(index)
                 } else {
@@ -560,6 +808,15 @@ impl GeneratedProxy {
                 }
             })
             .collect::<Vec<_>>()
+    }
+
+    fn eligible_upstream_indices(&self, route_index: usize) -> Vec<usize> {
+        let primary = self.eligible_upstream_indices_by_role(route_index, false);
+        if !primary.is_empty() {
+            return primary;
+        }
+
+        self.eligible_upstream_indices_by_role(route_index, true)
     }
 
     fn has_healthy_upstream(&self, route_index: usize) -> bool {
@@ -999,6 +1256,18 @@ impl ProxyHttp for GeneratedProxy {
     ) -> Result<bool> {
         let path = session.req_header().uri.path().to_string();
         let method = session.req_header().method.as_str().to_uppercase();
+
+        if path == "/__gateway_runtime_admin/upstream/disable" {
+            return self.serve_runtime_admin_upstream(session, "disable").await;
+        }
+
+        if path == "/__gateway_runtime_admin/upstream/drain" {
+            return self.serve_runtime_admin_upstream(session, "drain").await;
+        }
+
+        if path == "/__gateway_runtime_admin/upstream/enable" {
+            return self.serve_runtime_admin_upstream(session, "enable").await;
+        }
 
         if path == "/__gateway_runtime_admin/cache/clear" {
             if method != "POST" {

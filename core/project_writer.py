@@ -2216,7 +2216,7 @@ def _pw_run_post_generation_script(script_name, success_message, failure_label):
 def _pw_patch_runtime_admin_agent_phase1(project_dir):
     _pw_run_post_generation_script(
         "patch_runtime_admin_agent_phase1.py",
-        "✅ Runtime Admin Agent phase1 patched into generated Rust.",
+        "✅ Runtime Admin Agent compatibility check completed.",
         "Runtime Admin Agent patch",
     )
 

@@ -14,6 +14,21 @@ def backup(path: Path) -> None:
 
 def main() -> int:
     text = MAIN_RS.read_text(encoding="utf-8")
+
+    template_integrated_markers = [
+        "struct RuntimeAdminUpstreamState",
+        "admin_upstream_state: Arc<Mutex<HashMap<String, RuntimeAdminUpstreamState>>>",
+        "async fn serve_runtime_admin_upstream",
+        "fn update_admin_upstream_state",
+        "fn eligible_upstream_indices_by_role",
+        "effective_state",
+        "live_admin_override",
+    ]
+
+    if all(marker in text for marker in template_integrated_markers):
+        print("✅ Runtime admin already template-integrated; compatibility patch skipped.")
+        return 0
+
     backup(MAIN_RS)
 
     if "PINGORA_AI_RUNTIME_ADMIN_PHASE1" in text:
