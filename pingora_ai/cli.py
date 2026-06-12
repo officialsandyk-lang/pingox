@@ -1468,6 +1468,129 @@ def cmd_delete(args: argparse.Namespace) -> int:
     )
 
 
+def _require_local_cache_runtime(args: argparse.Namespace) -> None:
+    apply_runtime_shortcuts(args)
+
+    if getattr(args, "runtime", None) != "local":
+        raise SystemExit("Cache CLI control is local-only in this preview. Use --local.")
+
+
+def _local_cache_config_path() -> Path:
+    return require_project_root() / "generated-pingora-proxy" / "config.json"
+
+
+def _load_local_cache_config() -> dict:
+    config_path = _local_cache_config_path()
+
+    if not config_path.exists():
+        raise SystemExit(f"Cannot find local gateway config: {config_path}")
+
+    with config_path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _save_regenerate_build_restart_local_cache(config: dict, args: argparse.Namespace) -> int:
+    project_root = require_project_root()
+    project_dir = project_root / "generated-pingora-proxy"
+
+    from core.project_writer import write_project
+
+    write_project(config, project_dir=project_dir)
+
+    run_command(["cargo", "build"], project_dir)
+
+    args.local = True
+    args.runtime = "local"
+    args.strategy = "direct"
+
+    return cmd_start(args)
+
+
+def _find_cache_route(config: dict, path_text: str) -> dict:
+    wanted = normalize_path(path_text)
+
+    for route in config.get("routes", []) or []:
+        if normalize_path(route.get("path")) == wanted:
+            return route
+
+    raise SystemExit(f"Route not found: {wanted}")
+
+
+def _cache_runtime_json() -> dict:
+    import urllib.request
+
+    url = "http://127.0.0.1:8080/__gateway_runtime_state"
+
+    with urllib.request.urlopen(url, timeout=5) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def cmd_cache(args: argparse.Namespace) -> int:
+    _require_local_cache_runtime(args)
+
+    action = getattr(args, "cache_action", None)
+
+    if action == "enable":
+        route_path = normalize_path(args.path)
+        risky_routes = {"/auth", "/payments", "/billing", "/login", "/users"}
+
+        if route_path in risky_routes and not getattr(args, "force", False):
+            raise SystemExit(
+                f"Refusing to enable cache for risky/user-specific route {route_path}. "
+                "Use --force only after confirming it is safe."
+            )
+
+        ttl = int(getattr(args, "ttl", 30) or 30)
+        ttl = max(1, min(ttl, 86400))
+
+        config = _load_local_cache_config()
+        route = _find_cache_route(config, route_path)
+
+        route["cache"] = {
+            "enabled": True,
+            "ttl_seconds": ttl,
+            "methods": ["GET", "HEAD"],
+            "cache_key": "method:path:query",
+            "bypass_headers": ["authorization", "x-api-key"],
+            "stale_while_revalidate_seconds": 0,
+        }
+
+        print(f"✅ Enabling cache for {route_path} with TTL {ttl}s")
+        return _save_regenerate_build_restart_local_cache(config, args)
+
+    if action == "disable":
+        route_path = normalize_path(args.path)
+        config = _load_local_cache_config()
+        route = _find_cache_route(config, route_path)
+
+        cache = route.get("cache") if isinstance(route.get("cache"), dict) else {}
+        cache["enabled"] = False
+        route["cache"] = cache
+
+        print(f"✅ Disabling cache for {route_path}")
+        return _save_regenerate_build_restart_local_cache(config, args)
+
+    if action == "clear":
+        import urllib.request
+
+        url = "http://127.0.0.1:8080/__gateway_runtime_admin/cache/clear"
+        request = urllib.request.Request(url, method="POST")
+
+        with urllib.request.urlopen(request, timeout=5) as response:
+            body = response.read().decode("utf-8")
+
+        print(body)
+        return 0
+
+    if action == "status":
+        state = _cache_runtime_json()
+        cache = state.get("cache", {})
+        print(json.dumps(cache, indent=2))
+        return 0
+
+    raise SystemExit("Unknown cache action.")
+
+
 def add_runtime_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--runtime",
@@ -1641,6 +1764,34 @@ def build_parser() -> argparse.ArgumentParser:
     backup_restore_parser.add_argument("backup_name")
     backup_restore_parser.add_argument("--confirm", action="store_true")
     backup_restore_parser.set_defaults(func=cmd_backup)
+
+    cache_parser = subcommands.add_parser(
+        "cache",
+        help="Manage local route cache policy and cache entries.",
+        description="Local-only cache control. Enable/disable route cache, clear live cache entries, or show cache status.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    cache_subcommands = cache_parser.add_subparsers(dest="cache_action", required=True)
+
+    cache_enable_parser = cache_subcommands.add_parser("enable", help="Enable cache for a route.")
+    add_runtime_flags(cache_enable_parser)
+    cache_enable_parser.add_argument("path", help="Route path, for example /reports")
+    cache_enable_parser.add_argument("--ttl", type=int, default=30, help="TTL seconds, clamped to 1-86400.")
+    cache_enable_parser.add_argument("--force", action="store_true", help="Allow risky routes after manual confirmation.")
+    cache_enable_parser.set_defaults(func=cmd_cache)
+
+    cache_disable_parser = cache_subcommands.add_parser("disable", help="Disable cache for a route.")
+    add_runtime_flags(cache_disable_parser)
+    cache_disable_parser.add_argument("path", help="Route path, for example /reports")
+    cache_disable_parser.set_defaults(func=cmd_cache)
+
+    cache_clear_parser = cache_subcommands.add_parser("clear", help="Clear live local cache entries.")
+    add_runtime_flags(cache_clear_parser)
+    cache_clear_parser.set_defaults(func=cmd_cache)
+
+    cache_status_parser = cache_subcommands.add_parser("status", help="Show live local cache status.")
+    add_runtime_flags(cache_status_parser)
+    cache_status_parser.set_defaults(func=cmd_cache)
 
     start_parser = subcommands.add_parser(
         "start",
