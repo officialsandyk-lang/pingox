@@ -77,8 +77,28 @@ struct RateBucket {
     count: usize,
 }
 
+#[derive(Clone, Debug)]
+struct CachedResponse {
+    header: ResponseHeader,
+    body: Vec<u8>,
+    expires_unix_ms: u128,
+}
+
 #[derive(Debug)]
-struct RequestContext {}
+struct InFlightCacheCapture {
+    key: String,
+    header: Option<ResponseHeader>,
+    body: Vec<u8>,
+    ttl_seconds: u64,
+    cacheable: bool,
+}
+
+#[derive(Debug)]
+struct RequestContext {
+    cache_route_index: Option<usize>,
+    cache_key: Option<String>,
+    cache_capture: Option<InFlightCacheCapture>,
+}
 
 #[derive(Clone)]
 struct GeneratedProxy {
@@ -90,6 +110,9 @@ struct GeneratedProxy {
     runtime_state: Arc<Mutex<HashMap<String, RuntimeUpstreamState>>>,
     cache_eligible: Arc<AtomicUsize>,
     cache_bypasses: Arc<AtomicUsize>,
+    cache_hits: Arc<AtomicUsize>,
+    cache_misses: Arc<AtomicUsize>,
+    response_cache: Arc<Mutex<HashMap<String, CachedResponse>>>,
 }
 
 fn content_type_for_path(path: &PathBuf) -> &'static str {
@@ -224,6 +247,9 @@ impl GeneratedProxy {
             runtime_state,
             cache_eligible: Arc::new(AtomicUsize::new(0)),
             cache_bypasses: Arc::new(AtomicUsize::new(0)),
+            cache_hits: Arc::new(AtomicUsize::new(0)),
+            cache_misses: Arc::new(AtomicUsize::new(0)),
+            response_cache: Arc::new(Mutex::new(HashMap::new())),
         };
 
         proxy.start_health_checker();
@@ -403,8 +429,14 @@ impl GeneratedProxy {
             ));
         }
 
+        let cache_entries = self
+            .response_cache
+            .lock()
+            .map(|cache| cache.len())
+            .unwrap_or(0);
+
         format!(
-            "{{\"ok\":true,\"health_check\":{{\"path\":\"{}\",\"interval_seconds\":{},\"timeout_seconds\":{},\"healthy_threshold\":{},\"unhealthy_threshold\":{}}},\"routes\":[{}],\"cache\":{{\"eligible\":{},\"bypasses\":{}}}}}",
+            "{{\"ok\":true,\"health_check\":{{\"path\":\"{}\",\"interval_seconds\":{},\"timeout_seconds\":{},\"healthy_threshold\":{},\"unhealthy_threshold\":{}}},\"routes\":[{}],\"cache\":{{\"eligible\":{},\"bypasses\":{},\"hits\":{},\"misses\":{},\"entries\":{}}}}}",
             json_escape(HEALTH_CHECK_PATH),
             HEALTH_INTERVAL_SECONDS,
             HEALTH_TIMEOUT_SECONDS,
@@ -412,7 +444,10 @@ impl GeneratedProxy {
             UNHEALTHY_THRESHOLD,
             routes_json.join(","),
             self.cache_eligible.load(Ordering::Relaxed),
-            self.cache_bypasses.load(Ordering::Relaxed)
+            self.cache_bypasses.load(Ordering::Relaxed),
+            self.cache_hits.load(Ordering::Relaxed),
+            self.cache_misses.load(Ordering::Relaxed),
+            cache_entries
         )
     }
 
@@ -678,6 +713,56 @@ impl GeneratedProxy {
         self.cache_eligible.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn route_cache_allows_method(route: &RouteConfig, method: &str) -> bool {
+        route
+            .cache
+            .as_ref()
+            .map(|cache| cache.methods.iter().any(|item| item.eq_ignore_ascii_case(method)))
+            .unwrap_or(false)
+    }
+
+    fn route_cache_ttl_seconds(route: &RouteConfig) -> u64 {
+        route
+            .cache
+            .as_ref()
+            .map(|cache| cache.ttl_seconds)
+            .unwrap_or(30)
+            .clamp(1, 86400)
+    }
+
+    fn cache_key_for_request(&self, session: &Session, route: &RouteConfig) -> String {
+        let method = session.req_header().method.as_str().to_uppercase();
+        let uri = session.req_header().uri.clone();
+        let path = uri.path().to_string();
+        let query = uri.query().unwrap_or("").to_string();
+
+        let key_mode = route
+            .cache
+            .as_ref()
+            .map(|cache| cache.cache_key.as_str())
+            .unwrap_or("method:path:query");
+
+        if key_mode == "method:path" {
+            format!("{}:{}", method, path)
+        } else {
+            format!("{}:{}?{}", method, path, query)
+        }
+    }
+
+    fn cached_response_for_key(&self, key: &str) -> Option<CachedResponse> {
+        let now = current_unix_ms();
+
+        let mut cache = self.response_cache.lock().ok()?;
+        match cache.get(key) {
+            Some(entry) if entry.expires_unix_ms > now => Some(entry.clone()),
+            Some(_) => {
+                cache.remove(key);
+                None
+            }
+            None => None,
+        }
+    }
+
     fn is_blocked_path(&self, path: &str) -> bool {
         for blocked in &self.security.blocked_paths {
             if path == blocked || path.starts_with(&format!("{}/", blocked.trim_end_matches('/'))) {
@@ -867,7 +952,11 @@ impl ProxyHttp for GeneratedProxy {
     type CTX = RequestContext;
 
     fn new_ctx(&self) -> Self::CTX {
-        RequestContext {}
+        RequestContext {
+            cache_route_index: None,
+            cache_key: None,
+            cache_capture: None,
+        }
     }
 
     async fn request_filter(
@@ -938,6 +1027,45 @@ impl ProxyHttp for GeneratedProxy {
 
         self.record_cache_gate(session, &route);
 
+        let cache_allowed = Self::route_cache_enabled(&route)
+            && Self::route_cache_allows_method(&route, &method)
+            && !Self::request_has_cache_bypass_headers(session, &route)
+            && route.route_type != "static";
+
+        if cache_allowed {
+            let cache_key = self.cache_key_for_request(session, &route);
+
+            if let Some(cached) = self.cached_response_for_key(&cache_key) {
+                let mut header = cached.header.clone();
+                let _ = header.insert_header("x-pingora-ai-cache", "HIT");
+                let end_stream = method == "HEAD" || cached.body.is_empty();
+
+                session.write_response_header(Box::new(header), end_stream).await?;
+
+                if method != "HEAD" && !cached.body.is_empty() {
+                    session
+                        .write_response_body(Some(Bytes::copy_from_slice(&cached.body)), true)
+                        .await?;
+                } else if end_stream {
+                    session.write_response_body(None, true).await?;
+                }
+
+                self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(true);
+            }
+
+            self.cache_misses.fetch_add(1, Ordering::Relaxed);
+            _ctx.cache_route_index = Some(route_index);
+            _ctx.cache_key = Some(cache_key.clone());
+            _ctx.cache_capture = Some(InFlightCacheCapture {
+                key: cache_key,
+                header: None,
+                body: Vec::new(),
+                ttl_seconds: Self::route_cache_ttl_seconds(&route),
+                cacheable: true,
+            });
+        }
+
         if route.route_type == "static" {
             return self.serve_static_route(session, &route, &path).await;
         }
@@ -948,6 +1076,72 @@ impl ProxyHttp for GeneratedProxy {
         }
 
         Ok(false)
+    }
+
+    async fn response_filter(
+        &self,
+        _session: &mut Session,
+        upstream_response: &mut ResponseHeader,
+        ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        if let Some(capture) = &mut ctx.cache_capture {
+            if upstream_response.status.as_u16() == 200 {
+                let _ = upstream_response.insert_header("x-pingora-ai-cache", "MISS");
+                capture.header = Some(upstream_response.clone());
+            } else {
+                capture.cacheable = false;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn response_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<Option<Duration>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        const MAX_CACHE_BODY_BYTES: usize = 1024 * 1024;
+
+        if let Some(capture) = &mut ctx.cache_capture {
+            if capture.cacheable {
+                if let Some(chunk) = body.as_ref() {
+                    if capture.body.len().saturating_add(chunk.len()) <= MAX_CACHE_BODY_BYTES {
+                        capture.body.extend_from_slice(chunk);
+                    } else {
+                        capture.cacheable = false;
+                    }
+                }
+
+                if end_of_stream && capture.cacheable {
+                    if let Some(header) = capture.header.clone() {
+                        let expires_unix_ms = current_unix_ms()
+                            .saturating_add((capture.ttl_seconds as u128) * 1000);
+
+                        if let Ok(mut cache) = self.response_cache.lock() {
+                            cache.insert(
+                                capture.key.clone(),
+                                CachedResponse {
+                                    header,
+                                    body: capture.body.clone(),
+                                    expires_unix_ms,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     async fn upstream_peer(
@@ -1004,6 +1198,11 @@ fn build_routes() -> Vec<RouteConfig> {
         UpstreamConfig {
             address: "127.0.0.1:9101".to_string(),
             weight: 1,
+            state: "enabled".to_string(),
+            enabled: true,
+            draining: false,
+            role: "primary".to_string(),
+            backup: false,
         },
         ],
     },

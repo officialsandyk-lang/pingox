@@ -2106,10 +2106,9 @@ if "write_project" in globals() and not globals().get("_PW_REAL_WRITE_PROJECT_UP
 # Runtime Admin Agent post-generation hook
 # ---------------------------------------------------------------------
 
-def _pw_patch_runtime_admin_agent_phase1(project_dir):
+def _pw_run_post_generation_script(script_name, success_message, failure_label):
     """
-    Applies the already-verified local Runtime Admin Agent patch to generated
-    src/main.rs after write_project() regenerates routes.
+    Run a verified generated-runtime patch script after write_project().
 
     Safe scope:
     - generated project only
@@ -2123,10 +2122,10 @@ def _pw_patch_runtime_admin_agent_phase1(project_dir):
         import sys
 
         root = Path(__file__).resolve().parents[1]
-        script = root / "scripts" / "patch_runtime_admin_agent_phase1.py"
+        script = root / "scripts" / script_name
 
         if not script.exists():
-            print("⚠️ Runtime Admin Agent patch skipped: script missing")
+            print(f"⚠️ {failure_label} skipped: script missing")
             return
 
         result = subprocess.run(
@@ -2138,14 +2137,30 @@ def _pw_patch_runtime_admin_agent_phase1(project_dir):
         )
 
         if result.returncode != 0:
-            print("⚠️ Runtime Admin Agent patch failed")
+            print(f"⚠️ {failure_label} failed")
             print(result.stdout[-2000:])
             print(result.stderr[-2000:])
             return
 
-        print("✅ Runtime Admin Agent phase1 patched into generated Rust.")
+        print(success_message)
     except Exception as exc:
-        print(f"⚠️ Runtime Admin Agent patch skipped: {exc}")
+        print(f"⚠️ {failure_label} skipped: {exc}")
+
+
+def _pw_patch_runtime_admin_agent_phase1(project_dir):
+    _pw_run_post_generation_script(
+        "patch_runtime_admin_agent_phase1.py",
+        "✅ Runtime Admin Agent phase1 patched into generated Rust.",
+        "Runtime Admin Agent patch",
+    )
+
+
+def _pw_patch_runtime_manual_cache_step6(project_dir):
+    _pw_run_post_generation_script(
+        "patch_runtime_manual_cache_step6.py",
+        "✅ Manual cache Step 6 patched into generated Rust.",
+        "Manual cache Step 6 patch",
+    )
 
 
 if "_pw_original_write_project_runtime_admin" not in globals():
@@ -2154,5 +2169,6 @@ if "_pw_original_write_project_runtime_admin" not in globals():
     def write_project(config, project_dir=DEFAULT_PROJECT_DIR, **kwargs):
         result = _pw_original_write_project_runtime_admin(config, project_dir=project_dir, **kwargs)
         _pw_patch_runtime_admin_agent_phase1(project_dir)
+        _pw_patch_runtime_manual_cache_step6(project_dir)
         return result
 
