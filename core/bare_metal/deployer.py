@@ -2,7 +2,9 @@ from __future__ import annotations
 from core.homepage_route import ensure_route_directory_homepage
 
 import json
+import os
 import shlex
+import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
@@ -55,44 +57,75 @@ class BareMetalDeployResult:
 
 
 class BareMetalLinuxDeployer:
+    def _run_best_effort(
+        self,
+        command: str,
+        *,
+        sudo: bool = True,
+        timeout: int = 10,
+    ) -> subprocess.CompletedProcess[str]:
+        try:
+            return self.ssh.run(
+                command,
+                sudo=sudo,
+                check=False,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return subprocess.CompletedProcess(
+                args=exc.cmd,
+                returncode=124,
+                stdout=(exc.stdout or "") if isinstance(exc.stdout, str) else "",
+                stderr=f"Timed out after {timeout} seconds: {command}",
+            )
+
     def _stop_service(self, color: str | None) -> None:
         if color not in {"blue", "green"}:
             return
 
         service = f"pingora-ai-{color}"
+        service_arg = shlex.quote(service)
+        release_pattern = f"{REMOTE_RELEASES}/[{color[0]}]{color[1:]}/pingora-gateway"
 
         # Current generated Pingora runtime may not stop cleanly with SIGTERM.
-        # Kill first, avoid "disable --now", then clean systemd state.
-        self.ssh.run(
-            f"systemctl kill -s SIGKILL {service}",
-            sudo=True,
-            check=False,
-            timeout=10,
+        # Keep every cleanup command bounded. On some hosts, systemd stop can
+        # wait on a stale unit job even after the process is gone.
+        self._run_best_effort(
+            f"systemctl kill --kill-who=all -s SIGKILL {service_arg}",
         )
-        self.ssh.run(
-            f"pkill -9 -f /opt/pingora-ai/releases/{color}/pingora-gateway",
-            sudo=True,
-            check=False,
-            timeout=10,
+        self._run_best_effort(
+            f"pkill -9 -f {shlex.quote(release_pattern)}",
         )
-        self.ssh.run(
-            f"systemctl stop {service}",
-            sudo=True,
-            check=False,
-            timeout=10,
+        self._run_best_effort(
+            f"systemctl stop --no-block {service_arg}",
+            timeout=5,
         )
-        self.ssh.run(
-            f"systemctl disable {service}",
-            sudo=True,
-            check=False,
-            timeout=10,
+        self._run_best_effort(
+            f"systemctl disable {service_arg}",
         )
-        self.ssh.run(
-            f"systemctl reset-failed {service}",
-            sudo=True,
-            check=False,
-            timeout=10,
+        self._run_best_effort(
+            f"systemctl reset-failed {service_arg}",
         )
+
+
+    def _is_pingora_only_edge(self, config: dict[str, Any] | None = None) -> bool:
+        config = config or {}
+        edge = config.get("edge") or {}
+        edge_type = str(edge.get("type") or os.getenv("PINGORA_AI_EDGE_TYPE", "")).strip().lower()
+
+        return edge_type == "pingora" or bool(config.get("replace_nginx")) is True
+
+    def _candidate_port_for_config(self, config: dict[str, Any], color: str) -> int:
+        if self._is_pingora_only_edge(config):
+            return 80
+
+        return color_port(color)
+
+    def _live_url_for_config(self, config: dict[str, Any]) -> str:
+        if self._is_pingora_only_edge(config):
+            return f"http://{self.options.host}:80/"
+
+        return f"http://{self.options.host}:{self.options.public_http_port}/"
 
 
     def __init__(self, options: BareMetalDeployOptions):
@@ -112,7 +145,7 @@ class BareMetalLinuxDeployer:
 
             current_state = self._read_state()
             candidate_color = opposite_color(current_state.active_color)
-            candidate_port = color_port(candidate_color)
+            candidate_port = self._candidate_port_for_config(config, candidate_color)
 
             release_dir = f"{REMOTE_RELEASES}/{candidate_color}"
             remote_binary = f"{release_dir}/pingora-gateway"
@@ -140,22 +173,27 @@ class BareMetalLinuxDeployer:
             self._start_candidate(service_name)
             self._verify_candidate(candidate_port)
 
-            nginx_backup = self._backup_nginx()
+            if self._is_pingora_only_edge(config):
+                # Pingora-only Linux/systemd mode:
+                # Pingora owns public port 80 directly. No NGINX config/reload.
+                self._verify_public(config=config)
+            else:
+                nginx_backup = self._backup_nginx()
 
-            nginx_text = render_nginx_conf(
-                active_port=candidate_port,
-                server_name=self.options.server_name,
-                public_http_port=self.options.public_http_port,
-                config=config,
-            )
-            self._upload_text(nginx_text, REMOTE_NGINX_CONF, sudo=True)
+                nginx_text = render_nginx_conf(
+                    active_port=candidate_port,
+                    server_name=self.options.server_name,
+                    public_http_port=self.options.public_http_port,
+                    config=config,
+                )
+                self._upload_text(nginx_text, REMOTE_NGINX_CONF, sudo=True)
 
-            try:
-                self._test_and_reload_nginx()
-                self._verify_public()
-            except Exception:
-                self._restore_nginx(nginx_backup)
-                raise
+                try:
+                    self._test_and_reload_nginx()
+                    self._verify_public(config=config)
+                except Exception:
+                    self._restore_nginx(nginx_backup)
+                    raise
 
             new_state = BareMetalState(
                 active_color=candidate_color,
@@ -171,7 +209,7 @@ class BareMetalLinuxDeployer:
                 success=True,
                 active_color=candidate_color,
                 active_port=candidate_port,
-                live_url=f"http://{self.options.host}:{self.options.public_http_port}/",
+                live_url=self._live_url_for_config(config),
                 message="Bare-metal Linux blue/green deployment completed successfully.",
             )
 
@@ -192,22 +230,39 @@ class BareMetalLinuxDeployer:
                     message="No previous bare-metal deployment state available for rollback.",
                 )
 
-            nginx_backup = self._backup_nginx()
+            if os.getenv("PINGORA_AI_EDGE_TYPE", "").strip().lower() == "pingora":
+                # Pingora-only Linux/systemd rollback:
+                # previous Pingora service owns public port 80 directly.
+                current_service = f"pingora-ai-{state.active_color}"
+                previous_service = f"pingora-ai-{state.previous_color}"
 
-            nginx_text = render_nginx_conf(
-                active_port=state.previous_port,
-                server_name=self.options.server_name,
-                public_http_port=self.options.public_http_port,
-                config={},
-            )
-            self._upload_text(nginx_text, REMOTE_NGINX_CONF, sudo=True)
+                # Port 80 can only be owned by one Pingora service.
+                # Stop current active service first to avoid address-in-use rollback failure.
+                self.ssh.run(f"systemctl stop {shlex.quote(current_service)}", sudo=True, check=False)
+                self.ssh.run("systemctl daemon-reload", sudo=True)
+                self.ssh.run(f"systemctl restart {shlex.quote(previous_service)}", sudo=True)
+                self.ssh.run(f"systemctl enable {shlex.quote(previous_service)}", sudo=True, check=False)
 
-            try:
-                self._test_and_reload_nginx()
-                self._verify_public()
-            except Exception:
-                self._restore_nginx(nginx_backup)
-                raise
+                # Verify the previous service directly and then verify public port 80.
+                self._verify_candidate(int(state.previous_port))
+                self._verify_public(config={"edge": {"type": "pingora"}, "replace_nginx": True})
+            else:
+                nginx_backup = self._backup_nginx()
+
+                nginx_text = render_nginx_conf(
+                    active_port=state.previous_port,
+                    server_name=self.options.server_name,
+                    public_http_port=self.options.public_http_port,
+                    config={},
+                )
+                self._upload_text(nginx_text, REMOTE_NGINX_CONF, sudo=True)
+
+                try:
+                    self._test_and_reload_nginx()
+                    self._verify_public(config={})
+                except Exception:
+                    self._restore_nginx(nginx_backup)
+                    raise
 
             rolled_state = BareMetalState(
                 active_color=state.previous_color,
@@ -221,7 +276,11 @@ class BareMetalLinuxDeployer:
                 success=True,
                 active_color=rolled_state.active_color,
                 active_port=rolled_state.active_port,
-                live_url=f"http://{self.options.host}:{self.options.public_http_port}/",
+                live_url=(
+                    self._live_url_for_config({"edge": {"type": "pingora"}, "replace_nginx": True})
+                    if os.getenv("PINGORA_AI_EDGE_TYPE", "").strip().lower() == "pingora"
+                    else f"http://{self.options.host}:{self.options.public_http_port}/"
+                ),
                 message="Bare-metal Linux rollback completed successfully.",
             )
 
@@ -254,24 +313,52 @@ class BareMetalLinuxDeployer:
     def _preflight(self) -> None:
         self.ssh.run("echo pingora-ai-ssh-ok")
         self.ssh.run("command -v systemctl")
-        self.ssh.run(
-            "command -v nginx || (apt-get update && apt-get install -y nginx)",
-            sudo=True,
-            timeout=300,
-        )
         self.ssh.run("command -v curl || (apt-get update && apt-get install -y curl)", sudo=True, timeout=300)
-        self.ssh.run("systemctl enable nginx", sudo=True, check=False)
-        self.ssh.run("systemctl start nginx", sudo=True, check=False)
 
-        # Disable Ubuntu's default NGINX site so pingora-ai owns port 80.
-        self.ssh.run("rm -f /etc/nginx/sites-enabled/default /etc/nginx/sites-available/default", sudo=True, check=False)
+        pingora_only_edge = os.getenv("PINGORA_AI_EDGE_TYPE", "").strip().lower() == "pingora"
+
+        if pingora_only_edge:
+            # Pingora-only Linux/systemd mode: do not install/start NGINX.
+            self._run_best_effort(
+                "systemctl stop --no-block nginx",
+                sudo=True,
+                timeout=5,
+            )
+            self._run_best_effort(
+                "systemctl disable nginx",
+                sudo=True,
+                timeout=5,
+            )
+        else:
+            self.ssh.run(
+                "command -v nginx || (apt-get update && apt-get install -y nginx)",
+                sudo=True,
+                timeout=300,
+            )
+            self.ssh.run("systemctl enable nginx", sudo=True, check=False)
+            self.ssh.run("systemctl start nginx", sudo=True, check=False)
+
+        # Disable stale site configs so the managed conf.d file or Pingora-only
+        # service owns the public HTTP port.
+        self._run_best_effort(
+            "rm -f "
+            "/etc/nginx/sites-enabled/default "
+            "/etc/nginx/sites-available/default "
+            "/etc/nginx/sites-enabled/pingora-ai-edge "
+            "/etc/nginx/sites-available/pingora-ai-edge",
+            sudo=True,
+            timeout=5,
+        )
 
         self.ssh.run(
             f"mkdir -p {REMOTE_RELEASES} {REMOTE_STATE_DIR} {REMOTE_BACKUPS}",
             sudo=True,
         )
+        # Avoid recursive chown on every deploy. Recursive chown can make SSH
+        # appear timed out when /opt/pingora-ai contains old releases/logs.
         self.ssh.run(
-            f"chown -R {shlex.quote(self.options.user)}:{shlex.quote(self.options.user)} {REMOTE_ROOT}",
+            f"chown {shlex.quote(self.options.user)}:{shlex.quote(self.options.user)} "
+            f"{REMOTE_ROOT} {REMOTE_RELEASES} {REMOTE_STATE_DIR} {REMOTE_BACKUPS}",
             sudo=True,
         )
 
@@ -415,13 +502,13 @@ class BareMetalLinuxDeployer:
             f"{last_output}"
         )
 
-    def _verify_public(self) -> None:
+    def _verify_public(self, config: dict[str, Any] | None = None) -> None:
         deadline = time.time() + self.options.verify_timeout_seconds
         last_output = ""
 
         while time.time() < deadline:
             proc = self.ssh.run(
-                f"curl -fsS http://127.0.0.1:{self.options.public_http_port}{self.options.verify_path}",
+                f"curl -fsS http://127.0.0.1:{80 if self._is_pingora_only_edge(config) else self.options.public_http_port}{self.options.verify_path}",
                 check=False,
                 timeout=10,
             )
@@ -433,7 +520,7 @@ class BareMetalLinuxDeployer:
             time.sleep(2)
 
         raise RuntimeError(
-            f"Public NGINX route failed health check on 127.0.0.1:{self.options.public_http_port}{self.options.verify_path}\n"
+            f"Public route failed health check on 127.0.0.1:{80 if self._is_pingora_only_edge(config) else self.options.public_http_port}{self.options.verify_path}\n"
             f"{last_output}"
         )
 
@@ -464,11 +551,4 @@ class BareMetalLinuxDeployer:
         self.ssh.run("systemctl reload nginx", sudo=True)
 
     def _stop_old_service(self, old_color: str | None) -> None:
-        if old_color not in {"blue", "green"}:
-            return
-
-        self.ssh.run(
-            f"systemctl stop pingora-ai-{old_color}",
-            sudo=True,
-            check=False,
-        )
+        self._stop_service(old_color)

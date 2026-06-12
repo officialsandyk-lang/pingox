@@ -18,16 +18,19 @@ def opposite_color(color: str) -> str:
 
 def color_port(color: str) -> int:
     """
-    Temporary bare-metal proof-mode port mapping.
+    Bare-metal blue/green port mapping.
 
-    Current generated Rust runtime ignores --port and always binds to 8090.
-    Until dynamic --port support lands, both blue and green must use 8090.
+    Keep green on 8090 for compatibility with existing proof-mode deployments,
+    and use 8091 for blue so candidate releases can run beside the live color.
     """
+    if color == "blue":
+        return 8091
+
     return 8090
 
 
 def default_state() -> BareMetalState:
-    return BareMetalState(active_color="blue", active_port=color_port("blue"))
+    return BareMetalState(active_color="green", active_port=color_port("green"))
 
 
 def parse_state(text: str | None) -> BareMetalState:

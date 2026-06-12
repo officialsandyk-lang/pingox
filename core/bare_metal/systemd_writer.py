@@ -26,6 +26,9 @@ ExecStart={binary_path} --config {config_path} --port {listen_port}
 Restart=always
 RestartSec=2
 LimitNOFILE=65535
+# Allow Pingora to bind directly to privileged ports 80/443 without NGINX.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 PrivateTmp=true
 

@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import ssl
 import subprocess
 import sys
 import threading
@@ -19,7 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PYTHON = sys.executable
 
 API_URL = "http://127.0.0.1:8000"
-LIVE_URL = "http://127.0.0.1:8090"
+LIVE_URL = os.environ.get("PINGORA_AI_ACCEPTANCE_LIVE_URL", "https://127.0.0.1:8443").rstrip("/")
 
 BASELINE_PROMPT = (
     "create gateway with /api random across "
@@ -27,6 +28,41 @@ BASELINE_PROMPT = (
 )
 
 BASELINE_PORTS = {"9101", "9102", "9103"}
+
+
+def deployed_edge_api_key() -> str:
+    nginx_path = PROJECT_ROOT / "docker-bluegreen" / "nginx.conf"
+    if not nginx_path.exists():
+        return ""
+
+    text = nginx_path.read_text(encoding="utf-8", errors="replace")
+    match = re.search(r'if\s*\(\s*\$http_x_api_key\s*=\s*["\']([^"\']+)["\']\s*\)', text)
+    return match.group(1).strip() if match else ""
+
+
+def env_file_edge_api_key() -> str:
+    env_path = PROJECT_ROOT / ".env"
+    if not env_path.exists():
+        return ""
+
+    for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, raw_value = line.split("=", 1)
+        if key.strip() == "PINGORA_EDGE_API_KEY":
+            return raw_value.strip().strip('"').strip("'")
+
+    return ""
+
+
+def edge_api_key() -> str:
+    return (
+        deployed_edge_api_key()
+        or os.environ.get("PINGORA_EDGE_API_KEY", "").strip()
+        or env_file_edge_api_key()
+    )
 
 
 def log(title: str) -> None:
@@ -79,10 +115,16 @@ def http_request(
     method: str = "GET",
     timeout: int = 10,
 ) -> tuple[int | None, str, dict[str, str]]:
-    request = urllib.request.Request(url, method=method)
+    headers = {}
+    api_key = edge_api_key()
+    if api_key and url.startswith(LIVE_URL):
+        headers["X-API-Key"] = api_key
+
+    request = urllib.request.Request(url, method=method, headers=headers)
+    context = ssl._create_unverified_context() if url.startswith("https://") else None
 
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
             body = response.read().decode("utf-8", errors="replace")
             headers = {k: v for k, v in response.headers.items()}
             return int(response.status), body, headers
@@ -187,6 +229,14 @@ def start_demo_backends(config_path: Path | None = None) -> None:
     )
 
 
+def start_demo_backend_ports(ports: list[int], name: str) -> None:
+    config_path = make_backend_config(
+        PROJECT_ROOT / "tmp" / f"acceptance_{name}_backends.json",
+        ports,
+    )
+    start_demo_backends(config_path)
+
+
 def stop_backend_port(port: int) -> None:
     run(
         ["bash", "-lc", f"lsof -tiTCP:{port} -sTCP:LISTEN | xargs -r kill -9"],
@@ -200,8 +250,8 @@ def wait_live() -> None:
         status, _body, _headers = http_request(f"{LIVE_URL}/", timeout=5)
         return status == 200
 
-    wait_until("gateway live on 8090", condition, timeout_seconds=120)
-    print("✅ Gateway live on 8090")
+    wait_until(f"gateway live on {LIVE_URL}", condition, timeout_seconds=120)
+    print(f"✅ Gateway live on {LIVE_URL}")
 
 
 def apply_baseline() -> None:
@@ -385,6 +435,7 @@ def pingora_edit_algorithm(path: str, algorithm: str) -> subprocess.CompletedPro
             "bluegreen",
             "--verify",
             "full",
+            "--confirm-route-mutation",
             path,
             "--algorithm",
             algorithm,
@@ -405,6 +456,7 @@ def pingora_delete(path: str, *, command: str = "delete", check: bool = True) ->
             "bluegreen",
             "--verify",
             "full",
+            "--confirm-route-mutation",
             path,
         ],
         timeout=1800,
@@ -523,6 +575,7 @@ def assert_zero_downtime_update() -> None:
 
     path = f"/zdaccept{int(time.time())}"
     backend = "127.0.0.1:9499"
+    start_demo_backend_ports([9499], "zero_downtime")
 
     stop_event = threading.Event()
     statuses: list[int | None] = []
@@ -547,9 +600,9 @@ def assert_zero_downtime_update() -> None:
     print("Zero-downtime monitor statuses:", statuses)
 
     if bad:
-        raise AssertionError(f"8090 had non-200 statuses during update: {bad}")
+        raise AssertionError(f"{LIVE_URL} had non-200 statuses during update: {bad}")
 
-    print("✅ 8090 stayed live during update")
+    print(f"✅ {LIVE_URL} stayed live during update")
 
     pingora_delete(path, command="delete", check=True)
 
@@ -609,6 +662,7 @@ def main() -> int:
     assert_health_failover_and_recovery()
 
     log("Add /coupons")
+    start_demo_backend_ports([9401], "coupons")
     pingora_add("/coupons", "127.0.0.1:9401", check=True)
 
     if not homepage_contains("/coupons"):
