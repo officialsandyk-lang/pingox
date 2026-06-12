@@ -583,10 +583,13 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
       </div>
 
       <div class="dash-card" id="cacheCounterCard">
-        <h2>Cache Counters</h2>
+        <h2>Local In-Memory Response Cache</h2>
+        <p>Hits: <strong id="cacheHitCount">0</strong></p>
+        <p>Misses: <strong id="cacheMissCount">0</strong></p>
+        <p>Entries: <strong id="cacheEntryCount">0</strong></p>
+        <p>Bypasses: <strong id="cacheBypassCount">0</strong></p>
         <p>Eligible GET/HEAD: <strong id="cacheEligibleCount">0</strong></p>
-        <p>Bypassed Auth/API-Key: <strong id="cacheBypassCount">0</strong></p>
-        <p class="muted">Live runtime cache gate counters only. No cached response serving yet.</p>
+        <p class="muted">Real local in-memory response cache. GET/HEAD only; Authorization and X-API-Key bypass cache.</p>
       </div>
 
       <div class="dash-card">
@@ -911,6 +914,9 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
 
           const eligibleEl = document.getElementById("cacheEligibleCount");
           const bypassEl = document.getElementById("cacheBypassCount");
+          const hitEl = document.getElementById("cacheHitCount");
+          const missEl = document.getElementById("cacheMissCount");
+          const entryEl = document.getElementById("cacheEntryCount");
 
           if (eligibleEl) {{
             eligibleEl.textContent = String(Number(cache.eligible || 0));
@@ -918,6 +924,18 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
 
           if (bypassEl) {{
             bypassEl.textContent = String(Number(cache.bypasses || 0));
+          }}
+
+          if (hitEl) {{
+            hitEl.textContent = String(Number(cache.hits || 0));
+          }}
+
+          if (missEl) {{
+            missEl.textContent = String(Number(cache.misses || 0));
+          }}
+
+          if (entryEl) {{
+            entryEl.textContent = String(Number(cache.entries || 0));
           }}
         }} catch (err) {{
           console.warn("cache counter refresh failed", err);
