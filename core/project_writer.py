@@ -2224,7 +2224,7 @@ def _pw_patch_runtime_admin_agent_phase1(project_dir):
 def _pw_patch_runtime_manual_cache_step6(project_dir):
     _pw_run_post_generation_script(
         "patch_runtime_manual_cache_step6.py",
-        "✅ Manual cache Step 6 patched into generated Rust.",
+        "✅ Manual cache Step 6 compatibility check completed.",
         "Manual cache Step 6 patch",
     )
 

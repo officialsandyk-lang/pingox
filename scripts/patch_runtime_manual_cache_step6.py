@@ -31,17 +31,26 @@ def main() -> int:
 
     text = TARGET.read_text(encoding="utf-8")
 
-    if (
-        "struct CachedResponse" in text
-        and "response_cache: Arc<Mutex<HashMap<String, CachedResponse>>>" in text
-        and "fn response_body_filter(" in text
-        and "x-pingora-ai-cache" in text
-        and "__gateway_runtime_admin/cache/clear" in text
-        and "created_unix_ms" in text
-        and "MAX_CACHE_ENTRIES" in text
-        and "\"policy\":{\"max_entries\":1024" in text
-    ):
-        print("✅ Manual cache Step 6 + invalidation + policy observability already present in generated Rust.")
+    template_integrated_markers = [
+        "struct CachedResponse",
+        "struct InFlightCacheCapture",
+        "cache_capture: Option<InFlightCacheCapture>",
+        "response_cache: Arc<Mutex<HashMap<String, CachedResponse>>>",
+        "cache_hits: Arc<AtomicUsize>",
+        "cache_misses: Arc<AtomicUsize>",
+        "fn route_cache_enabled",
+        "fn cache_key_for_request",
+        "fn cached_response_for_key",
+        "async fn response_filter",
+        "x-pingora-ai-cache",
+        "__gateway_runtime_admin/cache/clear",
+        "created_unix_ms",
+        "MAX_CACHE_ENTRIES",
+        "\"policy\":{\"max_entries\":1024",
+    ]
+
+    if all(marker in text for marker in template_integrated_markers):
+        print("✅ Manual cache already template-integrated; compatibility patch skipped.")
         return 0
 
     if (
