@@ -1415,7 +1415,7 @@ def _pw_balancing_for_rust(route):
     if balancing:
         return str(balancing)
 
-    return "round_robin"
+    return "single"
 
 
 def _pw_upstreams_for_rust(route):
