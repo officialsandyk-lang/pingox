@@ -3,6 +3,7 @@ use bytes::Bytes;
 use pingora::http::ResponseHeader;
 use pingora::prelude::*;
 use std::collections::HashMap;
+use std::env;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
@@ -22,6 +23,21 @@ const UNHEALTHY_THRESHOLD: usize = 3;
 struct UpstreamConfig {
     address: String,
     weight: usize,
+    state: String,
+    enabled: bool,
+    draining: bool,
+    role: String,
+    backup: bool,
+}
+
+#[derive(Clone, Debug)]
+struct CacheConfig {
+    enabled: bool,
+    ttl_seconds: u64,
+    methods: Vec<String>,
+    cache_key: String,
+    bypass_headers: Vec<String>,
+    stale_while_revalidate_seconds: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -31,6 +47,7 @@ struct RouteConfig {
     root: String,
     index: String,
     balancing: String,
+    cache: Option<CacheConfig>,
     upstreams: Vec<UpstreamConfig>,
 }
 
@@ -54,14 +71,55 @@ struct RuntimeUpstreamState {
     last_checked_unix_ms: u128,
 }
 
+// PINGORA_AI_RUNTIME_ADMIN_TEMPLATE_INTEGRATED_V1
+#[derive(Clone, Debug)]
+struct RuntimeAdminUpstreamState {
+    state: String,
+    enabled: bool,
+    draining: bool,
+    role: String,
+    backup: bool,
+    updated_unix_ms: u128,
+}
+
 #[derive(Debug)]
 struct RateBucket {
     window_start: Instant,
     count: usize,
 }
 
+#[derive(Clone, Debug)]
+struct CachedResponse {
+    header: ResponseHeader,
+    body: Vec<u8>,
+    expires_unix_ms: u128,
+    created_unix_ms: u128,
+    route_path: String,
+}
+
 #[derive(Debug)]
-struct RequestContext {}
+struct InFlightCacheCapture {
+    key: String,
+    header: Option<ResponseHeader>,
+    body: Vec<u8>,
+    ttl_seconds: u64,
+    cacheable: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CacheRouteStats {
+    eligible: usize,
+    bypasses: usize,
+    hits: usize,
+    misses: usize,
+}
+
+#[derive(Debug)]
+struct RequestContext {
+    cache_route_index: Option<usize>,
+    cache_key: Option<String>,
+    cache_capture: Option<InFlightCacheCapture>,
+}
 
 #[derive(Clone)]
 struct GeneratedProxy {
@@ -71,6 +129,13 @@ struct GeneratedProxy {
     security: SecurityConfig,
     rate_limiter: Arc<Mutex<HashMap<String, RateBucket>>>,
     runtime_state: Arc<Mutex<HashMap<String, RuntimeUpstreamState>>>,
+    admin_upstream_state: Arc<Mutex<HashMap<String, RuntimeAdminUpstreamState>>>,
+    cache_eligible: Arc<AtomicUsize>,
+    cache_bypasses: Arc<AtomicUsize>,
+    cache_hits: Arc<AtomicUsize>,
+    cache_misses: Arc<AtomicUsize>,
+    response_cache: Arc<Mutex<HashMap<String, CachedResponse>>>,
+    cache_route_stats: Arc<Mutex<HashMap<String, CacheRouteStats>>>,
 }
 
 fn content_type_for_path(path: &PathBuf) -> &'static str {
@@ -98,6 +163,20 @@ fn current_unix_ms() -> u128 {
 
 fn runtime_state_key(route_path: &str, upstream_address: &str) -> String {
     format!("{}|{}", route_path, upstream_address)
+}
+
+fn default_cache_config() -> CacheConfig {
+    CacheConfig {
+        enabled: false,
+        ttl_seconds: 30,
+        methods: vec!["GET".to_string()],
+        cache_key: "method:path:query".to_string(),
+        bypass_headers: vec![
+            "authorization".to_string(),
+            "x-api-key".to_string(),
+        ],
+        stale_while_revalidate_seconds: 0,
+    }
 }
 
 fn json_escape(value: &str) -> String {
@@ -138,6 +217,26 @@ fn safe_static_path(root: &str, relative_path: &str, index: &str) -> Option<Path
     Some(path)
 }
 
+fn pingora_ai_upstream_state_enabled(state: &str, enabled: bool, draining: bool) -> bool {
+    if !enabled {
+        return false;
+    }
+
+    if draining {
+        return false;
+    }
+
+    !matches!(state.to_ascii_lowercase().as_str(), "disabled" | "draining" | "drain")
+}
+
+fn pingora_ai_upstream_role_is_backup(role: &str, backup: bool) -> bool {
+    if backup {
+        return true;
+    }
+
+    matches!(role.to_ascii_lowercase().as_str(), "backup" | "standby" | "secondary")
+}
+
 impl GeneratedProxy {
     fn new(routes: Vec<RouteConfig>, security: SecurityConfig) -> Self {
         let counters = routes
@@ -157,9 +256,11 @@ impl GeneratedProxy {
             .collect::<Vec<_>>();
 
         let runtime_state = Arc::new(Mutex::new(HashMap::new()));
+        let admin_upstream_state = Arc::new(Mutex::new(HashMap::new()));
 
         {
             let mut state = runtime_state.lock().unwrap();
+            let mut admin_state = admin_upstream_state.lock().unwrap();
 
             for route in &routes {
                 if route.route_type == "static" {
@@ -178,6 +279,18 @@ impl GeneratedProxy {
                             last_checked_unix_ms: 0,
                         },
                     );
+
+                    admin_state.insert(
+                        runtime_state_key(&route.path, &upstream.address),
+                        RuntimeAdminUpstreamState {
+                            state: upstream.state.clone(),
+                            enabled: upstream.enabled,
+                            draining: upstream.draining,
+                            role: upstream.role.clone(),
+                            backup: upstream.backup,
+                            updated_unix_ms: current_unix_ms(),
+                        },
+                    );
                 }
             }
         }
@@ -189,6 +302,13 @@ impl GeneratedProxy {
             security,
             rate_limiter: Arc::new(Mutex::new(HashMap::new())),
             runtime_state,
+            admin_upstream_state,
+            cache_eligible: Arc::new(AtomicUsize::new(0)),
+            cache_bypasses: Arc::new(AtomicUsize::new(0)),
+            cache_hits: Arc::new(AtomicUsize::new(0)),
+            cache_misses: Arc::new(AtomicUsize::new(0)),
+            response_cache: Arc::new(Mutex::new(HashMap::new())),
+            cache_route_stats: Arc::new(Mutex::new(HashMap::new())),
         };
 
         proxy.start_health_checker();
@@ -302,6 +422,141 @@ impl GeneratedProxy {
         Ok(true)
     }
 
+    fn query_param(query: &str, name: &str) -> Option<String> {
+        for part in query.split('&') {
+            let mut pieces = part.splitn(2, '=');
+            let key = pieces.next().unwrap_or("");
+            let value = pieces.next().unwrap_or("");
+
+            if key == name {
+                return Some(value.replace("%2F", "/").replace("%3A", ":"));
+            }
+        }
+
+        None
+    }
+
+    fn update_admin_upstream_state(&self, action: &str, route_path: &str, upstream_address: &str) -> (bool, String) {
+        let normalised = upstream_address
+            .replace("127.0.0.1:", "127.0.0.1:")
+            .replace("localhost:", "127.0.0.1:");
+
+        let route = match self.routes.iter().find(|route| route.path == route_path) {
+            Some(value) => value,
+            None => return (false, format!("route_not_found: {}", route_path)),
+        };
+
+        let target = match route.upstreams.iter().find(|upstream| {
+            upstream.address == upstream_address || upstream.address == normalised
+        }) {
+            Some(value) => value,
+            None => return (false, format!("upstream_not_found: {}", upstream_address)),
+        };
+
+        if action == "disable" || action == "drain" {
+            let active_primary_count = route.upstreams.iter().filter(|upstream| {
+                if upstream.address == target.address {
+                    return false;
+                }
+
+                self.upstream_allows_new_traffic_for_route(route, upstream)
+                    && !self.upstream_is_backup_for_route(route, upstream)
+            }).count();
+
+            if active_primary_count < 1 {
+                return (false, "cannot_disable_or_drain_last_active_primary".to_string());
+            }
+        }
+
+        let key = runtime_state_key(&route.path, &target.address);
+
+        let mut state = match self.admin_upstream_state.lock() {
+            Ok(guard) => guard,
+            Err(_) => return (false, "admin_state_lock_failed".to_string()),
+        };
+
+        let entry = state.entry(key).or_insert(RuntimeAdminUpstreamState {
+            state: target.state.clone(),
+            enabled: target.enabled,
+            draining: target.draining,
+            role: target.role.clone(),
+            backup: target.backup,
+            updated_unix_ms: current_unix_ms(),
+        });
+
+        match action {
+            "disable" => {
+                entry.state = "disabled".to_string();
+                entry.enabled = false;
+                entry.draining = false;
+            }
+            "drain" => {
+                entry.state = "draining".to_string();
+                entry.enabled = false;
+                entry.draining = true;
+            }
+            "enable" => {
+                entry.state = "enabled".to_string();
+                entry.enabled = true;
+                entry.draining = false;
+            }
+            _ => return (false, format!("unknown_action: {}", action)),
+        }
+
+        entry.updated_unix_ms = current_unix_ms();
+
+        (true, "updated_in_memory".to_string())
+    }
+
+    async fn serve_runtime_admin_upstream(&self, session: &mut Session, action: &str) -> Result<bool> {
+        let method = session.req_header().method.as_str().to_uppercase();
+
+        if method != "POST" {
+            return self.write_json_response(
+                session,
+                405,
+                "{\"ok\":false,\"error\":\"method_not_allowed\"}".to_string(),
+            ).await;
+        }
+
+        let query = session.req_header().uri.query().unwrap_or("");
+        let confirm = Self::query_param(query, "confirm").unwrap_or_default();
+
+        if confirm != "true" {
+            return self.write_json_response(
+                session,
+                400,
+                "{\"ok\":false,\"error\":\"confirm_true_required\"}".to_string(),
+            ).await;
+        }
+
+        let route = Self::query_param(query, "route").unwrap_or_else(|| "/api".to_string());
+        let upstream = Self::query_param(query, "upstream").unwrap_or_default();
+
+        if upstream.is_empty() {
+            return self.write_json_response(
+                session,
+                400,
+                "{\"ok\":false,\"error\":\"upstream_required\"}".to_string(),
+            ).await;
+        }
+
+        let (ok, message) = self.update_admin_upstream_state(action, &route, &upstream);
+
+        let status = if ok { 200 } else { 400 };
+        let body = format!(
+            "{{\"ok\":{},\"runtime_admin\":true,\"action\":\"{}\",\"route\":\"{}\",\"upstream\":\"{}\",\"message\":\"{}\",\"live_runtime_mutation\":{},\"restart\":false,\"docker_apply\":false}}",
+            ok,
+            json_escape(action),
+            json_escape(&route),
+            json_escape(&upstream),
+            json_escape(&message),
+            ok
+        );
+
+        self.write_json_response(session, status, body).await
+    }
+
     async fn serve_runtime_state(&self, session: &mut Session) -> Result<bool> {
         let body = self.runtime_state_json();
         self.write_json_response(session, 200, body).await
@@ -348,9 +603,26 @@ impl GeneratedProxy {
                     None => "null".to_string(),
                 };
 
+                let admin_item = self.admin_state_for_upstream(route, upstream);
+                let effective_state = admin_item.as_ref().map(|value| value.state.as_str()).unwrap_or(upstream.state.as_str());
+                let effective_enabled = admin_item.as_ref().map(|value| value.enabled).unwrap_or(upstream.enabled);
+                let effective_draining = admin_item.as_ref().map(|value| value.draining).unwrap_or(upstream.draining);
+                let effective_role = admin_item.as_ref().map(|value| value.role.as_str()).unwrap_or(upstream.role.as_str());
+                let effective_backup = admin_item.as_ref().map(|value| value.backup).unwrap_or(upstream.backup);
+                let live_admin_override = admin_item.is_some();
+
                 upstreams_json.push(format!(
-                    "{{\"address\":\"{}\",\"healthy\":{},\"consecutive_successes\":{},\"consecutive_failures\":{},\"last_status\":{},\"last_error\":{},\"last_checked_unix_ms\":{}}}",
+                    "{{\"address\":\"{}\",\"weight\":{},\"config_state\":\"{}\",\"effective_state\":\"{}\",\"state\":\"{}\",\"enabled\":{},\"draining\":{},\"role\":\"{}\",\"backup\":{},\"live_admin_override\":{},\"healthy\":{},\"consecutive_successes\":{},\"consecutive_failures\":{},\"last_status\":{},\"last_error\":{},\"last_checked_unix_ms\":{}}}",
                     json_escape(&upstream.address),
+                    upstream.weight,
+                    json_escape(&upstream.state),
+                    json_escape(effective_state),
+                    json_escape(effective_state),
+                    effective_enabled,
+                    effective_draining,
+                    json_escape(effective_role),
+                    effective_backup,
+                    live_admin_override,
                     item.healthy,
                     item.consecutive_successes,
                     item.consecutive_failures,
@@ -368,14 +640,109 @@ impl GeneratedProxy {
             ));
         }
 
+        let (cache_entries, cache_approximate_bytes, cache_route_entry_bytes) = match self.response_cache.lock() {
+            Ok(cache) => {
+                let mut per_route = HashMap::<String, (usize, usize)>::new();
+                let mut total_bytes = 0usize;
+
+                for entry in cache.values() {
+                    let entry_bytes = entry.body.len();
+                    total_bytes = total_bytes.saturating_add(entry_bytes);
+
+                    let route_entry = per_route
+                        .entry(entry.route_path.clone())
+                        .or_insert((0usize, 0usize));
+                    route_entry.0 = route_entry.0.saturating_add(1);
+                    route_entry.1 = route_entry.1.saturating_add(entry_bytes);
+                }
+
+                (cache.len(), total_bytes, per_route)
+            }
+            Err(_) => (0usize, 0usize, HashMap::<String, (usize, usize)>::new()),
+        };
+
+        let cache_route_stats_snapshot = self
+            .cache_route_stats
+            .lock()
+            .map(|stats| stats.clone())
+            .unwrap_or_default();
+
+        let mut cache_per_route_stats = Vec::new();
+
+        for route in self.routes.iter() {
+            if let Some(cache) = &route.cache {
+                if cache.enabled {
+                    let counters = cache_route_stats_snapshot
+                        .get(&route.path)
+                        .cloned()
+                        .unwrap_or_default();
+
+                    let (entries, approximate_bytes) = cache_route_entry_bytes
+                        .get(&route.path)
+                        .cloned()
+                        .unwrap_or((0usize, 0usize));
+
+                    cache_per_route_stats.push(format!(
+                        "{{\"path\":\"{}\",\"entries\":{},\"hits\":{},\"misses\":{},\"bypasses\":{},\"eligible\":{},\"approximate_bytes\":{}}}",
+                        json_escape(&route.path),
+                        entries,
+                        counters.hits,
+                        counters.misses,
+                        counters.bypasses,
+                        counters.eligible,
+                        approximate_bytes
+                    ));
+                }
+            }
+        }
+
+        let mut cache_policy_routes = Vec::new();
+
+        for route in self.routes.iter() {
+            if let Some(cache) = &route.cache {
+                if cache.enabled {
+                    let methods_json = cache
+                        .methods
+                        .iter()
+                        .map(|method| format!("\"{}.\"", json_escape(method)).replace(".\"", "\""))
+                        .collect::<Vec<_>>()
+                        .join(",");
+
+                    let bypass_headers_json = cache
+                        .bypass_headers
+                        .iter()
+                        .map(|header| format!("\"{}.\"", json_escape(header)).replace(".\"", "\""))
+                        .collect::<Vec<_>>()
+                        .join(",");
+
+                    cache_policy_routes.push(format!(
+                        "{{\"path\":\"{}\",\"ttl_seconds\":{},\"methods\":[{}],\"cache_key\":\"{}\",\"bypass_headers\":[{}]}}",
+                        json_escape(&route.path),
+                        cache.ttl_seconds.clamp(1, 86400),
+                        methods_json,
+                        json_escape(&cache.cache_key),
+                        bypass_headers_json
+                    ));
+                }
+            }
+        }
+
         format!(
-            "{{\"ok\":true,\"health_check\":{{\"path\":\"{}\",\"interval_seconds\":{},\"timeout_seconds\":{},\"healthy_threshold\":{},\"unhealthy_threshold\":{}}},\"routes\":[{}]}}",
+            "{{\"ok\":true,\"health_check\":{{\"path\":\"{}\",\"interval_seconds\":{},\"timeout_seconds\":{},\"healthy_threshold\":{},\"unhealthy_threshold\":{}}},\"routes\":[{}],\"cache\":{{\"eligible\":{},\"bypasses\":{},\"hits\":{},\"misses\":{},\"entries\":{},\"approximate_bytes\":{},\"per_route_stats\":[{}],\"policy\":{{\"max_entries\":1024,\"max_body_bytes\":1048576,\"enabled_routes\":[{}]}}}}}}",
             json_escape(HEALTH_CHECK_PATH),
             HEALTH_INTERVAL_SECONDS,
             HEALTH_TIMEOUT_SECONDS,
             HEALTHY_THRESHOLD,
             UNHEALTHY_THRESHOLD,
-            routes_json.join(",")
+            routes_json.join(","),
+            self.cache_eligible.load(Ordering::Relaxed),
+            self.cache_bypasses.load(Ordering::Relaxed),
+            self.cache_hits.load(Ordering::Relaxed),
+            self.cache_misses.load(Ordering::Relaxed),
+            cache_entries,
+            cache_approximate_bytes,
+            cache_per_route_stats.join(","),
+            cache_policy_routes.join(",")
         )
     }
 
@@ -437,7 +804,48 @@ impl GeneratedProxy {
         state.get(&key).map(|item| item.healthy).unwrap_or(true)
     }
 
-    fn eligible_upstream_indices(&self, route_index: usize) -> Vec<usize> {
+    fn admin_state_for_upstream(&self, route: &RouteConfig, upstream: &UpstreamConfig) -> Option<RuntimeAdminUpstreamState> {
+        let key = runtime_state_key(&route.path, &upstream.address);
+
+        let state = match self.admin_upstream_state.lock() {
+            Ok(guard) => guard,
+            Err(_) => return None,
+        };
+
+        state.get(&key).cloned()
+    }
+
+    fn upstream_allows_new_traffic_for_route(&self, route: &RouteConfig, upstream: &UpstreamConfig) -> bool {
+        if let Some(admin) = self.admin_state_for_upstream(route, upstream) {
+            return pingora_ai_upstream_state_enabled(
+                &admin.state,
+                admin.enabled,
+                admin.draining,
+            );
+        }
+
+        pingora_ai_upstream_state_enabled(
+            &upstream.state,
+            upstream.enabled,
+            upstream.draining,
+        )
+    }
+
+    fn upstream_is_backup_for_route(&self, route: &RouteConfig, upstream: &UpstreamConfig) -> bool {
+        if let Some(admin) = self.admin_state_for_upstream(route, upstream) {
+            return pingora_ai_upstream_role_is_backup(
+                &admin.role,
+                admin.backup,
+            );
+        }
+
+        pingora_ai_upstream_role_is_backup(
+            &upstream.role,
+            upstream.backup,
+        )
+    }
+
+    fn eligible_upstream_indices_by_role(&self, route_index: usize, want_backup: bool) -> Vec<usize> {
         let route = match self.routes.get(route_index) {
             Some(value) => value,
             None => return Vec::new(),
@@ -448,6 +856,14 @@ impl GeneratedProxy {
             .iter()
             .enumerate()
             .filter_map(|(index, upstream)| {
+                if !self.upstream_allows_new_traffic_for_route(route, upstream) {
+                    return None;
+                }
+
+                if self.upstream_is_backup_for_route(route, upstream) != want_backup {
+                    return None;
+                }
+
                 if self.upstream_is_healthy(route, upstream) {
                     Some(index)
                 } else {
@@ -455,6 +871,15 @@ impl GeneratedProxy {
                 }
             })
             .collect::<Vec<_>>()
+    }
+
+    fn eligible_upstream_indices(&self, route_index: usize) -> Vec<usize> {
+        let primary = self.eligible_upstream_indices_by_role(route_index, false);
+        if !primary.is_empty() {
+            return primary;
+        }
+
+        self.eligible_upstream_indices_by_role(route_index, true)
     }
 
     fn has_healthy_upstream(&self, route_index: usize) -> bool {
@@ -588,6 +1013,128 @@ impl GeneratedProxy {
         }
 
         hash % len
+    }
+
+    fn increment_cache_route_stat(&self, route_path: &str, stat: &str) {
+        let mut stats = match self.cache_route_stats.lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+
+        let entry = stats
+            .entry(route_path.to_string())
+            .or_insert_with(CacheRouteStats::default);
+
+        match stat {
+            "eligible" => entry.eligible = entry.eligible.saturating_add(1),
+            "bypass" => entry.bypasses = entry.bypasses.saturating_add(1),
+            "hit" => entry.hits = entry.hits.saturating_add(1),
+            "miss" => entry.misses = entry.misses.saturating_add(1),
+            _ => {}
+        }
+    }
+
+    fn route_cache_enabled(route: &RouteConfig) -> bool {
+        route
+            .cache
+            .as_ref()
+            .map(|cache| cache.enabled)
+            .unwrap_or(false)
+    }
+
+    fn request_has_cache_bypass_headers(session: &Session, route: &RouteConfig) -> bool {
+        let mut bypass_headers = vec![
+            "authorization".to_string(),
+            "x-api-key".to_string(),
+        ];
+
+        if let Some(cache) = &route.cache {
+            for header in &cache.bypass_headers {
+                let normalized = header.to_lowercase();
+                if !bypass_headers.iter().any(|value| value == &normalized) {
+                    bypass_headers.push(normalized);
+                }
+            }
+        }
+
+        for header in bypass_headers {
+            if session.req_header().headers.get(header.as_str()).is_some() {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn record_cache_gate(&self, session: &Session, route: &RouteConfig) {
+        let method = session.req_header().method.as_str().to_uppercase();
+
+        if method != "GET" && method != "HEAD" {
+            return;
+        }
+
+        if !Self::route_cache_enabled(route) {
+            return;
+        }
+
+        if Self::request_has_cache_bypass_headers(session, route) {
+            self.cache_bypasses.fetch_add(1, Ordering::Relaxed);
+            self.increment_cache_route_stat(&route.path, "bypass");
+            return;
+        }
+
+        self.cache_eligible.fetch_add(1, Ordering::Relaxed);
+        self.increment_cache_route_stat(&route.path, "eligible");
+    }
+
+    fn route_cache_allows_method(route: &RouteConfig, method: &str) -> bool {
+        route
+            .cache
+            .as_ref()
+            .map(|cache| cache.methods.iter().any(|item| item.eq_ignore_ascii_case(method)))
+            .unwrap_or(false)
+    }
+
+    fn route_cache_ttl_seconds(route: &RouteConfig) -> u64 {
+        route
+            .cache
+            .as_ref()
+            .map(|cache| cache.ttl_seconds)
+            .unwrap_or(30)
+            .clamp(1, 86400)
+    }
+
+    fn cache_key_for_request(&self, session: &Session, route: &RouteConfig) -> String {
+        let method = session.req_header().method.as_str().to_uppercase();
+        let uri = session.req_header().uri.clone();
+        let path = uri.path().to_string();
+        let query = uri.query().unwrap_or("").to_string();
+
+        let key_mode = route
+            .cache
+            .as_ref()
+            .map(|cache| cache.cache_key.as_str())
+            .unwrap_or("method:path:query");
+
+        if key_mode == "method:path" {
+            format!("{}:{}", method, path)
+        } else {
+            format!("{}:{}?{}", method, path, query)
+        }
+    }
+
+    fn cached_response_for_key(&self, key: &str) -> Option<CachedResponse> {
+        let now = current_unix_ms();
+
+        let mut cache = self.response_cache.lock().ok()?;
+        match cache.get(key) {
+            Some(entry) if entry.expires_unix_ms > now => Some(entry.clone()),
+            Some(_) => {
+                cache.remove(key);
+                None
+            }
+            None => None,
+        }
     }
 
     fn is_blocked_path(&self, path: &str) -> bool {
@@ -779,7 +1326,11 @@ impl ProxyHttp for GeneratedProxy {
     type CTX = RequestContext;
 
     fn new_ctx(&self) -> Self::CTX {
-        RequestContext {}
+        RequestContext {
+            cache_route_index: None,
+            cache_key: None,
+            cache_capture: None,
+        }
     }
 
     async fn request_filter(
@@ -789,6 +1340,41 @@ impl ProxyHttp for GeneratedProxy {
     ) -> Result<bool> {
         let path = session.req_header().uri.path().to_string();
         let method = session.req_header().method.as_str().to_uppercase();
+
+        if path == "/__gateway_runtime_admin/upstream/disable" {
+            return self.serve_runtime_admin_upstream(session, "disable").await;
+        }
+
+        if path == "/__gateway_runtime_admin/upstream/drain" {
+            return self.serve_runtime_admin_upstream(session, "drain").await;
+        }
+
+        if path == "/__gateway_runtime_admin/upstream/enable" {
+            return self.serve_runtime_admin_upstream(session, "enable").await;
+        }
+
+        if path == "/__gateway_runtime_admin/cache/clear" {
+            if method != "POST" {
+                session.respond_error(405).await?;
+                return Ok(true);
+            }
+
+            let cleared = match self.response_cache.lock() {
+                Ok(mut cache) => {
+                    let count = cache.len();
+                    cache.clear();
+                    count
+                }
+                Err(_) => 0,
+            };
+
+            let body = format!(
+                "{{\"ok\":true,\"action\":\"clear_cache\",\"scope\":\"all\",\"cleared_entries\":{},\"local_only\":true}}",
+                cleared
+            );
+
+            return self.write_json_response(session, 200, body).await;
+        }
 
         if path == "/__gateway_runtime_state" {
             if method != "GET" && method != "HEAD" {
@@ -848,6 +1434,49 @@ impl ProxyHttp for GeneratedProxy {
             }
         };
 
+        self.record_cache_gate(session, &route);
+
+        let cache_allowed = Self::route_cache_enabled(&route)
+            && Self::route_cache_allows_method(&route, &method)
+            && !Self::request_has_cache_bypass_headers(session, &route)
+            && route.route_type != "static";
+
+        if cache_allowed {
+            let cache_key = self.cache_key_for_request(session, &route);
+
+            if let Some(cached) = self.cached_response_for_key(&cache_key) {
+                let mut header = cached.header.clone();
+                let _ = header.insert_header("x-pingora-ai-cache", "HIT");
+                let end_stream = method == "HEAD" || cached.body.is_empty();
+
+                session.write_response_header(Box::new(header), end_stream).await?;
+
+                if method != "HEAD" && !cached.body.is_empty() {
+                    session
+                        .write_response_body(Some(Bytes::copy_from_slice(&cached.body)), true)
+                        .await?;
+                } else if end_stream {
+                    session.write_response_body(None, true).await?;
+                }
+
+                self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                self.increment_cache_route_stat(&route.path, "hit");
+                return Ok(true);
+            }
+
+            self.cache_misses.fetch_add(1, Ordering::Relaxed);
+            self.increment_cache_route_stat(&route.path, "miss");
+            _ctx.cache_route_index = Some(route_index);
+            _ctx.cache_key = Some(cache_key.clone());
+            _ctx.cache_capture = Some(InFlightCacheCapture {
+                key: cache_key,
+                header: None,
+                body: Vec::new(),
+                ttl_seconds: Self::route_cache_ttl_seconds(&route),
+                cacheable: true,
+            });
+        }
+
         if route.route_type == "static" {
             return self.serve_static_route(session, &route, &path).await;
         }
@@ -858,6 +1487,89 @@ impl ProxyHttp for GeneratedProxy {
         }
 
         Ok(false)
+    }
+
+    async fn response_filter(
+        &self,
+        _session: &mut Session,
+        upstream_response: &mut ResponseHeader,
+        ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        if let Some(capture) = &mut ctx.cache_capture {
+            if upstream_response.status.as_u16() == 200 {
+                let _ = upstream_response.insert_header("x-pingora-ai-cache", "MISS");
+                capture.header = Some(upstream_response.clone());
+            } else {
+                capture.cacheable = false;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn response_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<Option<Duration>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        const MAX_CACHE_BODY_BYTES: usize = 1024 * 1024;
+        const MAX_CACHE_ENTRIES: usize = 1024;
+
+        if let Some(capture) = &mut ctx.cache_capture {
+            if capture.cacheable {
+                if let Some(chunk) = body.as_ref() {
+                    if capture.body.len().saturating_add(chunk.len()) <= MAX_CACHE_BODY_BYTES {
+                        capture.body.extend_from_slice(chunk);
+                    } else {
+                        capture.cacheable = false;
+                    }
+                }
+
+                if end_of_stream && capture.cacheable {
+                    if let Some(header) = capture.header.clone() {
+                        let expires_unix_ms = current_unix_ms()
+                            .saturating_add((capture.ttl_seconds as u128) * 1000);
+
+                        if let Ok(mut cache) = self.response_cache.lock() {
+                            if cache.len() >= MAX_CACHE_ENTRIES {
+                                if let Some(oldest_key) = cache
+                                    .iter()
+                                    .min_by_key(|(_key, entry)| entry.created_unix_ms)
+                                    .map(|(key, _entry)| key.clone())
+                                {
+                                    cache.remove(&oldest_key);
+                                }
+                            }
+
+                            cache.insert(
+                                capture.key.clone(),
+                                CachedResponse {
+                                    header,
+                                    body: capture.body.clone(),
+                                    expires_unix_ms,
+                                    created_unix_ms: current_unix_ms(),
+                                    route_path: self
+                                        .routes
+                                        .get(ctx.cache_route_index.unwrap_or(0))
+                                        .map(|route| route.path.clone())
+                                        .unwrap_or_else(|| "unknown".to_string()),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     async fn upstream_peer(
@@ -899,6 +1611,7 @@ fn build_routes() -> Vec<RouteConfig> {
         root: "public".to_string(),
         index: "index.html".to_string(),
         balancing: "single".to_string(),
+        cache: Some(default_cache_config()),
         upstreams: vec![
         ],
     },
@@ -908,10 +1621,16 @@ fn build_routes() -> Vec<RouteConfig> {
         root: "public".to_string(),
         index: "index.html".to_string(),
         balancing: "single".to_string(),
+        cache: Some(default_cache_config()),
         upstreams: vec![
         UpstreamConfig {
             address: "127.0.0.1:9101".to_string(),
             weight: 1,
+            state: "enabled".to_string(),
+            enabled: true,
+            draining: false,
+            role: "primary".to_string(),
+            backup: false,
         },
         ],
     },
@@ -929,6 +1648,34 @@ fn build_security() -> SecurityConfig {
     }
 }
 
+fn resolve_listen_port() -> u16 {
+    let args = env::args().collect::<Vec<_>>();
+
+    for index in 0..args.len() {
+        if args[index] == "--port" {
+            if let Some(value) = args.get(index + 1) {
+                if let Ok(port) = value.parse::<u16>() {
+                    return port;
+                }
+            }
+        }
+
+        if let Some(value) = args[index].strip_prefix("--port=") {
+            if let Ok(port) = value.parse::<u16>() {
+                return port;
+            }
+        }
+    }
+
+    if let Ok(value) = env::var("PINGORA_AI_LISTEN_PORT") {
+        if let Ok(port) = value.parse::<u16>() {
+            return port;
+        }
+    }
+
+    GATEWAY_LISTEN_PORT
+}
+
 fn main() {
     let routes = build_routes();
     let security = build_security();
@@ -938,7 +1685,7 @@ fn main() {
     let mut server = Server::new(None).unwrap();
     server.bootstrap();
 
-    let listen_port = GATEWAY_LISTEN_PORT;
+    let listen_port = resolve_listen_port();
     let listen_addr = format!("0.0.0.0:{}", listen_port);
 
     let mut service = http_proxy_service(&server.configuration, proxy);

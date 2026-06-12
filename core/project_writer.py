@@ -1706,6 +1706,14 @@ def write_project(
         _write_minimal_runtime_placeholder(project_path)
 
     config_path = write_json_config(config, project_path)
+
+    # Refresh src/main.rs from the active Pingora runtime template before
+    # route/listen rewrites. This keeps generated runtimes aligned with
+    # template-integrated features such as runtime admin and cache stats,
+    # instead of preserving an older generated src/main.rs forever.
+    main_rs_path = project_path / "src" / "main.rs"
+    main_rs_path.write_text(render_main_rs(config), encoding="utf-8")
+
     rewrite_rust_build_routes(config, project_path)
     rewrite_rust_listen_port(config, project_path)
     homepage_path = write_route_directory_homepage(config, project_path)

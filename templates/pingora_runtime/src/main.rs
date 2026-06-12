@@ -94,6 +94,7 @@ struct CachedResponse {
     body: Vec<u8>,
     expires_unix_ms: u128,
     created_unix_ms: u128,
+    route_path: String,
 }
 
 #[derive(Debug)]
@@ -103,6 +104,14 @@ struct InFlightCacheCapture {
     body: Vec<u8>,
     ttl_seconds: u64,
     cacheable: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CacheRouteStats {
+    eligible: usize,
+    bypasses: usize,
+    hits: usize,
+    misses: usize,
 }
 
 #[derive(Debug)]
@@ -126,6 +135,7 @@ struct GeneratedProxy {
     cache_hits: Arc<AtomicUsize>,
     cache_misses: Arc<AtomicUsize>,
     response_cache: Arc<Mutex<HashMap<String, CachedResponse>>>,
+    cache_route_stats: Arc<Mutex<HashMap<String, CacheRouteStats>>>,
 }
 
 fn content_type_for_path(path: &PathBuf) -> &'static str {
@@ -298,6 +308,7 @@ impl GeneratedProxy {
             cache_hits: Arc::new(AtomicUsize::new(0)),
             cache_misses: Arc::new(AtomicUsize::new(0)),
             response_cache: Arc::new(Mutex::new(HashMap::new())),
+            cache_route_stats: Arc::new(Mutex::new(HashMap::new())),
         };
 
         proxy.start_health_checker();
@@ -629,11 +640,61 @@ impl GeneratedProxy {
             ));
         }
 
-        let cache_entries = self
-            .response_cache
+        let (cache_entries, cache_approximate_bytes, cache_route_entry_bytes) = match self.response_cache.lock() {
+            Ok(cache) => {
+                let mut per_route = HashMap::<String, (usize, usize)>::new();
+                let mut total_bytes = 0usize;
+
+                for entry in cache.values() {
+                    let entry_bytes = entry.body.len();
+                    total_bytes = total_bytes.saturating_add(entry_bytes);
+
+                    let route_entry = per_route
+                        .entry(entry.route_path.clone())
+                        .or_insert((0usize, 0usize));
+                    route_entry.0 = route_entry.0.saturating_add(1);
+                    route_entry.1 = route_entry.1.saturating_add(entry_bytes);
+                }
+
+                (cache.len(), total_bytes, per_route)
+            }
+            Err(_) => (0usize, 0usize, HashMap::<String, (usize, usize)>::new()),
+        };
+
+        let cache_route_stats_snapshot = self
+            .cache_route_stats
             .lock()
-            .map(|cache| cache.len())
-            .unwrap_or(0);
+            .map(|stats| stats.clone())
+            .unwrap_or_default();
+
+        let mut cache_per_route_stats = Vec::new();
+
+        for route in self.routes.iter() {
+            if let Some(cache) = &route.cache {
+                if cache.enabled {
+                    let counters = cache_route_stats_snapshot
+                        .get(&route.path)
+                        .cloned()
+                        .unwrap_or_default();
+
+                    let (entries, approximate_bytes) = cache_route_entry_bytes
+                        .get(&route.path)
+                        .cloned()
+                        .unwrap_or((0usize, 0usize));
+
+                    cache_per_route_stats.push(format!(
+                        "{{\"path\":\"{}\",\"entries\":{},\"hits\":{},\"misses\":{},\"bypasses\":{},\"eligible\":{},\"approximate_bytes\":{}}}",
+                        json_escape(&route.path),
+                        entries,
+                        counters.hits,
+                        counters.misses,
+                        counters.bypasses,
+                        counters.eligible,
+                        approximate_bytes
+                    ));
+                }
+            }
+        }
 
         let mut cache_policy_routes = Vec::new();
 
@@ -667,7 +728,7 @@ impl GeneratedProxy {
         }
 
         format!(
-            "{{\"ok\":true,\"health_check\":{{\"path\":\"{}\",\"interval_seconds\":{},\"timeout_seconds\":{},\"healthy_threshold\":{},\"unhealthy_threshold\":{}}},\"routes\":[{}],\"cache\":{{\"eligible\":{},\"bypasses\":{},\"hits\":{},\"misses\":{},\"entries\":{},\"policy\":{{\"max_entries\":1024,\"max_body_bytes\":1048576,\"enabled_routes\":[{}]}}}}}}",
+            "{{\"ok\":true,\"health_check\":{{\"path\":\"{}\",\"interval_seconds\":{},\"timeout_seconds\":{},\"healthy_threshold\":{},\"unhealthy_threshold\":{}}},\"routes\":[{}],\"cache\":{{\"eligible\":{},\"bypasses\":{},\"hits\":{},\"misses\":{},\"entries\":{},\"approximate_bytes\":{},\"per_route_stats\":[{}],\"policy\":{{\"max_entries\":1024,\"max_body_bytes\":1048576,\"enabled_routes\":[{}]}}}}}}",
             json_escape(HEALTH_CHECK_PATH),
             HEALTH_INTERVAL_SECONDS,
             HEALTH_TIMEOUT_SECONDS,
@@ -679,6 +740,8 @@ impl GeneratedProxy {
             self.cache_hits.load(Ordering::Relaxed),
             self.cache_misses.load(Ordering::Relaxed),
             cache_entries,
+            cache_approximate_bytes,
+            cache_per_route_stats.join(","),
             cache_policy_routes.join(",")
         )
     }
@@ -952,6 +1015,25 @@ impl GeneratedProxy {
         hash % len
     }
 
+    fn increment_cache_route_stat(&self, route_path: &str, stat: &str) {
+        let mut stats = match self.cache_route_stats.lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+
+        let entry = stats
+            .entry(route_path.to_string())
+            .or_insert_with(CacheRouteStats::default);
+
+        match stat {
+            "eligible" => entry.eligible = entry.eligible.saturating_add(1),
+            "bypass" => entry.bypasses = entry.bypasses.saturating_add(1),
+            "hit" => entry.hits = entry.hits.saturating_add(1),
+            "miss" => entry.misses = entry.misses.saturating_add(1),
+            _ => {}
+        }
+    }
+
     fn route_cache_enabled(route: &RouteConfig) -> bool {
         route
             .cache
@@ -997,10 +1079,12 @@ impl GeneratedProxy {
 
         if Self::request_has_cache_bypass_headers(session, route) {
             self.cache_bypasses.fetch_add(1, Ordering::Relaxed);
+            self.increment_cache_route_stat(&route.path, "bypass");
             return;
         }
 
         self.cache_eligible.fetch_add(1, Ordering::Relaxed);
+        self.increment_cache_route_stat(&route.path, "eligible");
     }
 
     fn route_cache_allows_method(route: &RouteConfig, method: &str) -> bool {
@@ -1376,10 +1460,12 @@ impl ProxyHttp for GeneratedProxy {
                 }
 
                 self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                self.increment_cache_route_stat(&route.path, "hit");
                 return Ok(true);
             }
 
             self.cache_misses.fetch_add(1, Ordering::Relaxed);
+            self.increment_cache_route_stat(&route.path, "miss");
             _ctx.cache_route_index = Some(route_index);
             _ctx.cache_key = Some(cache_key.clone());
             _ctx.cache_capture = Some(InFlightCacheCapture {
@@ -1470,6 +1556,11 @@ impl ProxyHttp for GeneratedProxy {
                                     body: capture.body.clone(),
                                     expires_unix_ms,
                                     created_unix_ms: current_unix_ms(),
+                                    route_path: self
+                                        .routes
+                                        .get(ctx.cache_route_index.unwrap_or(0))
+                                        .map(|route| route.path.clone())
+                                        .unwrap_or_else(|| "unknown".to_string()),
                                 },
                             );
                         }
