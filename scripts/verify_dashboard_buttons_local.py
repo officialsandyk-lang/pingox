@@ -24,8 +24,9 @@ def post_json(url: str) -> dict[str, Any]:
         return json.loads(res.read().decode("utf-8"))
 
 
-def get_text(url: str) -> str:
-    with urllib.request.urlopen(url, timeout=10) as res:
+def get_text(url: str, headers: dict[str, str] | None = None) -> str:
+    req = urllib.request.Request(url, headers=headers or {}, method="GET")
+    with urllib.request.urlopen(req, timeout=10) as res:
         return res.read().decode("utf-8", errors="replace")
 
 
@@ -34,10 +35,14 @@ def require(ok: bool, message: str) -> None:
         raise SystemExit(f"❌ {message}")
 
 
-def backend_counts(n: int = 20) -> dict[str, int]:
+def backend_counts(n: int = 20, label: str = "traffic") -> dict[str, int]:
     counts: dict[str, int] = {}
-    for _ in range(n):
-        body = get_text(f"{RUNTIME}/api/")
+    # Cache-bypass header and unique query string prevent response cache from hiding
+    # live upstream traffic changes during disable/enable/drain checks.
+    headers = {"Authorization": "Bearer verifier-cache-bypass"}
+
+    for i in range(n):
+        body = get_text(f"{RUNTIME}/api/{label}?probe={i}", headers=headers)
         found = re.findall(r'"backend_port"\s*:\s*(\d+)', body)
         if not found:
             found = re.findall(r"Demo Backend\s+(\d+)", body)
@@ -166,21 +171,21 @@ def main() -> int:
     require(live_disable.get("live_runtime_mutation") is True, "Live Disable did not mutate runtime")
     require(live_disable.get("docker_apply") is False, "Live Disable should not docker apply")
     require(live_disable.get("restart") is False, "Live Disable should not restart")
-    counts_disabled = backend_counts(20)
+    counts_disabled = backend_counts(20, "live-disable")
     require(counts_disabled.get("9101", 0) == 0, "Live Disable still sent traffic to 9101")
     require(counts_disabled.get("9102", 0) > 0, "Live Disable did not send traffic to 9102")
     print("✅ Live Disable output and traffic correct")
 
     live_enable = control("/__gateway_control/runtime-admin/upstream/enable?route=/api&upstream=127.0.0.1:9101&confirm=true")
     require(live_enable.get("live_runtime_mutation") is True, "Live Enable did not mutate runtime")
-    counts_enabled = backend_counts(20)
+    counts_enabled = backend_counts(20, "live-enable")
     require(counts_enabled.get("9101", 0) > 0, "Live Enable did not restore 9101 traffic")
     require(counts_enabled.get("9102", 0) > 0, "Live Enable missing 9102 traffic")
     print("✅ Live Enable output and traffic correct")
 
     live_drain = control("/__gateway_control/runtime-admin/upstream/drain?route=/api&upstream=127.0.0.1:9101&confirm=true")
     require(live_drain.get("live_runtime_mutation") is True, "Live Drain did not mutate runtime")
-    counts_drained = backend_counts(20)
+    counts_drained = backend_counts(20, "live-drain")
     require(counts_drained.get("9101", 0) == 0, "Live Drain still sent traffic to 9101")
     require(counts_drained.get("9102", 0) > 0, "Live Drain did not send traffic to 9102")
     print("✅ Live Drain output and traffic correct")
