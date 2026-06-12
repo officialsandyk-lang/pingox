@@ -82,6 +82,7 @@ struct CachedResponse {
     header: ResponseHeader,
     body: Vec<u8>,
     expires_unix_ms: u128,
+    created_unix_ms: u128,
 }
 
 #[derive(Debug)]
@@ -967,6 +968,29 @@ impl ProxyHttp for GeneratedProxy {
         let path = session.req_header().uri.path().to_string();
         let method = session.req_header().method.as_str().to_uppercase();
 
+        if path == "/__gateway_runtime_admin/cache/clear" {
+            if method != "POST" {
+                session.respond_error(405).await?;
+                return Ok(true);
+            }
+
+            let cleared = match self.response_cache.lock() {
+                Ok(mut cache) => {
+                    let count = cache.len();
+                    cache.clear();
+                    count
+                }
+                Err(_) => 0,
+            };
+
+            let body = format!(
+                "{{\"ok\":true,\"action\":\"clear_cache\",\"scope\":\"all\",\"cleared_entries\":{},\"local_only\":true}}",
+                cleared
+            );
+
+            return self.write_json_response(session, 200, body).await;
+        }
+
         if path == "/__gateway_runtime_state" {
             if method != "GET" && method != "HEAD" {
                 session.respond_error(405).await?;
@@ -1110,6 +1134,7 @@ impl ProxyHttp for GeneratedProxy {
         Self::CTX: Send + Sync,
     {
         const MAX_CACHE_BODY_BYTES: usize = 1024 * 1024;
+        const MAX_CACHE_ENTRIES: usize = 1024;
 
         if let Some(capture) = &mut ctx.cache_capture {
             if capture.cacheable {
@@ -1127,12 +1152,23 @@ impl ProxyHttp for GeneratedProxy {
                             .saturating_add((capture.ttl_seconds as u128) * 1000);
 
                         if let Ok(mut cache) = self.response_cache.lock() {
+                            if cache.len() >= MAX_CACHE_ENTRIES {
+                                if let Some(oldest_key) = cache
+                                    .iter()
+                                    .min_by_key(|(_key, entry)| entry.created_unix_ms)
+                                    .map(|(key, _entry)| key.clone())
+                                {
+                                    cache.remove(&oldest_key);
+                                }
+                            }
+
                             cache.insert(
                                 capture.key.clone(),
                                 CachedResponse {
                                     header,
                                     body: capture.body.clone(),
                                     expires_unix_ms,
+                                    created_unix_ms: current_unix_ms(),
                                 },
                             );
                         }
