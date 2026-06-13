@@ -645,6 +645,67 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
       color: #991b1b;
     }}
 
+
+    /* Stable dashboard layout polish */
+    .dash-grid {{
+      align-items: start;
+    }}
+
+    .dash-card {{
+      min-width: 0;
+      overflow: hidden;
+    }}
+
+    .dash-card pre,
+    .dash-card code {{
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }}
+
+    #agentLearningCard {{
+      grid-column: span 2;
+    }}
+
+    #agentLearningList {{
+      max-height: 520px;
+      overflow-y: auto;
+      padding-right: 4px;
+    }}
+
+    .agent-learning-row {{
+      display: block;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
+      white-space: normal;
+      padding: 10px 12px;
+    }}
+
+    .agent-learning-row strong {{
+      display: block;
+      font-size: 13px;
+      margin-bottom: 6px;
+      overflow-wrap: anywhere;
+    }}
+
+    .agent-learning-row span {{
+      display: inline-block;
+      margin-right: 10px;
+      margin-bottom: 4px;
+      vertical-align: top;
+    }}
+
+    .agent-learning-notes {{
+      display: block !important;
+      margin-top: 6px;
+      color: #374151;
+      max-height: 56px;
+      overflow: hidden;
+    }}
+
+    .active-health-row {{
+      overflow-wrap: anywhere;
+    }}
+
 </style>
 </head>
 <body>
@@ -717,6 +778,13 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
         <h2>Route Impact</h2>
         <p class="muted">Correlates per-route traffic with active backend health. Read-only dashboard view.</p>
         <div id="healthTrafficCorrelationList" class="active-health-list">none</div>
+      </div>
+
+      <div class="dash-card" id="agentLearningCard">
+        <h2>Agent Learning</h2>
+        <p class="muted">Recent root-cause learnings stored by the reliability agent. Read-only.</p>
+        <button class="op-button" id="agentLearningButton" type="button">Fetch Agent Learnings</button>
+        <div id="agentLearningList" class="active-health-list">none</div>
       </div>
 
       <div class="dash-card">
@@ -1052,6 +1120,90 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
           }}
         }});
       }}
+
+      async function fetchAgentLearnings() {{
+        const listEl = document.getElementById("agentLearningList");
+        if (!listEl) {{
+          return;
+        }}
+
+        listEl.textContent = "Loading agent learnings...";
+
+        try {{
+          const agentLearningEndpoint = "/__gateway_control/agent/learnings";
+          const controlBaseRaw = (typeof controlApiUrl !== "undefined" && controlApiUrl)
+            ? controlApiUrl
+            : "http://127.0.0.1:8787";
+          const tokenRaw = (typeof controlApiToken !== "undefined" && controlApiToken)
+            ? controlApiToken
+            : "dev-local-control-token";
+
+          const controlBase = controlBaseRaw && controlBaseRaw.value
+            ? controlBaseRaw.value
+            : String(controlBaseRaw || "http://127.0.0.1:8787");
+
+          const token = tokenRaw && tokenRaw.value
+            ? tokenRaw.value
+            : String(tokenRaw || "dev-local-control-token");
+          const url = `${{controlBase}}${{agentLearningEndpoint}}?limit=10`;
+
+          const response = await fetch(url, {{
+            cache: "no-store",
+            headers: {{ "X-Pingora-Control-Token": token }},
+          }});
+
+          const text = await response.text();
+          if (!text.trim()) {{
+            listEl.textContent = `Agent learning fetch failed: empty response from ${{url}} · HTTP ${{response.status}}`;
+            return;
+          }}
+
+          let data;
+          try {{
+            data = JSON.parse(text);
+          }} catch (_err) {{
+            listEl.textContent = `Agent learning fetch failed: non-JSON response from ${{url}} · HTTP ${{response.status}} · ${{text.slice(0, 300)}}`;
+            return;
+          }}
+
+          if (!data.ok) {{
+            listEl.textContent = `Agent learning fetch failed: ${{data.error || "unknown error"}}`;
+            return;
+          }}
+
+          const rows = Array.isArray(data.learnings) ? data.learnings : [];
+          if (!rows.length) {{
+            listEl.textContent = "none";
+            return;
+          }}
+
+          listEl.innerHTML = rows.map((item) => {{
+            const rootCause = item.root_cause || "unknown";
+            const success = Number(item.successful_repair_count || 0);
+            const failed = Number(item.failed_repair_count || 0);
+            const action = item.last_repair_action || "none";
+            const level = item.last_verification_level || "none";
+            const seen = item.last_seen_at || "unknown";
+            const notes = item.notes || "";
+            const rowClass = failed > success ? "unhealthy" : "healthy";
+
+            return `<div class="active-health-row agent-learning-row ${{rowClass}}"><strong>${{rootCause}}</strong><span>success ${{success}}</span><span>failed ${{failed}}</span><span>action ${{action}}</span><span>level ${{level}}</span><span>seen ${{seen}}</span><span class="agent-learning-notes">${{notes}}</span></div>`;
+          }}).join("");
+        }} catch (error) {{
+          listEl.textContent = `Agent learning fetch failed: ${{error}}`;
+        }}
+      }}
+
+      const agentLearningButton = document.getElementById("agentLearningButton");
+      if (agentLearningButton) {{
+        agentLearningButton.addEventListener("click", async (event) => {{
+          event.preventDefault();
+          event.stopPropagation();
+          await fetchAgentLearnings();
+        }});
+      }}
+
+      window.fetchAgentLearnings = fetchAgentLearnings;
 
       async function updateCacheCountersFromRuntimeState() {{
         try {{

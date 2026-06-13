@@ -1415,3 +1415,63 @@ def control_runtime_admin_enable(
     _require_token(x_pingora_control_token)
     return _runtime_admin_agent_call_local("enable", route, upstream, confirm)
 
+def _recent_agent_learnings(limit: int = 10) -> dict[str, Any]:
+    import sqlite3
+    from pathlib import Path
+
+    db = Path("data/reliability_reports.sqlite3")
+    if not db.exists():
+        return {
+            "ok": False,
+            "agent": "agent_learning_dashboard",
+            "error": "data/reliability_reports.sqlite3 not found",
+            "learnings": [],
+        }
+
+    con = sqlite3.connect(db)
+    con.row_factory = sqlite3.Row
+
+    try:
+        rows = con.execute(
+            """
+            SELECT
+                root_cause,
+                successful_repair_count,
+                failed_repair_count,
+                last_repair_action,
+                last_verification_level,
+                last_seen_at,
+                notes
+            FROM root_cause_learnings
+            ORDER BY last_seen_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    except Exception as exc:
+        con.close()
+        return {
+            "ok": False,
+            "agent": "agent_learning_dashboard",
+            "error": str(exc),
+            "learnings": [],
+        }
+
+    learnings = [dict(row) for row in rows]
+    con.close()
+
+    return {
+        "ok": True,
+        "agent": "agent_learning_dashboard",
+        "mode": "read_only",
+        "source": str(db),
+        "count": len(learnings),
+        "learnings": learnings,
+    }
+
+
+@app.get("/__gateway_control/agent/learnings")
+def agent_learnings(limit: int = 10) -> dict[str, Any]:
+    limit = max(1, min(int(limit or 10), 50))
+    return _recent_agent_learnings(limit=limit)
+
