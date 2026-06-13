@@ -624,7 +624,9 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
         <h2>Runtime Health</h2>
         <p><span class="ok-dot"></span> Gateway responding</p>
         <p><a href="/__gateway_runtime_state">Open runtime state JSON</a></p>
-      </div>
+      
+        <p class="muted">Last updated: <strong id="runtimeStateLastUpdated">never</strong></p>
+</div>
 
       <div class="dash-card" id="cacheCounterCard">
         <h2>Local In-Memory Response Cache</h2>
@@ -985,6 +987,12 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
         try {{
           const response = await fetch("/__gateway_runtime_state", {{ cache: "no-store" }});
           const data = await response.json();
+
+          const lastUpdatedEl = document.getElementById("runtimeStateLastUpdated");
+          if (lastUpdatedEl) {{
+            lastUpdatedEl.textContent = new Date().toLocaleTimeString();
+          }}
+
           const cache = data && data.cache ? data.cache : {{}};
           const routeTraffic = Array.isArray(data.route_traffic) ? data.route_traffic : [];
 
