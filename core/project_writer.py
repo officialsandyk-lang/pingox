@@ -690,6 +690,12 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
         <p class="muted">Runtime active health history only. This does not mutate routes, algorithms, upstreams, cache policy, or security.</p>
       </div>
 
+      <div class="dash-card" id="healthTrafficCorrelationCard">
+        <h2>Route Impact</h2>
+        <p class="muted">Correlates per-route traffic with active backend health. Read-only dashboard view.</p>
+        <div id="healthTrafficCorrelationList" class="active-health-list">none</div>
+      </div>
+
       <div class="dash-card">
         <h2>Edge Mode</h2>
         <p>Pingora-only edge</p>
@@ -1073,6 +1079,7 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
           const activeHealthWorstBackendEl = document.getElementById("activeHealthWorstBackend");
           const activeHealthLastErrorEl = document.getElementById("activeHealthLastError");
           const activeHealthStatsEl = document.getElementById("activeHealthStats");
+          const healthTrafficCorrelationListEl = document.getElementById("healthTrafficCorrelationList");
 
           if (activeHealthPolicyEl) {{
             const path = activeHealthPolicy.path || "none";
@@ -1135,6 +1142,41 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
                 const rowClass = isHealthy ? "healthy" : "unhealthy";
                 const errorLine = isHealthy ? "" : `<span class="health-error">error ${{lastError}}</span>`;
                 return `<div class="active-health-row ${{rowClass}}"><strong>${{route}} → ${{upstream}}</strong><span>${{status}}</span><span>last ${{last}}</span><span>success ${{success}}</span><span class="health-failure-count">failure ${{failure}}</span>${{errorLine}}</div>`;
+              }}).join("");
+            }}
+          }}
+
+          if (healthTrafficCorrelationListEl) {{
+            const trafficRows = Array.isArray(data.route_traffic) ? data.route_traffic : [];
+            const routes = new Set([
+              ...trafficRows.map((item) => item.path || item.route || "unknown"),
+              ...activeHealthUpstreams.map((item) => item.route || "unknown"),
+            ]);
+
+            if (!routes.size) {{
+              healthTrafficCorrelationListEl.textContent = "none";
+            }} else {{
+              healthTrafficCorrelationListEl.innerHTML = Array.from(routes).sort().map((route) => {{
+                const traffic = trafficRows.find((item) => (item.path || item.route) === route) || {{}};
+                const healthRows = activeHealthUpstreams.filter((item) => item.route === route);
+                const unhealthy = healthRows.filter((item) => item.healthy === false);
+                const totalBackends = healthRows.length;
+                const healthyBackends = healthRows.filter((item) => item.healthy === true).length;
+
+                const requestCount = Number(traffic.total_requests || traffic.requests || traffic.total || traffic.count || 0);
+                const successCount = Number(traffic.success_responses || traffic.status_2xx || traffic.success || traffic.ok || 0);
+                const errorCount = Number(traffic.error_responses || traffic.status_5xx || traffic.errors || traffic.failures || 0);
+
+                const worst = unhealthy
+                  .sort((a, b) => Number(b.consecutive_failures || 0) - Number(a.consecutive_failures || 0))[0] || null;
+
+                const rowClass = unhealthy.length ? "unhealthy" : "healthy";
+                const unhealthyList = unhealthy.map((item) => item.upstream || "unknown").join(", ") || "none";
+                const errorLine = worst && worst.last_error
+                  ? `<span class="health-error">${{String(worst.last_error)}}</span>`
+                  : "";
+
+                return `<div class="active-health-row ${{rowClass}}"><strong>${{route}}</strong><span>traffic ${{requestCount}}</span><span>2xx ${{successCount}}</span><span>5xx ${{errorCount}}</span><span>health ${{healthyBackends}}/${{totalBackends}}</span><span>unhealthy ${{unhealthyList}}</span>${{errorLine}}</div>`;
               }}).join("");
             }}
           }}
