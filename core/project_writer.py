@@ -1791,6 +1791,110 @@ def rewrite_rust_listen_port(config: dict, project_path: Path) -> None:
             count=1,
         )
 
+
+    active_health = config.get("active_health") or {}
+
+    def _health_int(name: str, default: int, minimum: int, maximum: int) -> int:
+        try:
+            value = int(active_health.get(name, default))
+        except Exception:
+            value = default
+
+        if value < minimum or value > maximum:
+            return default
+
+        return value
+
+    health_path = str(active_health.get("path") or "/health").strip()
+    if not health_path.startswith("/"):
+        health_path = "/" + health_path
+
+    health_expected_status = _health_int("expected_status", 200, 100, 599)
+    health_interval_seconds = _health_int("interval_seconds", 5, 1, 300)
+    health_timeout_seconds = _health_int("timeout_seconds", 2, 1, 30)
+    healthy_threshold = _health_int("healthy_threshold", 2, 1, 20)
+    unhealthy_threshold = _health_int("unhealthy_threshold", 3, 1, 20)
+
+    text = re.sub(
+        r'const HEALTH_CHECK_PATH:\s*&str\s*=\s*".*?";',
+        f"const HEALTH_CHECK_PATH: &str = {json.dumps(health_path)};",
+        text,
+        count=1,
+    )
+
+    if "const HEALTH_EXPECTED_STATUS:" not in text:
+        text = text.replace(
+            f"const HEALTH_CHECK_PATH: &str = {json.dumps(health_path)};\n",
+            f"const HEALTH_CHECK_PATH: &str = {json.dumps(health_path)};\nconst HEALTH_EXPECTED_STATUS: u16 = {health_expected_status};\n",
+            1,
+        )
+    else:
+        text = re.sub(
+            r"const HEALTH_EXPECTED_STATUS:\s*u16\s*=\s*\d+;",
+            f"const HEALTH_EXPECTED_STATUS: u16 = {health_expected_status};",
+            text,
+            count=1,
+        )
+
+    text = re.sub(
+        r"const HEALTH_INTERVAL_SECONDS:\s*u64\s*=\s*\d+;",
+        f"const HEALTH_INTERVAL_SECONDS: u64 = {health_interval_seconds};",
+        text,
+        count=1,
+    )
+    text = re.sub(
+        r"const HEALTH_TIMEOUT_SECONDS:\s*u64\s*=\s*\d+;",
+        f"const HEALTH_TIMEOUT_SECONDS: u64 = {health_timeout_seconds};",
+        text,
+        count=1,
+    )
+    text = re.sub(
+        r"const HEALTHY_THRESHOLD:\s*usize\s*=\s*\d+;",
+        f"const HEALTHY_THRESHOLD: usize = {healthy_threshold};",
+        text,
+        count=1,
+    )
+    text = re.sub(
+        r"const UNHEALTHY_THRESHOLD:\s*usize\s*=\s*\d+;",
+        f"const UNHEALTHY_THRESHOLD: usize = {unhealthy_threshold};",
+        text,
+        count=1,
+    )
+
+    text = text.replace(
+        '"expected_status":{}',
+        '"expected_status":{}',
+        1,
+    )
+
+    text = text.replace(
+        '\\"expected_status\\":200',
+        '\\"expected_status\\":{}',
+        1,
+    )
+    text = text.replace(
+        '"expected_status":200',
+        '"expected_status":{}',
+        1,
+    )
+
+    health_json_arg_marker = (
+        "            json_escape(HEALTH_CHECK_PATH),\n"
+        "            HEALTH_TIMEOUT_SECONDS,\n"
+    )
+
+    if "HEALTH_EXPECTED_STATUS" in text and health_json_arg_marker in text:
+        text = text.replace(
+            health_json_arg_marker,
+            (
+                "            json_escape(HEALTH_CHECK_PATH),\n"
+                "            HEALTH_EXPECTED_STATUS,\n"
+                "            HEALTH_TIMEOUT_SECONDS,\n"
+            ),
+            1,
+        )
+
+
     # Safety: ensure the runtime uses the generated constant, not hardcoded 8090.
     text = text.replace(
         "let listen_port = config.port.unwrap_or(8090);",
