@@ -601,6 +601,31 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
       color: #475569;
     }}
 
+    .active-health-row.healthy {{
+      background: #f8fafc;
+      border-color: #e5e7eb;
+    }}
+
+    .active-health-row.unhealthy {{
+      background: #fef2f2;
+      border-color: #fca5a5;
+      box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.12);
+    }}
+
+    .active-health-row.unhealthy strong {{
+      color: #991b1b;
+    }}
+
+    .active-health-row .health-error {{
+      color: #991b1b;
+      font-weight: 600;
+      overflow-wrap: anywhere;
+    }}
+
+    .active-health-row .health-failure-count {{
+      font-weight: 700;
+    }}
+
 </style>
 </head>
 <body>
@@ -1069,11 +1094,15 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
               activeHealthStatsEl.innerHTML = activeHealthUpstreams.map((item) => {{
                 const route = item.route || "unknown";
                 const upstream = item.upstream || "unknown";
-                const status = item.healthy === true ? "healthy" : "unhealthy";
+                const isHealthy = item.healthy === true;
+                const status = isHealthy ? "healthy" : "unhealthy";
                 const last = item.last_status === null || item.last_status === undefined ? "none" : String(item.last_status);
                 const success = Number(item.consecutive_successes || 0);
                 const failure = Number(item.consecutive_failures || 0);
-                return `<div class="active-health-row"><strong>${{route}} → ${{upstream}}</strong><span>${{status}}</span><span>last ${{last}}</span><span>success ${{success}}</span><span>failure ${{failure}}</span></div>`;
+                const lastError = item.last_error === null || item.last_error === undefined || item.last_error === "" ? "none" : String(item.last_error);
+                const rowClass = isHealthy ? "healthy" : "unhealthy";
+                const errorLine = isHealthy ? "" : `<span class="health-error">error ${{lastError}}</span>`;
+                return `<div class="active-health-row ${{rowClass}}"><strong>${{route}} → ${{upstream}}</strong><span>${{status}}</span><span>last ${{last}}</span><span>success ${{success}}</span><span class="health-failure-count">failure ${{failure}}</span>${{errorLine}}</div>`;
               }}).join("");
             }}
           }}
