@@ -819,3 +819,43 @@ Always review generated configs and code before using them in production environ
 This project is licensed under the Apache License 2.0.
 
 See [LICENSE](./LICENSE) for details.
+
+## Active Health Local Demo
+
+This local demo shows how AI Pingora Gateway detects a failed backend and confirms recovery after it is restored.
+
+This demo is local-only. It does not touch Docker, Linux/systemd, cloud, production ports, route algorithms, cache policy, or security policy.
+
+### What it proves
+
+- Backend health is visible in runtime state and dashboard.
+- Stopping backend `127.0.0.1:9102` makes Active Health mark it unhealthy.
+- The dashboard highlights unhealthy backend rows in red.
+- The dashboard shows failure count and `last_error`.
+- Restarting the local runtime/demo backends restores the backend.
+- Active Health marks the backend healthy again after recovery.
+
+### Run the demo
+
+```bash
+scripts/demo_active_health_local.sh 9102
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8080/?runtime_context=local&address_mode=local
+```
+
+During the failure stage, the dashboard should show fewer healthy backend targets, more unhealthy backend targets, red unhealthy backend rows, failure count, and the latest connection error.
+
+After pressing ENTER in the terminal, the script restarts the local runtime/demo backends and waits until the backend becomes healthy again.
+
+### Related verification
+
+```bash
+python scripts/verify_active_health_failure_recovery_local.py
+python scripts/verify_active_health_dashboard_failure_visuals_local.py
+python scripts/verify_active_health_summary_dashboard_local.py
+python scripts/verify_local_production_readiness_gate.py
+```
