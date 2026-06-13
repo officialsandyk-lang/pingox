@@ -579,6 +579,28 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
       color: #475569;
     }}
 
+
+    .active-health-list {{
+      display: grid;
+      gap: 8px;
+      margin-top: 8px;
+      font-size: 0.92rem;
+    }}
+
+    .active-health-row {{
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 2px;
+      padding: 8px;
+      border: 1px solid #e5e7eb;
+      border-radius: 10px;
+      background: #f8fafc;
+    }}
+
+    .active-health-row span {{
+      color: #475569;
+    }}
+
 </style>
 </head>
 <body>
@@ -627,6 +649,14 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
         <p>Total route requests: <strong id="routeTrafficTotal">0</strong></p>
         <div id="routeTrafficStats" class="route-traffic-list">none</div>
         <p class="muted">Live runtime counters only. This does not change routes, algorithms, upstreams, cache policy, or security.</p>
+      </div>
+
+      <div class="dash-card" id="activeHealthCard">
+        <h2>Active Health</h2>
+        <p>Policy: <strong id="activeHealthPolicy">none</strong></p>
+        <p>Healthy upstreams: <strong id="activeHealthHealthy">0</strong></p>
+        <div id="activeHealthStats" class="active-health-list">none</div>
+        <p class="muted">Runtime active health history only. This does not mutate routes, algorithms, upstreams, cache policy, or security.</p>
       </div>
 
       <div class="dash-card">
@@ -979,6 +1009,42 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
                 const serverErr = Number(item.status_5xx || 0);
                 const last = item.last_status === null || item.last_status === undefined ? "none" : String(item.last_status);
                 return `<div class="route-traffic-row"><strong>${{path}}</strong><span>total ${{total}}</span><span>2xx ${{ok}}</span><span>3xx ${{redirect}}</span><span>4xx ${{clientErr}}</span><span>5xx ${{serverErr}}</span><span>last ${{last}}</span></div>`;
+              }}).join("");
+            }}
+          }}
+
+
+          const activeHealth = data.active_health || {{}};
+          const activeHealthPolicy = activeHealth.policy || {{}};
+          const activeHealthUpstreams = Array.isArray(activeHealth.upstreams) ? activeHealth.upstreams : [];
+          const activeHealthPolicyEl = document.getElementById("activeHealthPolicy");
+          const activeHealthHealthyEl = document.getElementById("activeHealthHealthy");
+          const activeHealthStatsEl = document.getElementById("activeHealthStats");
+
+          if (activeHealthPolicyEl) {{
+            const path = activeHealthPolicy.path || "none";
+            const expected = activeHealthPolicy.expected_status === undefined ? "none" : String(activeHealthPolicy.expected_status);
+            const healthyThreshold = activeHealthPolicy.healthy_threshold === undefined ? "none" : String(activeHealthPolicy.healthy_threshold);
+            const unhealthyThreshold = activeHealthPolicy.unhealthy_threshold === undefined ? "none" : String(activeHealthPolicy.unhealthy_threshold);
+            activeHealthPolicyEl.textContent = `${{path}} · expected ${{expected}} · healthy ${{healthyThreshold}} · unhealthy ${{unhealthyThreshold}}`;
+          }}
+
+          if (activeHealthHealthyEl) {{
+            activeHealthHealthyEl.textContent = String(activeHealthUpstreams.filter((item) => item.healthy === true).length);
+          }}
+
+          if (activeHealthStatsEl) {{
+            if (activeHealthUpstreams.length === 0) {{
+              activeHealthStatsEl.textContent = "none";
+            }} else {{
+              activeHealthStatsEl.innerHTML = activeHealthUpstreams.map((item) => {{
+                const route = item.route || "unknown";
+                const upstream = item.upstream || "unknown";
+                const status = item.healthy === true ? "healthy" : "unhealthy";
+                const last = item.last_status === null || item.last_status === undefined ? "none" : String(item.last_status);
+                const success = Number(item.consecutive_successes || 0);
+                const failure = Number(item.consecutive_failures || 0);
+                return `<div class="active-health-row"><strong>${{route}} → ${{upstream}}</strong><span>${{status}}</span><span>last ${{last}}</span><span>success ${{success}}</span><span>failure ${{failure}}</span></div>`;
               }}).join("");
             }}
           }}
