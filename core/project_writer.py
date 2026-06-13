@@ -656,7 +656,8 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
       <div class="dash-card" id="activeHealthCard">
         <h2>Active Health</h2>
         <p>Policy: <strong id="activeHealthPolicy">none</strong></p>
-        <p>Healthy upstreams: <strong id="activeHealthHealthy">0</strong></p>
+        <p>Healthy backend targets: <strong id="activeHealthHealthy">0 / 0</strong></p>
+        <p>Unhealthy backend targets: <strong id="activeHealthUnhealthy">0</strong></p>
         <div id="activeHealthStats" class="active-health-list">none</div>
         <p class="muted">Runtime active health history only. This does not mutate routes, algorithms, upstreams, cache policy, or security.</p>
       </div>
@@ -1027,6 +1028,7 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
           const activeHealthUpstreams = Array.isArray(activeHealth.upstreams) ? activeHealth.upstreams : [];
           const activeHealthPolicyEl = document.getElementById("activeHealthPolicy");
           const activeHealthHealthyEl = document.getElementById("activeHealthHealthy");
+          const activeHealthUnhealthyEl = document.getElementById("activeHealthUnhealthy");
           const activeHealthStatsEl = document.getElementById("activeHealthStats");
 
           if (activeHealthPolicyEl) {{
@@ -1034,11 +1036,18 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
             const expected = activeHealthPolicy.expected_status === undefined ? "none" : String(activeHealthPolicy.expected_status);
             const healthyThreshold = activeHealthPolicy.healthy_threshold === undefined ? "none" : String(activeHealthPolicy.healthy_threshold);
             const unhealthyThreshold = activeHealthPolicy.unhealthy_threshold === undefined ? "none" : String(activeHealthPolicy.unhealthy_threshold);
-            activeHealthPolicyEl.textContent = `${{path}} · expected ${{expected}} · healthy ${{healthyThreshold}} · unhealthy ${{unhealthyThreshold}}`;
+            activeHealthPolicyEl.textContent = `${{path}} · expected ${{expected}} · mark healthy after ${{healthyThreshold}} successes · mark unhealthy after ${{unhealthyThreshold}} failures`;
           }}
 
+          const activeHealthHealthyCount = activeHealthUpstreams.filter((item) => item.healthy === true).length;
+          const activeHealthUnhealthyCount = activeHealthUpstreams.filter((item) => item.healthy === false).length;
+
           if (activeHealthHealthyEl) {{
-            activeHealthHealthyEl.textContent = String(activeHealthUpstreams.filter((item) => item.healthy === true).length);
+            activeHealthHealthyEl.textContent = `${{activeHealthHealthyCount}} / ${{activeHealthUpstreams.length}}`;
+          }}
+
+          if (activeHealthUnhealthyEl) {{
+            activeHealthUnhealthyEl.textContent = String(activeHealthUnhealthyCount);
           }}
 
           if (activeHealthStatsEl) {{
