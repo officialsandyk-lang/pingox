@@ -1260,6 +1260,44 @@ def _cmd_health_set_local(args: argparse.Namespace) -> int:
     print(json.dumps(output, indent=2))
     return 0
 
+
+def _cmd_health_reset_local(args: argparse.Namespace) -> int:
+    import json
+
+    if not getattr(args, "local", False):
+        print("health reset currently supports --local only.")
+        return 1
+
+    config = _load_health_policy_config()
+
+    health_policy = {
+        "path": "/health",
+        "expected_status": 200,
+        "timeout_seconds": 2,
+        "interval_seconds": 5,
+        "healthy_threshold": 2,
+        "unhealthy_threshold": 3,
+        "body_contains": None,
+        "header_name": None,
+        "header_value": None,
+    }
+
+    config["active_health"] = health_policy
+    _save_health_policy_config(config)
+
+    output = {
+        "ok": True,
+        "local_only": True,
+        "changed": True,
+        "reset": True,
+        "config": str(_health_policy_config_path()),
+        "active_health": health_policy,
+        "note": "Health policy reset to local defaults. Restart local runtime to apply.",
+    }
+
+    print(json.dumps(output, indent=2))
+    return 0
+
 def cmd_health(args: argparse.Namespace) -> int:
     from pingora_ai.gateway_ops import health_policy
 
@@ -1280,6 +1318,9 @@ def cmd_health(args: argparse.Namespace) -> int:
 
     if args.health_action == "set":
         return _cmd_health_set_local(args)
+
+    if args.health_action == "reset":
+        return _cmd_health_reset_local(args)
 
     print("Unknown health action.")
     return 1
@@ -1966,6 +2007,13 @@ def build_parser() -> argparse.ArgumentParser:
     health_set_parser.add_argument("--healthy-threshold", type=int, default=2)
     health_set_parser.add_argument("--unhealthy-threshold", type=int, default=3)
     health_set_parser.set_defaults(func=cmd_health)
+
+    health_reset_parser = health_subcommands.add_parser(
+        "reset",
+        help="Reset local active health-check policy to defaults.",
+    )
+    health_reset_parser.add_argument("--local", action="store_true", help="Reset local generated config only.")
+    health_reset_parser.set_defaults(func=cmd_health)
 
     upstream_parser = subcommands.add_parser(
         "upstream",
