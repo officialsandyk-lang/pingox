@@ -1150,6 +1150,116 @@ def _cmd_health_test_local() -> int:
 
 
 
+
+def _health_policy_config_path() -> "Path":
+    from pathlib import Path
+
+    return Path("generated-pingora-proxy") / "config.local.json"
+
+
+def _load_health_policy_config() -> dict:
+    import json
+
+    path = _health_policy_config_path()
+    if not path.exists():
+        fallback = Path("generated-pingora-proxy") / "config.json"
+        if fallback.exists():
+            path = fallback
+        else:
+            raise FileNotFoundError("Could not find generated-pingora-proxy/config.local.json or config.json")
+
+    return json.loads(path.read_text())
+
+
+def _save_health_policy_config(config: dict) -> None:
+    import json
+    import shutil
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    path = _health_policy_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not path.exists():
+        fallback = Path("generated-pingora-proxy") / "config.json"
+        if fallback.exists():
+            shutil.copy2(fallback, path)
+
+    if path.exists():
+        backup_dir = Path("data") / "health_policy_backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        shutil.copy2(path, backup_dir / f"config.local.{stamp}.json")
+
+    path.write_text(json.dumps(config, indent=2) + "\n")
+
+
+def _cmd_health_set_local(args: argparse.Namespace) -> int:
+    import json
+
+    if not getattr(args, "local", False):
+        print("health set currently supports --local only.")
+        return 1
+
+    health_path = str(getattr(args, "path", "/health") or "/health").strip()
+    if not health_path.startswith("/"):
+        health_path = "/" + health_path
+
+    expected_status = int(getattr(args, "expected_status", 200))
+    timeout_seconds = int(getattr(args, "timeout_seconds", 2))
+    interval_seconds = int(getattr(args, "interval_seconds", 5))
+    healthy_threshold = int(getattr(args, "healthy_threshold", 2))
+    unhealthy_threshold = int(getattr(args, "unhealthy_threshold", 3))
+
+    if expected_status < 100 or expected_status > 599:
+        print("expected-status must be between 100 and 599.")
+        return 1
+
+    if timeout_seconds < 1 or timeout_seconds > 30:
+        print("timeout-seconds must be between 1 and 30.")
+        return 1
+
+    if interval_seconds < 1 or interval_seconds > 300:
+        print("interval-seconds must be between 1 and 300.")
+        return 1
+
+    if healthy_threshold < 1 or healthy_threshold > 20:
+        print("healthy-threshold must be between 1 and 20.")
+        return 1
+
+    if unhealthy_threshold < 1 or unhealthy_threshold > 20:
+        print("unhealthy-threshold must be between 1 and 20.")
+        return 1
+
+    config = _load_health_policy_config()
+
+    health_policy = {
+        "path": health_path,
+        "expected_status": expected_status,
+        "timeout_seconds": timeout_seconds,
+        "interval_seconds": interval_seconds,
+        "healthy_threshold": healthy_threshold,
+        "unhealthy_threshold": unhealthy_threshold,
+        "body_contains": None,
+        "header_name": None,
+        "header_value": None,
+    }
+
+    config["active_health"] = health_policy
+    _save_health_policy_config(config)
+
+    output = {
+        "ok": True,
+        "local_only": True,
+        "changed": True,
+        "config": str(_health_policy_config_path()),
+        "active_health": health_policy,
+        "note": "Config updated. Restart local runtime to apply generated runtime constants if needed.",
+    }
+
+    print(json.dumps(output, indent=2))
+    return 0
+
 def cmd_health(args: argparse.Namespace) -> int:
     from pingora_ai.gateway_ops import health_policy
 
@@ -1167,6 +1277,9 @@ def cmd_health(args: argparse.Namespace) -> int:
             print("health test currently supports --local only.")
             return 1
         return _cmd_health_test_local()
+
+    if args.health_action == "set":
+        return _cmd_health_set_local(args)
 
     print("Unknown health action.")
     return 1
@@ -1840,6 +1953,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     health_test_parser.add_argument("--local", action="store_true", help="Use local runtime on 127.0.0.1:8080.")
     health_test_parser.set_defaults(func=cmd_health)
+
+    health_set_parser = health_subcommands.add_parser(
+        "set",
+        help="Set local active health-check policy.",
+    )
+    health_set_parser.add_argument("--local", action="store_true", help="Update local generated config only.")
+    health_set_parser.add_argument("--path", default="/health", help="Health-check path, for example /health.")
+    health_set_parser.add_argument("--expected-status", type=int, default=200)
+    health_set_parser.add_argument("--timeout-seconds", type=int, default=2)
+    health_set_parser.add_argument("--interval-seconds", type=int, default=5)
+    health_set_parser.add_argument("--healthy-threshold", type=int, default=2)
+    health_set_parser.add_argument("--unhealthy-threshold", type=int, default=3)
+    health_set_parser.set_defaults(func=cmd_health)
 
     upstream_parser = subcommands.add_parser(
         "upstream",
