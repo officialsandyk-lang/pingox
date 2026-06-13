@@ -626,6 +626,25 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
       font-weight: 700;
     }}
 
+    .active-health-alert {{
+      display: none;
+      margin: 12px 0;
+      padding: 14px 16px;
+      border-radius: 14px;
+      border: 1px solid #fca5a5;
+      background: #fef2f2;
+      color: #7f1d1d;
+      box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.08);
+    }}
+
+    .active-health-alert.visible {{
+      display: block;
+    }}
+
+    .active-health-alert strong {{
+      color: #991b1b;
+    }}
+
 </style>
 </head>
 <body>
@@ -680,6 +699,10 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
 
       <div class="dash-card" id="activeHealthCard">
         <h2>Active Health</h2>
+        <div id="activeHealthAlertBanner" class="active-health-alert">
+          <strong>Active Health Alert:</strong>
+          <span id="activeHealthAlertText">No unhealthy backends.</span>
+        </div>
         <p>Policy: <strong id="activeHealthPolicy">none</strong></p>
         <p>Summary: <strong id="activeHealthSummary">0 total · 0 healthy · 0 unhealthy</strong></p>
         <p>Healthy backend targets: <strong id="activeHealthHealthy">0 / 0</strong></p>
@@ -1072,6 +1095,8 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
           const activeHealth = data.active_health || {{}};
           const activeHealthPolicy = activeHealth.policy || {{}};
           const activeHealthUpstreams = Array.isArray(activeHealth.upstreams) ? activeHealth.upstreams : [];
+          const activeHealthAlertBannerEl = document.getElementById("activeHealthAlertBanner");
+          const activeHealthAlertTextEl = document.getElementById("activeHealthAlertText");
           const activeHealthPolicyEl = document.getElementById("activeHealthPolicy");
           const activeHealthSummaryEl = document.getElementById("activeHealthSummary");
           const activeHealthHealthyEl = document.getElementById("activeHealthHealthy");
@@ -1109,6 +1134,21 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
             .sort((a, b) => Number(b.consecutive_failures || 0) - Number(a.consecutive_failures || 0));
 
           const worstBackend = failingBackends.length ? failingBackends[0] : null;
+
+          if (activeHealthAlertBannerEl && activeHealthAlertTextEl) {{
+            const affectedRoutes = new Set(failingBackends.map((item) => item.route || "unknown"));
+            if (failingBackends.length > 0) {{
+              const routeCount = affectedRoutes.size;
+              const worstRoute = worstBackend ? (worstBackend.route || "unknown") : "unknown";
+              const worstUpstream = worstBackend ? (worstBackend.upstream || "unknown") : "unknown";
+              const worstFailures = worstBackend ? Number(worstBackend.consecutive_failures || 0) : 0;
+              activeHealthAlertBannerEl.classList.add("visible");
+              activeHealthAlertTextEl.textContent = `${{failingBackends.length}} unhealthy backend target(s) across ${{routeCount}} affected route(s). Worst: ${{worstRoute}} → ${{worstUpstream}} · failures ${{worstFailures}}.`;
+            }} else {{
+              activeHealthAlertBannerEl.classList.remove("visible");
+              activeHealthAlertTextEl.textContent = "No unhealthy backends.";
+            }}
+          }}
 
           if (activeHealthWorstBackendEl) {{
             if (worstBackend) {{
