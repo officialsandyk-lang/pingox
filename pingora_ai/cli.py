@@ -1053,15 +1053,123 @@ def cmd_parity(args: argparse.Namespace) -> int:
 
 
 
+
+def _local_runtime_state_url() -> str:
+    return "http://127.0.0.1:8080/__gateway_runtime_state"
+
+
+def _fetch_local_runtime_state() -> dict:
+    import json
+    import urllib.request
+
+    with urllib.request.urlopen(_local_runtime_state_url(), timeout=10) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _cmd_health_list_local() -> int:
+    import json
+
+    state = _fetch_local_runtime_state()
+    active_health = state.get("active_health", {})
+    policy = active_health.get("policy", {})
+    upstreams = active_health.get("upstreams", [])
+
+    output = {
+        "ok": bool(state.get("ok")),
+        "local_only": True,
+        "policy": policy,
+        "upstreams": upstreams,
+        "summary": {
+            "total_upstreams": len(upstreams),
+            "healthy_upstreams": sum(1 for item in upstreams if item.get("healthy") is True),
+            "unhealthy_upstreams": sum(1 for item in upstreams if item.get("healthy") is False),
+        },
+    }
+
+    print(json.dumps(output, indent=2))
+    return 0
+
+
+def _cmd_health_test_local() -> int:
+    import json
+    import urllib.request
+
+    state = _fetch_local_runtime_state()
+    active_health = state.get("active_health", {})
+    policy = active_health.get("policy", {})
+    upstreams = active_health.get("upstreams", [])
+
+    path = policy.get("path") or "/health"
+    expected_status = int(policy.get("expected_status") or 200)
+    timeout_seconds = int(policy.get("timeout_seconds") or 2)
+
+    results = []
+
+    for item in upstreams:
+        route = item.get("route")
+        upstream = item.get("upstream")
+
+        if not upstream:
+            continue
+
+        url = f"http://{upstream}{path}"
+        result = {
+            "route": route,
+            "upstream": upstream,
+            "url": url,
+            "expected_status": expected_status,
+            "ok": False,
+            "status": None,
+            "error": None,
+        }
+
+        try:
+            with urllib.request.urlopen(url, timeout=timeout_seconds) as response:
+                status = response.status
+                result["status"] = status
+                result["ok"] = status == expected_status
+        except Exception as exc:
+            result["error"] = str(exc)
+
+        results.append(result)
+
+    output = {
+        "ok": bool(results) and all(item.get("ok") for item in results),
+        "local_only": True,
+        "policy": policy,
+        "results": results,
+        "summary": {
+            "total": len(results),
+            "passed": sum(1 for item in results if item.get("ok")),
+            "failed": sum(1 for item in results if not item.get("ok")),
+        },
+    }
+
+    print(json.dumps(output, indent=2))
+    return 0 if output["ok"] else 1
+
+
+
 def cmd_health(args: argparse.Namespace) -> int:
     from pingora_ai.gateway_ops import health_policy
 
     if args.health_action == "policy":
         return health_policy(path=getattr(args, "path", None))
 
-    print("Unknown health action.")
-    return 2
+    if args.health_action == "list":
+        if not getattr(args, "local", False):
+            print("health list currently supports --local only.")
+            return 1
+        return _cmd_health_list_local()
 
+    if args.health_action == "test":
+        if not getattr(args, "local", False):
+            print("health test currently supports --local only.")
+            return 1
+        return _cmd_health_test_local()
+
+    print("Unknown health action.")
+    return 1
 
 def cmd_upstream(args: argparse.Namespace) -> int:
     if args.upstream_action == "list":
@@ -1718,6 +1826,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     health_policy_parser.add_argument("path", nargs="?", default=None)
     health_policy_parser.set_defaults(func=cmd_health)
+
+    health_list_parser = health_subcommands.add_parser(
+        "list",
+        help="List local active health policy and upstream health.",
+    )
+    health_list_parser.add_argument("--local", action="store_true", help="Use local runtime on 127.0.0.1:8080.")
+    health_list_parser.set_defaults(func=cmd_health)
+
+    health_test_parser = health_subcommands.add_parser(
+        "test",
+        help="Run active health checks directly against local upstreams.",
+    )
+    health_test_parser.add_argument("--local", action="store_true", help="Use local runtime on 127.0.0.1:8080.")
+    health_test_parser.set_defaults(func=cmd_health)
 
     upstream_parser = subcommands.add_parser(
         "upstream",
