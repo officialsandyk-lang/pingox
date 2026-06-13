@@ -557,7 +557,29 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
       font-size: 14px;
     }}
 
-  </style>
+  
+    .route-traffic-list {{
+      display: grid;
+      gap: 8px;
+      margin-top: 8px;
+      font-size: 0.92rem;
+    }}
+
+    .route-traffic-row {{
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 2px;
+      padding: 8px;
+      border: 1px solid #e5e7eb;
+      border-radius: 10px;
+      background: #f8fafc;
+    }}
+
+    .route-traffic-row span {{
+      color: #475569;
+    }}
+
+</style>
 </head>
 <body>
   <main>
@@ -598,6 +620,13 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
         <p>Methods: <strong id="cachePolicyMethods">none</strong></p>
         <p>Bypass headers: <strong id="cachePolicyBypassHeaders">none</strong></p>
         <p class="muted">Cache Policy: real local in-memory response cache. GET/HEAD only; Authorization and X-API-Key bypass cache.</p>
+      </div>
+
+      <div class="dash-card" id="routeTrafficCard">
+        <h2>Route Traffic</h2>
+        <p>Total route requests: <strong id="routeTrafficTotal">0</strong></p>
+        <div id="routeTrafficStats" class="route-traffic-list">none</div>
+        <p class="muted">Live runtime counters only. This does not change routes, algorithms, upstreams, cache policy, or security.</p>
       </div>
 
       <div class="dash-card">
@@ -927,6 +956,32 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
           const response = await fetch("/__gateway_runtime_state", {{ cache: "no-store" }});
           const data = await response.json();
           const cache = data && data.cache ? data.cache : {{}};
+          const routeTraffic = Array.isArray(data.route_traffic) ? data.route_traffic : [];
+
+          const routeTrafficTotalEl = document.getElementById("routeTrafficTotal");
+          const routeTrafficStatsEl = document.getElementById("routeTrafficStats");
+
+          if (routeTrafficTotalEl) {{
+            const total = routeTraffic.reduce((sum, item) => sum + Number(item.total_requests || 0), 0);
+            routeTrafficTotalEl.textContent = String(total);
+          }}
+
+          if (routeTrafficStatsEl) {{
+            if (routeTraffic.length === 0) {{
+              routeTrafficStatsEl.textContent = "none";
+            }} else {{
+              routeTrafficStatsEl.innerHTML = routeTraffic.map((item) => {{
+                const path = item.path || "unknown";
+                const total = Number(item.total_requests || 0);
+                const ok = Number(item.status_2xx || 0);
+                const redirect = Number(item.status_3xx || 0);
+                const clientErr = Number(item.status_4xx || 0);
+                const serverErr = Number(item.status_5xx || 0);
+                const last = item.last_status === null || item.last_status === undefined ? "none" : String(item.last_status);
+                return `<div class="route-traffic-row"><strong>${{path}}</strong><span>total ${{total}}</span><span>2xx ${{ok}}</span><span>3xx ${{redirect}}</span><span>4xx ${{clientErr}}</span><span>5xx ${{serverErr}}</span><span>last ${{last}}</span></div>`;
+              }}).join("");
+            }}
+          }}
 
           const eligibleEl = document.getElementById("cacheEligibleCount");
           const bypassEl = document.getElementById("cacheBypassCount");
@@ -1008,7 +1063,7 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
                 const eligible = Number(item.eligible || 0);
                 const bytes = Number(item.approximate_bytes || 0);
                 return `${{path}}: entries ${{entries}}, hits ${{hits}}, misses ${{misses}}, bypasses ${{bypasses}}, eligible ${{eligible}}, bytes ${{bytes}}`;
-              }}).join(" | ");
+              }}).join("");
             }}
           }}
         }} catch (err) {{

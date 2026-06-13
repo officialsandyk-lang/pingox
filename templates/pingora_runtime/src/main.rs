@@ -114,8 +114,19 @@ struct CacheRouteStats {
     misses: usize,
 }
 
+#[derive(Clone, Debug, Default)]
+struct RouteTrafficStats {
+    total_requests: usize,
+    status_2xx: usize,
+    status_3xx: usize,
+    status_4xx: usize,
+    status_5xx: usize,
+    last_status: Option<u16>,
+}
+
 #[derive(Debug)]
 struct RequestContext {
+    route_path: Option<String>,
     cache_route_index: Option<usize>,
     cache_key: Option<String>,
     cache_capture: Option<InFlightCacheCapture>,
@@ -136,6 +147,7 @@ struct GeneratedProxy {
     cache_misses: Arc<AtomicUsize>,
     response_cache: Arc<Mutex<HashMap<String, CachedResponse>>>,
     cache_route_stats: Arc<Mutex<HashMap<String, CacheRouteStats>>>,
+    route_traffic_stats: Arc<Mutex<HashMap<String, RouteTrafficStats>>>,
 }
 
 fn content_type_for_path(path: &PathBuf) -> &'static str {
@@ -295,6 +307,14 @@ impl GeneratedProxy {
             }
         }
 
+        let mut route_traffic_map = HashMap::<String, RouteTrafficStats>::new();
+
+        for route in routes.iter() {
+            if route.route_type != "static" {
+                route_traffic_map.insert(route.path.clone(), RouteTrafficStats::default());
+            }
+        }
+
         let proxy = Self {
             routes: Arc::new(routes),
             counters: Arc::new(counters),
@@ -309,6 +329,7 @@ impl GeneratedProxy {
             cache_misses: Arc::new(AtomicUsize::new(0)),
             response_cache: Arc::new(Mutex::new(HashMap::new())),
             cache_route_stats: Arc::new(Mutex::new(HashMap::new())),
+            route_traffic_stats: Arc::new(Mutex::new(route_traffic_map)),
         };
 
         proxy.start_health_checker();
@@ -640,6 +661,41 @@ impl GeneratedProxy {
             ));
         }
 
+        let route_traffic_snapshot = self
+            .route_traffic_stats
+            .lock()
+            .map(|stats| stats.clone())
+            .unwrap_or_default();
+
+        let mut route_traffic_json = Vec::new();
+
+        for route in self.routes.iter() {
+            if route.route_type == "static" {
+                continue;
+            }
+
+            let counters = route_traffic_snapshot
+                .get(&route.path)
+                .cloned()
+                .unwrap_or_default();
+
+            let last_status_json = match counters.last_status {
+                Some(status) => status.to_string(),
+                None => "null".to_string(),
+            };
+
+            route_traffic_json.push(format!(
+                "{{\"path\":\"{}\",\"total_requests\":{},\"status_2xx\":{},\"status_3xx\":{},\"status_4xx\":{},\"status_5xx\":{},\"last_status\":{}}}",
+                json_escape(&route.path),
+                counters.total_requests,
+                counters.status_2xx,
+                counters.status_3xx,
+                counters.status_4xx,
+                counters.status_5xx,
+                last_status_json
+            ));
+        }
+
         let (cache_entries, cache_approximate_bytes, cache_route_entry_bytes) = match self.response_cache.lock() {
             Ok(cache) => {
                 let mut per_route = HashMap::<String, (usize, usize)>::new();
@@ -728,13 +784,14 @@ impl GeneratedProxy {
         }
 
         format!(
-            "{{\"ok\":true,\"health_check\":{{\"path\":\"{}\",\"interval_seconds\":{},\"timeout_seconds\":{},\"healthy_threshold\":{},\"unhealthy_threshold\":{}}},\"routes\":[{}],\"cache\":{{\"eligible\":{},\"bypasses\":{},\"hits\":{},\"misses\":{},\"entries\":{},\"approximate_bytes\":{},\"per_route_stats\":[{}],\"policy\":{{\"max_entries\":1024,\"max_body_bytes\":1048576,\"enabled_routes\":[{}]}}}}}}",
+            "{{\"ok\":true,\"health_check\":{{\"path\":\"{}\",\"interval_seconds\":{},\"timeout_seconds\":{},\"healthy_threshold\":{},\"unhealthy_threshold\":{}}},\"routes\":[{}],\"route_traffic\":[{}],\"cache\":{{\"eligible\":{},\"bypasses\":{},\"hits\":{},\"misses\":{},\"entries\":{},\"approximate_bytes\":{},\"per_route_stats\":[{}],\"policy\":{{\"max_entries\":1024,\"max_body_bytes\":1048576,\"enabled_routes\":[{}]}}}}}}",
             json_escape(HEALTH_CHECK_PATH),
             HEALTH_INTERVAL_SECONDS,
             HEALTH_TIMEOUT_SECONDS,
             HEALTHY_THRESHOLD,
             UNHEALTHY_THRESHOLD,
             routes_json.join(","),
+            route_traffic_json.join(","),
             self.cache_eligible.load(Ordering::Relaxed),
             self.cache_bypasses.load(Ordering::Relaxed),
             self.cache_hits.load(Ordering::Relaxed),
@@ -1013,6 +1070,30 @@ impl GeneratedProxy {
         }
 
         hash % len
+    }
+
+    fn record_route_traffic(&self, route_path: &str, status: u16) {
+        let mut stats = match self.route_traffic_stats.lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+
+        let counters = stats
+            .entry(route_path.to_string())
+            .or_insert_with(RouteTrafficStats::default);
+
+        counters.total_requests = counters.total_requests.saturating_add(1);
+        counters.last_status = Some(status);
+
+        if (200..=299).contains(&status) {
+            counters.status_2xx = counters.status_2xx.saturating_add(1);
+        } else if (300..=399).contains(&status) {
+            counters.status_3xx = counters.status_3xx.saturating_add(1);
+        } else if (400..=499).contains(&status) {
+            counters.status_4xx = counters.status_4xx.saturating_add(1);
+        } else if status >= 500 {
+            counters.status_5xx = counters.status_5xx.saturating_add(1);
+        }
     }
 
     fn increment_cache_route_stat(&self, route_path: &str, stat: &str) {
@@ -1327,6 +1408,7 @@ impl ProxyHttp for GeneratedProxy {
 
     fn new_ctx(&self) -> Self::CTX {
         RequestContext {
+            route_path: None,
             cache_route_index: None,
             cache_key: None,
             cache_capture: None,
@@ -1434,6 +1516,8 @@ impl ProxyHttp for GeneratedProxy {
             }
         };
 
+        _ctx.route_path = Some(route.path.clone());
+
         self.record_cache_gate(session, &route);
 
         let cache_allowed = Self::route_cache_enabled(&route)
@@ -1461,6 +1545,7 @@ impl ProxyHttp for GeneratedProxy {
 
                 self.cache_hits.fetch_add(1, Ordering::Relaxed);
                 self.increment_cache_route_stat(&route.path, "hit");
+                self.record_route_traffic(&route.path, 200);
                 return Ok(true);
             }
 
@@ -1482,6 +1567,7 @@ impl ProxyHttp for GeneratedProxy {
         }
 
         if !self.has_healthy_upstream(route_index) {
+            self.record_route_traffic(&route.path, 503);
             session.respond_error(503).await?;
             return Ok(true);
         }
@@ -1498,6 +1584,10 @@ impl ProxyHttp for GeneratedProxy {
     where
         Self::CTX: Send + Sync,
     {
+        if let Some(route_path) = ctx.route_path.as_ref() {
+            self.record_route_traffic(route_path, upstream_response.status.as_u16());
+        }
+
         if let Some(capture) = &mut ctx.cache_capture {
             if upstream_response.status.as_u16() == 200 {
                 let _ = upstream_response.insert_header("x-pingora-ai-cache", "MISS");
