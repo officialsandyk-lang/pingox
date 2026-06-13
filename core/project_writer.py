@@ -681,8 +681,11 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
       <div class="dash-card" id="activeHealthCard">
         <h2>Active Health</h2>
         <p>Policy: <strong id="activeHealthPolicy">none</strong></p>
+        <p>Summary: <strong id="activeHealthSummary">0 total · 0 healthy · 0 unhealthy</strong></p>
         <p>Healthy backend targets: <strong id="activeHealthHealthy">0 / 0</strong></p>
         <p>Unhealthy backend targets: <strong id="activeHealthUnhealthy">0</strong></p>
+        <p>Worst failing backend: <strong id="activeHealthWorstBackend">none</strong></p>
+        <p>Last error summary: <strong id="activeHealthLastError">none</strong></p>
         <div id="activeHealthStats" class="active-health-list">none</div>
         <p class="muted">Runtime active health history only. This does not mutate routes, algorithms, upstreams, cache policy, or security.</p>
       </div>
@@ -1064,8 +1067,11 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
           const activeHealthPolicy = activeHealth.policy || {{}};
           const activeHealthUpstreams = Array.isArray(activeHealth.upstreams) ? activeHealth.upstreams : [];
           const activeHealthPolicyEl = document.getElementById("activeHealthPolicy");
+          const activeHealthSummaryEl = document.getElementById("activeHealthSummary");
           const activeHealthHealthyEl = document.getElementById("activeHealthHealthy");
           const activeHealthUnhealthyEl = document.getElementById("activeHealthUnhealthy");
+          const activeHealthWorstBackendEl = document.getElementById("activeHealthWorstBackend");
+          const activeHealthLastErrorEl = document.getElementById("activeHealthLastError");
           const activeHealthStatsEl = document.getElementById("activeHealthStats");
 
           if (activeHealthPolicyEl) {{
@@ -1079,12 +1085,38 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
           const activeHealthHealthyCount = activeHealthUpstreams.filter((item) => item.healthy === true).length;
           const activeHealthUnhealthyCount = activeHealthUpstreams.filter((item) => item.healthy === false).length;
 
+          if (activeHealthSummaryEl) {{
+            activeHealthSummaryEl.textContent = `${{activeHealthUpstreams.length}} total · ${{activeHealthHealthyCount}} healthy · ${{activeHealthUnhealthyCount}} unhealthy`;
+          }}
+
           if (activeHealthHealthyEl) {{
             activeHealthHealthyEl.textContent = `${{activeHealthHealthyCount}} / ${{activeHealthUpstreams.length}}`;
           }}
 
           if (activeHealthUnhealthyEl) {{
             activeHealthUnhealthyEl.textContent = String(activeHealthUnhealthyCount);
+          }}
+
+          const failingBackends = activeHealthUpstreams
+            .filter((item) => item.healthy === false)
+            .sort((a, b) => Number(b.consecutive_failures || 0) - Number(a.consecutive_failures || 0));
+
+          const worstBackend = failingBackends.length ? failingBackends[0] : null;
+
+          if (activeHealthWorstBackendEl) {{
+            if (worstBackend) {{
+              activeHealthWorstBackendEl.textContent = `${{worstBackend.route || "unknown"}} → ${{worstBackend.upstream || "unknown"}} · failures ${{Number(worstBackend.consecutive_failures || 0)}}`;
+            }} else {{
+              activeHealthWorstBackendEl.textContent = "none";
+            }}
+          }}
+
+          if (activeHealthLastErrorEl) {{
+            if (worstBackend && worstBackend.last_error) {{
+              activeHealthLastErrorEl.textContent = String(worstBackend.last_error);
+            }} else {{
+              activeHealthLastErrorEl.textContent = "none";
+            }}
           }}
 
           if (activeHealthStatsEl) {{
