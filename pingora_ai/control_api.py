@@ -887,6 +887,110 @@ def control_decision_integrity_report(
     return decision_integrity_report()
 
 
+
+
+def _fetch_runtime_state(
+    runtime_context: str | None = None,
+    address_mode: str | None = None,
+) -> dict[str, Any]:
+    import json
+    import urllib.request
+
+    # Local dashboard/control phase: keep runtime-state reads local-only.
+    url = "http://127.0.0.1:8080/__gateway_runtime_state"
+
+    with urllib.request.urlopen(url, timeout=10) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+@app.get("/__gateway_control/health/list")
+def control_health_list(
+    runtime_context: str | None = None,
+    address_mode: str | None = None,
+) -> dict[str, Any]:
+    try:
+        state = _fetch_runtime_state(runtime_context=runtime_context, address_mode=address_mode)
+        active_health = state.get("active_health", {})
+        upstreams = active_health.get("upstreams", [])
+
+        return {
+            "ok": True,
+            "command": "pingora-ai health list --local",
+            "local_only": True,
+            "active_health": active_health,
+            "summary": {
+                "total_upstreams": len(upstreams),
+                "healthy_upstreams": sum(1 for item in upstreams if item.get("healthy") is True),
+                "unhealthy_upstreams": sum(1 for item in upstreams if item.get("healthy") is False),
+            },
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "command": "pingora-ai health list --local"}
+
+
+@app.get("/__gateway_control/health/test")
+def control_health_test(
+    runtime_context: str | None = None,
+    address_mode: str | None = None,
+) -> dict[str, Any]:
+    try:
+        state = _fetch_runtime_state(runtime_context=runtime_context, address_mode=address_mode)
+        active_health = state.get("active_health", {})
+        policy = active_health.get("policy", {})
+        upstreams = active_health.get("upstreams", [])
+
+        results = []
+        for item in upstreams:
+            results.append({
+                "route": item.get("route"),
+                "upstream": item.get("upstream"),
+                "healthy": item.get("healthy"),
+                "last_status": item.get("last_status"),
+                "consecutive_successes": item.get("consecutive_successes"),
+                "consecutive_failures": item.get("consecutive_failures"),
+                "last_error": item.get("last_error"),
+            })
+
+        return {
+            "ok": True,
+            "command": "pingora-ai health test --local",
+            "local_only": True,
+            "policy": policy,
+            "results": results,
+            "summary": {
+                "total": len(results),
+                "passed": sum(1 for item in results if item.get("healthy") is True),
+                "failed": sum(1 for item in results if item.get("healthy") is False),
+            },
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "command": "pingora-ai health test --local"}
+
+
+@app.get("/__gateway_control/health/reset/dry-run")
+def control_health_reset_dry_run() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "dry_run": True,
+        "will_not_execute": True,
+        "local_only": True,
+        "command": "pingora-ai health reset --local",
+        "safety": "Browser dashboard does not execute live health reset.",
+        "would_set": {
+            "path": "/health",
+            "expected_status": 200,
+            "timeout_seconds": 2,
+            "interval_seconds": 5,
+            "healthy_threshold": 2,
+            "unhealthy_threshold": 3,
+            "body_contains": None,
+            "header_name": None,
+            "header_value": None,
+        },
+    }
+
+
+
 @app.get("/__gateway_control/dashboard-check")
 def control_dashboard_check_report(
     x_pingora_control_token: str | None = Header(default=None),

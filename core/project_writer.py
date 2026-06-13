@@ -755,6 +755,18 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
           Health Policy
         </button>
 
+        <button type="button" class="cmd-btn" data-command="pingora-ai health list --local" data-kind="api" data-endpoint="/__gateway_control/health/list">
+          Health Policy List
+        </button>
+
+        <button type="button" class="cmd-btn" data-command="pingora-ai health test --local" data-kind="api" data-endpoint="/__gateway_control/health/test">
+          Health Policy Test
+        </button>
+
+        <button type="button" class="cmd-btn warning" data-command="pingora-ai health reset --local --dry-run" data-kind="api" data-endpoint="/__gateway_control/health/reset/dry-run">
+          Health Policy Reset Dry Run
+        </button>
+
         <button type="button" class="cmd-btn" data-command="pingora-ai backup list" data-kind="api" data-endpoint="/__gateway_control/backups">
           Backup List
         </button>
