@@ -661,6 +661,51 @@ impl GeneratedProxy {
             ));
         }
 
+        let mut active_health_upstreams_json = Vec::new();
+
+        for route in self.routes.iter() {
+            if route.route_type == "static" {
+                continue;
+            }
+
+            for upstream in &route.upstreams {
+                let key = runtime_state_key(&route.path, &upstream.address);
+
+                let default_state = RuntimeUpstreamState {
+                    healthy: true,
+                    consecutive_successes: 0,
+                    consecutive_failures: 0,
+                    last_status: None,
+                    last_error: None,
+                    last_checked_unix_ms: 0,
+                };
+
+                let item = state.get(&key).unwrap_or(&default_state);
+
+                let last_status_json = match item.last_status {
+                    Some(status) => status.to_string(),
+                    None => "null".to_string(),
+                };
+
+                let last_error_json = match &item.last_error {
+                    Some(error) => format!("\"{}\",", json_escape(error)).trim_end_matches(',').to_string(),
+                    None => "null".to_string(),
+                };
+
+                active_health_upstreams_json.push(format!(
+                    "{{\"route\":\"{}\",\"upstream\":\"{}\",\"healthy\":{},\"last_status\":{},\"consecutive_successes\":{},\"consecutive_failures\":{},\"last_error\":{},\"last_checked_unix_ms\":{}}}",
+                    json_escape(&route.path),
+                    json_escape(&upstream.address),
+                    item.healthy,
+                    last_status_json,
+                    item.consecutive_successes,
+                    item.consecutive_failures,
+                    last_error_json,
+                    item.last_checked_unix_ms
+                ));
+            }
+        }
+
         let route_traffic_snapshot = self
             .route_traffic_stats
             .lock()
@@ -784,12 +829,18 @@ impl GeneratedProxy {
         }
 
         format!(
-            "{{\"ok\":true,\"health_check\":{{\"path\":\"{}\",\"interval_seconds\":{},\"timeout_seconds\":{},\"healthy_threshold\":{},\"unhealthy_threshold\":{}}},\"routes\":[{}],\"route_traffic\":[{}],\"cache\":{{\"eligible\":{},\"bypasses\":{},\"hits\":{},\"misses\":{},\"entries\":{},\"approximate_bytes\":{},\"per_route_stats\":[{}],\"policy\":{{\"max_entries\":1024,\"max_body_bytes\":1048576,\"enabled_routes\":[{}]}}}}}}",
+            "{{\"ok\":true,\"health_check\":{{\"path\":\"{}\",\"interval_seconds\":{},\"timeout_seconds\":{},\"healthy_threshold\":{},\"unhealthy_threshold\":{}}},\"active_health\":{{\"policy\":{{\"path\":\"{}\",\"expected_status\":200,\"timeout_seconds\":{},\"interval_seconds\":{},\"healthy_threshold\":{},\"unhealthy_threshold\":{},\"body_contains\":null,\"header_name\":null,\"header_value\":null}},\"upstreams\":[{}]}},\"routes\":[{}],\"route_traffic\":[{}],\"cache\":{{\"eligible\":{},\"bypasses\":{},\"hits\":{},\"misses\":{},\"entries\":{},\"approximate_bytes\":{},\"per_route_stats\":[{}],\"policy\":{{\"max_entries\":1024,\"max_body_bytes\":1048576,\"enabled_routes\":[{}]}}}}}}",
             json_escape(HEALTH_CHECK_PATH),
             HEALTH_INTERVAL_SECONDS,
             HEALTH_TIMEOUT_SECONDS,
             HEALTHY_THRESHOLD,
             UNHEALTHY_THRESHOLD,
+            json_escape(HEALTH_CHECK_PATH),
+            HEALTH_TIMEOUT_SECONDS,
+            HEALTH_INTERVAL_SECONDS,
+            HEALTHY_THRESHOLD,
+            UNHEALTHY_THRESHOLD,
+            active_health_upstreams_json.join(","),
             routes_json.join(","),
             route_traffic_json.join(","),
             self.cache_eligible.load(Ordering::Relaxed),
