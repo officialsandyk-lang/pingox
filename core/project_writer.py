@@ -784,7 +784,9 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
         <h2>Agent Learning</h2>
         <p class="muted">Recent root-cause learnings stored by the reliability agent. Read-only.</p>
         <button class="op-button" id="agentLearningButton" type="button">Fetch Agent Learnings</button>
+        <button class="op-button" id="agentRepairPlanButton" type="button">Generate Repair Plan</button>
         <div id="agentLearningList" class="active-health-list">none</div>
+        <div id="agentRepairPlanResult" class="active-health-list">none</div>
       </div>
 
       <div class="dash-card">
@@ -1173,6 +1175,7 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
           }}
 
           const rows = Array.isArray(data.learnings) ? data.learnings : [];
+          window.__lastAgentLearningRows = rows;
           if (!rows.length) {{
             listEl.textContent = "none";
             return;
@@ -1195,6 +1198,65 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
         }} catch (error) {{
           listEl.textContent = `Agent learning fetch failed: ${{error}}`;
         }}
+      }}
+
+      async function fetchAgentRepairPlan() {{
+        const resultEl = document.getElementById("agentRepairPlanResult");
+        if (!resultEl) {{
+          return;
+        }}
+
+        const rows = Array.isArray(window.__lastAgentLearningRows) ? window.__lastAgentLearningRows : [];
+        const first = rows[0] || {{}};
+        const rootCause = first.root_cause || "docker_backend_port_unreachable";
+        const repairAction = first.suggested_action || first.last_repair_action || "";
+
+        resultEl.textContent = "Generating dry-run repair plan...";
+
+        try {{
+          const controlBaseRaw = (typeof controlApiUrl !== "undefined" && controlApiUrl)
+            ? controlApiUrl
+            : "http://127.0.0.1:8787";
+          const tokenRaw = (typeof controlApiToken !== "undefined" && controlApiToken)
+            ? controlApiToken
+            : "dev-local-control-token";
+
+          const controlBase = controlBaseRaw && controlBaseRaw.value
+            ? controlBaseRaw.value
+            : String(controlBaseRaw || "http://127.0.0.1:8787");
+
+          const token = tokenRaw && tokenRaw.value
+            ? tokenRaw.value
+            : String(tokenRaw || "dev-local-control-token");
+
+          const url = `${{controlBase}}/__gateway_control/agent/repair-plan/dry-run?root_cause=${{encodeURIComponent(rootCause)}}&repair_action=${{encodeURIComponent(repairAction)}}`;
+          const response = await fetch(url, {{
+            cache: "no-store",
+            headers: {{ "X-Pingora-Control-Token": token }},
+          }});
+
+          const text = await response.text();
+          const data = JSON.parse(text);
+          if (!data.ok) {{
+            resultEl.textContent = `Repair plan failed: ${{data.error || "unknown error"}}`;
+            return;
+          }}
+
+          const plan = data.plan || {{}};
+          const steps = Array.isArray(plan.repair_steps) ? plan.repair_steps : [];
+          resultEl.innerHTML = `<div class="active-health-row agent-learning-row healthy"><strong>Dry-run repair plan: ${{plan.root_cause || rootCause}}</strong><span>actionability ${{plan.actionability || "manual"}}</span><span>risk ${{plan.risk || "unknown"}}</span><span>requires confirmation ${{plan.requires_confirmation === true ? "yes" : "no"}}</span><span>will execute ${{plan.will_execute === true ? "yes" : "false"}}</span><span class="agent-learning-notes">command preview: ${{plan.command_preview || "none"}}</span><span class="agent-learning-notes">verification: ${{plan.verification_command || "none"}}</span><span class="agent-learning-notes">steps: ${{steps.join(" → ")}}</span><span class="agent-learning-notes">reason: ${{plan.reason || ""}}</span></div>`;
+        }} catch (error) {{
+          resultEl.textContent = `Repair plan failed: ${{error}}`;
+        }}
+      }}
+
+      const agentRepairPlanButton = document.getElementById("agentRepairPlanButton");
+      if (agentRepairPlanButton) {{
+        agentRepairPlanButton.addEventListener("click", async (event) => {{
+          event.preventDefault();
+          event.stopPropagation();
+          await fetchAgentRepairPlan();
+        }});
       }}
 
       const agentLearningButton = document.getElementById("agentLearningButton");

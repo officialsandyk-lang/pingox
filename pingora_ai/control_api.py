@@ -1559,3 +1559,134 @@ def agent_learnings(limit: int = 10) -> dict[str, Any]:
     limit = max(1, min(int(limit or 10), 50))
     return _recent_agent_learnings(limit=limit)
 
+def _agent_repair_plan_for_learning(root_cause: str, repair_action: str | None = None) -> dict[str, Any]:
+    root = str(root_cause or "unknown")
+    action = str(repair_action or "")
+
+    base = {
+        "root_cause": root,
+        "repair_action": action or None,
+        "will_execute": False,
+        "docker_apply": False,
+        "linux_deploy": False,
+        "restart": False,
+        "rollback": False,
+        "config_write": False,
+        "runtime_mutation": False,
+    }
+
+    plans = {
+        "docker_backend_port_unreachable": {
+            "actionability": "manual",
+            "risk": "medium",
+            "requires_confirmation": True,
+            "repair_steps": [
+                "Read expected upstream backend ports from active config.",
+                "Check whether required demo backend ports are listening.",
+                "Start missing local demo backend processes only after confirmation.",
+                "Verify gateway route liveness after backend recovery.",
+            ],
+            "command_preview": "pingora-ai start --local",
+            "verification_command": "python scripts/verify_local_production_readiness_gate.py",
+            "reason": "Docker/backend failures often require host process context and should not be auto-executed from dashboard.",
+        },
+        "fastapi_planner_not_running": {
+            "actionability": "manual",
+            "risk": "low",
+            "requires_confirmation": True,
+            "repair_steps": [
+                "Check whether FastAPI planner port 8000 is listening.",
+                "Start planner service using the project-approved command.",
+                "Verify planner /health endpoint.",
+                "Retry CLI planning command.",
+            ],
+            "command_preview": "pingora-ai api start",
+            "verification_command": "curl -s http://127.0.0.1:8000/health",
+            "reason": "Planner startup is process control and should be confirmed by the user.",
+        },
+        "bare_metal_static_homepage_missing": {
+            "actionability": "needs_confirmation",
+            "risk": "high",
+            "requires_confirmation": True,
+            "repair_steps": [
+                "Confirm active bare-metal release path.",
+                "Create a backup of current release assets.",
+                "Upload generated static dashboard assets to active release.",
+                "Verify homepage and route directory.",
+            ],
+            "command_preview": "DRY RUN ONLY: upload_static_assets_to_release",
+            "verification_command": "pingora-ai status --linux",
+            "reason": "Bare-metal release changes can affect production-style serving and require confirmation.",
+        },
+        "docker_http_redirect_health_gate_false_negative": {
+            "actionability": "auto_repairable",
+            "risk": "low",
+            "requires_confirmation": False,
+            "repair_steps": [
+                "Update health readiness logic to accept HTTP redirect statuses 301/302/307/308.",
+                "Prefer /__edge_health for Docker edge health where available.",
+                "Run Docker health verifier.",
+            ],
+            "command_preview": "Safe deterministic verifier repair candidate: accept_docker_http_redirect_or_use_edge_health",
+            "verification_command": "python scripts/verify_tls_auth_secrets.py",
+            "reason": "This is verifier logic only and does not mutate live traffic.",
+        },
+        "verify_agent_learning_store_local": {
+            "actionability": "read_only",
+            "risk": "low",
+            "requires_confirmation": False,
+            "repair_steps": [
+                "No repair needed.",
+                "This learning confirms duplicate-signature upsert verification.",
+            ],
+            "command_preview": "python scripts/verify_agent_learning_store_local.py",
+            "verification_command": "python scripts/verify_agent_learning_store_local.py",
+            "reason": "Verifier-only learning; informational.",
+        },
+    }
+
+    plan = plans.get(root)
+    if not plan:
+        plan = {
+            "actionability": "manual",
+            "risk": "medium",
+            "requires_confirmation": True,
+            "repair_steps": [
+                "Review stored learning and evidence.",
+                "Generate a manual repair plan.",
+                "Run the smallest relevant verifier before any change.",
+            ],
+            "command_preview": f"Manual review required before running: {action or root}",
+            "verification_command": "python scripts/verify_local_production_readiness_gate.py",
+            "reason": "No allowlisted dry-run repair plan exists yet for this root cause.",
+        }
+
+    return {**base, **plan}
+
+
+@app.get("/__gateway_control/agent/repair-plan/dry-run")
+def agent_repair_plan_dry_run(
+    x_pingora_control_token: str | None = Header(default=None),
+    root_cause: str = "",
+    repair_action: str | None = None,
+) -> dict[str, Any]:
+    _require_token(x_pingora_control_token)
+
+    plan = _agent_repair_plan_for_learning(root_cause, repair_action)
+
+    return {
+        "ok": True,
+        "agent": "repair_plan_agent",
+        "mode": "dry_run_only",
+        "safety": {
+            "will_execute": False,
+            "docker_apply": False,
+            "linux_deploy": False,
+            "restart": False,
+            "rollback": False,
+            "config_write": False,
+            "runtime_mutation": False,
+        },
+        "plan": plan,
+    }
+
