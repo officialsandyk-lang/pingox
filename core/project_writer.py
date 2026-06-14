@@ -785,8 +785,11 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
         <p class="muted">Recent root-cause learnings stored by the reliability agent. Read-only.</p>
         <button class="op-button" id="agentLearningButton" type="button">Fetch Agent Learnings</button>
         <button class="op-button" id="agentRepairPlanButton" type="button">Generate Repair Plan</button>
+        <button class="op-button" id="copyRepairCommandButton" type="button">Copy Suggested Command</button>
+        <button class="op-button" id="viewRepairPlanJsonButton" type="button">View Repair Plan JSON</button>
         <div id="agentLearningList" class="active-health-list">none</div>
         <div id="agentRepairPlanResult" class="active-health-list">none</div>
+        <pre id="agentRepairPlanJson" class="agent-learning-notes" style="display:none; white-space:pre-wrap;"></pre>
       </div>
 
       <div class="dash-card">
@@ -1243,11 +1246,60 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
           }}
 
           const plan = data.plan || {{}};
+          window.__lastRepairPlan = data;
+          window.__lastRepairCommand = plan.command_preview || "";
+          const planJsonEl = document.getElementById("agentRepairPlanJson");
+          if (planJsonEl) {{
+            planJsonEl.textContent = JSON.stringify(data, null, 2);
+          }}
+
           const steps = Array.isArray(plan.repair_steps) ? plan.repair_steps : [];
           resultEl.innerHTML = `<div class="active-health-row agent-learning-row healthy"><strong>Dry-run repair plan: ${{plan.root_cause || rootCause}}</strong><span>actionability ${{plan.actionability || "manual"}}</span><span>risk ${{plan.risk || "unknown"}}</span><span>requires confirmation ${{plan.requires_confirmation === true ? "yes" : "no"}}</span><span>will execute ${{plan.will_execute === true ? "yes" : "false"}}</span><span class="agent-learning-notes">command preview: ${{plan.command_preview || "none"}}</span><span class="agent-learning-notes">verification: ${{plan.verification_command || "none"}}</span><span class="agent-learning-notes">steps: ${{steps.join(" → ")}}</span><span class="agent-learning-notes">reason: ${{plan.reason || ""}}</span></div>`;
         }} catch (error) {{
           resultEl.textContent = `Repair plan failed: ${{error}}`;
         }}
+      }}
+
+      const copyRepairCommandButton = document.getElementById("copyRepairCommandButton");
+      if (copyRepairCommandButton) {{
+        copyRepairCommandButton.addEventListener("click", async (event) => {{
+          event.preventDefault();
+          event.stopPropagation();
+          const command = window.__lastRepairCommand || "";
+          const resultEl = document.getElementById("agentRepairPlanResult");
+          if (!command) {{
+            if (resultEl) {{
+              resultEl.textContent = "No suggested command available. Generate a repair plan first.";
+            }}
+            return;
+          }}
+          try {{
+            await navigator.clipboard.writeText(command);
+            if (resultEl) {{
+              resultEl.insertAdjacentHTML("beforeend", `<div class="active-health-row healthy"><strong>Copied suggested command</strong><span>${{command}}</span></div>`);
+            }}
+          }} catch (_error) {{
+            if (resultEl) {{
+              resultEl.insertAdjacentHTML("beforeend", `<div class="active-health-row unhealthy"><strong>Copy failed</strong><span>${{command}}</span></div>`);
+            }}
+          }}
+        }});
+      }}
+
+      const viewRepairPlanJsonButton = document.getElementById("viewRepairPlanJsonButton");
+      if (viewRepairPlanJsonButton) {{
+        viewRepairPlanJsonButton.addEventListener("click", (event) => {{
+          event.preventDefault();
+          event.stopPropagation();
+          const planJsonEl = document.getElementById("agentRepairPlanJson");
+          if (!planJsonEl) {{
+            return;
+          }}
+          if (!planJsonEl.textContent.trim()) {{
+            planJsonEl.textContent = "No repair plan JSON available. Generate a repair plan first.";
+          }}
+          planJsonEl.style.display = planJsonEl.style.display === "none" ? "block" : "none";
+        }});
       }}
 
       const agentRepairPlanButton = document.getElementById("agentRepairPlanButton");
