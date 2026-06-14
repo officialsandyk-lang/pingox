@@ -1145,7 +1145,8 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
           const token = tokenRaw && tokenRaw.value
             ? tokenRaw.value
             : String(tokenRaw || "dev-local-control-token");
-          const url = `${{controlBase}}${{agentLearningEndpoint}}?limit=10`;
+
+          const url = `${{controlBase}}${{agentLearningEndpoint}}?limit=5`;
 
           const response = await fetch(url, {{
             cache: "no-store",
@@ -1181,13 +1182,15 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
             const rootCause = item.root_cause || "unknown";
             const success = Number(item.successful_repair_count || 0);
             const failed = Number(item.failed_repair_count || 0);
-            const action = item.last_repair_action || "none";
-            const level = item.last_verification_level || "none";
-            const seen = item.last_seen_at || "unknown";
-            const notes = item.notes || "";
-            const rowClass = failed > success ? "unhealthy" : "healthy";
+            const actionability = item.actionability || "read_only";
+            const autoRepair = item.safe_to_auto_repair === true ? "yes" : "no";
+            const confirmation = item.requires_confirmation === true ? "yes" : "no";
+            const action = item.suggested_action || item.last_repair_action || "none";
+            const command = item.safe_command_preview || "No command preview.";
+            const reason = item.reason || item.notes || "";
+            const rowClass = actionability === "auto_repairable" ? "healthy" : "unhealthy";
 
-            return `<div class="active-health-row agent-learning-row ${{rowClass}}"><strong>${{rootCause}}</strong><span>success ${{success}}</span><span>failed ${{failed}}</span><span>action ${{action}}</span><span>level ${{level}}</span><span>seen ${{seen}}</span><span class="agent-learning-notes">${{notes}}</span></div>`;
+            return `<div class="active-health-row agent-learning-row ${{rowClass}}"><strong>${{rootCause}}</strong><span>actionability ${{actionability}}</span><span>auto-repair ${{autoRepair}}</span><span>confirm ${{confirmation}}</span><span>action ${{action}}</span><span class="agent-learning-notes">command preview: ${{command}}</span><span class="agent-learning-notes">reason: ${{reason}}</span></div>`;
           }}).join("");
         }} catch (error) {{
           listEl.textContent = `Agent learning fetch failed: ${{error}}`;

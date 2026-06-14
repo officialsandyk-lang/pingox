@@ -1415,6 +1415,80 @@ def control_runtime_admin_enable(
     _require_token(x_pingora_control_token)
     return _runtime_admin_agent_call_local("enable", route, upstream, confirm)
 
+
+def _learning_actionability(root_cause: str, repair_action: str | None) -> dict[str, Any]:
+    root = str(root_cause or "")
+    action = str(repair_action or "")
+
+    if not action or action.lower() == "none":
+        return {
+            "actionability": "read_only",
+            "safe_to_auto_repair": False,
+            "requires_confirmation": False,
+            "suggested_action": None,
+            "safe_command_preview": "No repair command. Learning is informational only.",
+            "reason": "No repair action is registered for this learning.",
+        }
+
+    manual_actions = {
+        "start_fastapi_planner": "Start the FastAPI planner service, then verify /health.",
+        "start_missing_demo_backends_for_config": "Start required local demo backend ports, then rerun verification.",
+    }
+
+    confirmation_actions = {
+        "upload_static_assets_to_release": "Requires confirmed release/static asset sync before changing bare-metal release state.",
+        "restore_backup": "Requires explicit restore confirmation.",
+        "rewrite_docker_host_to_loopback": "Requires environment-specific config confirmation.",
+        "kill_process_then_reset_failed": "Requires process-control confirmation.",
+    }
+
+    auto_actions = {
+        "set_local_readiness_to_homepage": "Update local readiness logic to use homepage check.",
+        "set_local_live_url_to_8090": "Update local verifier URL contract.",
+        "accept_docker_http_redirect_or_use_edge_health": "Update verifier health gate to accept redirects or use edge health.",
+        "verify_upsert_second": "Verifier-only learning store check.",
+    }
+
+    if action in manual_actions:
+        return {
+            "actionability": "manual",
+            "safe_to_auto_repair": False,
+            "requires_confirmation": True,
+            "suggested_action": action,
+            "safe_command_preview": "pingora-ai start --local",
+            "reason": manual_actions[action],
+        }
+
+    if action in confirmation_actions:
+        return {
+            "actionability": "needs_confirmation",
+            "safe_to_auto_repair": False,
+            "requires_confirmation": True,
+            "suggested_action": action,
+            "safe_command_preview": f"DRY RUN ONLY: {action}",
+            "reason": confirmation_actions[action],
+        }
+
+    if action in auto_actions:
+        return {
+            "actionability": "auto_repairable",
+            "safe_to_auto_repair": True,
+            "requires_confirmation": False,
+            "suggested_action": action,
+            "safe_command_preview": f"Safe deterministic repair candidate: {action}",
+            "reason": auto_actions[action],
+        }
+
+    return {
+        "actionability": "manual",
+        "safe_to_auto_repair": False,
+        "requires_confirmation": True,
+        "suggested_action": action,
+        "safe_command_preview": f"Manual review required before running: {action}",
+        "reason": f"No allowlisted auto-repair policy exists yet for root cause {root}.",
+    }
+
+
 def _recent_agent_learnings(limit: int = 10) -> dict[str, Any]:
     import sqlite3
     from pathlib import Path
@@ -1457,7 +1531,17 @@ def _recent_agent_learnings(limit: int = 10) -> dict[str, Any]:
             "learnings": [],
         }
 
-    learnings = [dict(row) for row in rows]
+    learnings = []
+    for row in rows:
+        item = dict(row)
+        item.update(
+            _learning_actionability(
+                str(item.get("root_cause") or ""),
+                item.get("last_repair_action"),
+            )
+        )
+        learnings.append(item)
+
     con.close()
 
     return {
