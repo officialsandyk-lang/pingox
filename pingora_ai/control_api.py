@@ -1674,7 +1674,7 @@ def agent_repair_plan_dry_run(
 
     plan = _agent_repair_plan_for_learning(root_cause, repair_action)
 
-    return {
+    payload = {
         "ok": True,
         "agent": "repair_plan_agent",
         "mode": "dry_run_only",
@@ -1689,4 +1689,162 @@ def agent_repair_plan_dry_run(
         },
         "plan": plan,
     }
+
+    _store_repair_plan_history(payload)
+    return payload
+
+def _repair_plan_history_db_path() -> Path:
+    return Path("data") / "repair_plan_history.sqlite3"
+
+
+def _init_repair_plan_history_db() -> None:
+    import sqlite3
+
+    db_path = _repair_plan_history_db_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS repair_plan_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                root_cause TEXT NOT NULL,
+                actionability TEXT,
+                risk TEXT,
+                requires_confirmation INTEGER NOT NULL DEFAULT 0,
+                command_preview TEXT,
+                verification_command TEXT,
+                will_execute INTEGER NOT NULL DEFAULT 0,
+                mode TEXT NOT NULL DEFAULT 'dry_run_only',
+                plan_json TEXT NOT NULL
+            )
+            """
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _store_repair_plan_history(plan_payload: dict[str, Any]) -> None:
+    import json
+    import sqlite3
+    from datetime import datetime, timezone
+
+    _init_repair_plan_history_db()
+
+    plan = plan_payload.get("plan") or {}
+    db_path = _repair_plan_history_db_path()
+
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute(
+            """
+            INSERT INTO repair_plan_history (
+                created_at,
+                root_cause,
+                actionability,
+                risk,
+                requires_confirmation,
+                command_preview,
+                verification_command,
+                will_execute,
+                mode,
+                plan_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.now(timezone.utc).isoformat(),
+                str(plan.get("root_cause") or "unknown"),
+                str(plan.get("actionability") or ""),
+                str(plan.get("risk") or ""),
+                1 if plan.get("requires_confirmation") is True else 0,
+                str(plan.get("command_preview") or ""),
+                str(plan.get("verification_command") or ""),
+                1 if plan.get("will_execute") is True else 0,
+                str(plan_payload.get("mode") or "dry_run_only"),
+                json.dumps(plan_payload, sort_keys=True),
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _recent_repair_plan_history(limit: int = 10) -> dict[str, Any]:
+    import json
+    import sqlite3
+
+    limit = max(1, min(int(limit or 10), 50))
+    db_path = _repair_plan_history_db_path()
+
+    if not db_path.exists():
+        return {
+            "ok": True,
+            "agent": "repair_plan_history_agent",
+            "mode": "read_only",
+            "source": str(db_path),
+            "count": 0,
+            "history": [],
+        }
+
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+
+    try:
+        rows = con.execute(
+            """
+            SELECT
+                id,
+                created_at,
+                root_cause,
+                actionability,
+                risk,
+                requires_confirmation,
+                command_preview,
+                verification_command,
+                will_execute,
+                mode,
+                plan_json
+            FROM repair_plan_history
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    finally:
+        con.close()
+
+    history = []
+    for row in rows:
+        item = dict(row)
+        try:
+            item["plan"] = json.loads(item.get("plan_json") or "{}")
+        except Exception:
+            item["plan"] = {}
+        item.pop("plan_json", None)
+        item["requires_confirmation"] = bool(item.get("requires_confirmation"))
+        item["will_execute"] = bool(item.get("will_execute"))
+        history.append(item)
+
+    return {
+        "ok": True,
+        "agent": "repair_plan_history_agent",
+        "mode": "read_only",
+        "source": str(db_path),
+        "count": len(history),
+        "history": history,
+    }
+
+
+@app.get("/__gateway_control/agent/repair-plan/history")
+def agent_repair_plan_history(
+    x_pingora_control_token: str | None = Header(default=None),
+    limit: int = 10,
+) -> dict[str, Any]:
+    _require_token(x_pingora_control_token)
+    return _recent_repair_plan_history(limit=limit)
+
 

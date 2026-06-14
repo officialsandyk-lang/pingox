@@ -787,9 +787,11 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
         <button class="op-button" id="agentRepairPlanButton" type="button">Generate Repair Plan</button>
         <button class="op-button" id="copyRepairCommandButton" type="button">Copy Suggested Command</button>
         <button class="op-button" id="viewRepairPlanJsonButton" type="button">View Repair Plan JSON</button>
+        <button class="op-button" id="viewRepairHistoryButton" type="button">View Repair History</button>
         <div id="agentLearningList" class="active-health-list">none</div>
         <div id="agentRepairPlanResult" class="active-health-list">none</div>
         <pre id="agentRepairPlanJson" class="agent-learning-notes" style="display:none; white-space:pre-wrap;"></pre>
+        <div id="agentRepairHistoryList" class="active-health-list">none</div>
       </div>
 
       <div class="dash-card">
@@ -1258,6 +1260,77 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
         }} catch (error) {{
           resultEl.textContent = `Repair plan failed: ${{error}}`;
         }}
+      }}
+
+      async function fetchAgentRepairHistory() {{
+        const historyEl = document.getElementById("agentRepairHistoryList");
+        if (!historyEl) {{
+          return;
+        }}
+
+        historyEl.textContent = "Loading repair history...";
+
+        try {{
+          const controlBaseRaw = (typeof controlApiUrl !== "undefined" && controlApiUrl)
+            ? controlApiUrl
+            : "http://127.0.0.1:8787";
+          const tokenRaw = (typeof controlApiToken !== "undefined" && controlApiToken)
+            ? controlApiToken
+            : "dev-local-control-token";
+
+          const controlBase = controlBaseRaw && controlBaseRaw.value
+            ? controlBaseRaw.value
+            : String(controlBaseRaw || "http://127.0.0.1:8787");
+
+          const token = tokenRaw && tokenRaw.value
+            ? tokenRaw.value
+            : String(tokenRaw || "dev-local-control-token");
+
+          const url = `${{controlBase}}/__gateway_control/agent/repair-plan/history?limit=10`;
+          const response = await fetch(url, {{
+            cache: "no-store",
+            headers: {{ "X-Pingora-Control-Token": token }},
+          }});
+
+          const text = await response.text();
+          const data = JSON.parse(text);
+
+          if (!data.ok) {{
+            historyEl.textContent = `Repair history failed: ${{data.error || "unknown error"}}`;
+            return;
+          }}
+
+          const rows = Array.isArray(data.history) ? data.history : [];
+          if (!rows.length) {{
+            historyEl.textContent = "No repair plans generated yet.";
+            return;
+          }}
+
+          historyEl.innerHTML = rows.map((item) => {{
+            const created = item.created_at || "unknown time";
+            const root = item.root_cause || "unknown";
+            const actionability = item.actionability || "manual";
+            const risk = item.risk || "unknown";
+            const command = item.command_preview || "none";
+            const verification = item.verification_command || "none";
+            const mode = item.mode || "dry_run_only";
+            const willExecute = item.will_execute === true ? "yes" : "false";
+            const confirm = item.requires_confirmation === true ? "yes" : "no";
+
+            return `<div class="active-health-row agent-learning-row healthy"><strong>${{root}}</strong><span>created ${{created}}</span><span>actionability ${{actionability}}</span><span>risk ${{risk}}</span><span>confirmation ${{confirm}}</span><span>will execute ${{willExecute}}</span><span>mode ${{mode}}</span><span class="agent-learning-notes">command: ${{command}}</span><span class="agent-learning-notes">verification: ${{verification}}</span></div>`;
+          }}).join("");
+        }} catch (error) {{
+          historyEl.textContent = `Repair history failed: ${{error}}`;
+        }}
+      }}
+
+      const viewRepairHistoryButton = document.getElementById("viewRepairHistoryButton");
+      if (viewRepairHistoryButton) {{
+        viewRepairHistoryButton.addEventListener("click", async (event) => {{
+          event.preventDefault();
+          event.stopPropagation();
+          await fetchAgentRepairHistory();
+        }});
       }}
 
       const copyRepairCommandButton = document.getElementById("copyRepairCommandButton");
