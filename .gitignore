@@ -103,3 +103,4 @@ gateway_config.json
 *.bak
 *.bak-*
 *.broken_backup
+generated-pingora-proxy/tmp/
