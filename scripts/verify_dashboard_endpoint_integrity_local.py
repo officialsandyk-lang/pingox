@@ -168,7 +168,7 @@ def main() -> int:
             f"&runtime_context=local&address_mode=local"
         )
         result = control(endpoint)
-        require(result.get("ok") is True, f"{action} dry-run ok must be true")
+        require(result.get("ok") is True, f"{action} dry-run ok must be true: {result}")
         require(result.get("agent") == "upstream_state_agent", f"{action} dry-run agent mismatch")
         require(result.get("mode") == "dry_run_only", f"{action} dry-run mode must be dry_run_only")
         require(result.get("action") == action, f"{action} dry-run action mismatch")

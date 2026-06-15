@@ -1378,9 +1378,12 @@ def _start_local_runtime() -> int:
     project = root / "generated-pingora-proxy"
     main_rs = project / "src" / "main.rs"
 
-    from core.env_config_resolver import sync_env_configs, env_config_path
-    sync_env_configs(project / "config.json", project, environments=["local", "docker", "linux"])
+    from core.env_config_resolver import env_config_path
     config_path = env_config_path("local", project)
+
+    # Local start must not sync config.json into docker/linux/local profiles.
+    # config.json is legacy/base and may currently represent a Docker plan.
+    # The local runtime source of truth is config.local.json.
 
     if not main_rs.exists():
         print(f"❌ Missing generated runtime: {main_rs}")

@@ -567,6 +567,76 @@ def _upstream_candidates(value: str) -> set[str]:
     return candidates
 
 
+
+def _load_live_local_runtime_route(route_path: str) -> dict[str, Any] | None:
+    """
+    Local-only source of truth for dry-run upstream decisions.
+
+    This prevents local dry-run buttons from reading stale config files such as
+    data/api_plans/latest_config.json after a Docker/apply command.
+    It does not mutate runtime, config, Docker, Linux, or files.
+    """
+    try:
+        with urllib.request.urlopen(
+            "http://127.0.0.1:8080/__gateway_runtime_state",
+            timeout=3,
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return None
+
+    for route in payload.get("routes") or []:
+        if not isinstance(route, dict):
+            continue
+
+        if str(route.get("path") or "") != route_path:
+            continue
+
+        upstreams = []
+        for item in route.get("upstreams") or []:
+            if not isinstance(item, dict):
+                continue
+
+            address = item.get("address") or item.get("upstream") or item.get("backend") or ""
+            if not address:
+                continue
+
+            state = str(
+                item.get("state")
+                or item.get("effective_state")
+                or item.get("config_state")
+                or "enabled"
+            ).lower()
+
+            role = str(item.get("role") or ("backup" if item.get("backup") else "primary")).lower()
+
+            enabled = item.get("enabled")
+            if enabled is None:
+                enabled = state not in {"disabled", "draining", "drain"}
+
+            draining = bool(item.get("draining", state in {"draining", "drain"}))
+
+            upstreams.append(
+                {
+                    "address": str(address).replace("http://", "").replace("https://", "").rstrip("/"),
+                    "weight": item.get("weight", 1),
+                    "state": state,
+                    "enabled": bool(enabled),
+                    "draining": draining,
+                    "role": role,
+                    "backup": bool(item.get("backup", role in {"backup", "standby", "secondary"})),
+                }
+            )
+
+        return {
+            "path": route_path,
+            "upstreams": upstreams,
+            "_source": "live_local_runtime_state",
+        }
+
+    return None
+
+
 def upstream_mutation_dry_run(
     *,
     action: str,
@@ -610,10 +680,18 @@ def upstream_mutation_dry_run(
         return report
 
     matched_route = None
-    for route in config.get("routes") or []:
-        if isinstance(route, dict) and str(route.get("path") or "") == route_path:
-            matched_route = route
-            break
+    matched_route_source = "config"
+
+    if str(runtime_context or "").lower() == "local" and str(address_mode or "").lower() == "local":
+        matched_route = _load_live_local_runtime_route(route_path)
+        if matched_route:
+            matched_route_source = "live_local_runtime_state"
+
+    if matched_route is None:
+        for route in config.get("routes") or []:
+            if isinstance(route, dict) and str(route.get("path") or "") == route_path:
+                matched_route = route
+                break
 
     if not matched_route:
         report = {
@@ -759,6 +837,7 @@ def upstream_mutation_dry_run(
         "action": action,
         "route": route_path,
         "upstream": target["address"],
+        "source": matched_route_source,
         "decision": decision,
         "reason": reason,
         "risk": risk,
