@@ -718,8 +718,8 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
     <div class="meta">
       <div class="meta-item">Served URL: <code id="servedUrl">{html.escape(base_url)}</code></div>
       <div class="meta-item">Served runtime: <code id="servedRuntime">detecting</code></div>
-      <div class="meta-item">Config target: <code>{html.escape(str(config.get("runtime") or config.get("runtime_mode") or "local"))}</code></div>
-      <div class="meta-item">Config strategy: <code>{html.escape(str(config.get("strategy") or config.get("deployment_strategy") or "direct"))}</code></div>
+      <div class="meta-item">Config target: <code id="dashboardConfigTarget">detecting</code></div>
+      <div class="meta-item">Config strategy: <code id="dashboardConfigStrategy">detecting</code></div>
       <div class="meta-item">Total routes: <strong>{len(normalized_routes)}</strong></div>
     </div>
 
@@ -1773,23 +1773,53 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
   <script>
     (function () {{
       const port = window.location.port || (window.location.protocol === "https:" ? "443" : "80");
+      const params = new URLSearchParams(window.location.search);
+      const runtimeContext = (params.get("runtime_context") || "").toLowerCase();
+      const addressMode = (params.get("address_mode") || "").toLowerCase();
+
       const servedUrl = document.getElementById("servedUrl");
       const servedRuntime = document.getElementById("servedRuntime");
+      const dashboardConfigTarget = document.getElementById("dashboardConfigTarget");
+      const dashboardConfigStrategy = document.getElementById("dashboardConfigStrategy");
 
       let label = "unknown runtime";
+      let configTarget = "unknown";
+      let configStrategy = "unknown";
 
-      if (port === "8080" || port === "8081") {{
+      if (runtimeContext === "local" || addressMode === "local" || port === "8080" || port === "8081") {{
         label = "local/manual runtime";
-      }} else if (port === "80" || port === "443") {{
+        configTarget = "local";
+        configStrategy = "direct";
+      }} else if (
+        runtimeContext === "docker" ||
+        runtimeContext === "docker_host" ||
+        addressMode === "docker_host" ||
+        port === "80" ||
+        port === "443"
+      ) {{
         label = "public edge runtime";
+        configTarget = "docker_host";
+        configStrategy = "bluegreen";
       }} else if (port === "8090" || port === "8443") {{
         label = "legacy/internal runtime";
+        configTarget = "legacy/internal";
+        configStrategy = "legacy";
       }} else {{
         label = "custom runtime";
+        configTarget = runtimeContext || addressMode || "custom";
+        configStrategy = "custom";
       }}
 
       if (servedRuntime) {{
         servedRuntime.textContent = label + " on port " + port;
+      }}
+
+      if (dashboardConfigTarget) {{
+        dashboardConfigTarget.textContent = configTarget;
+      }}
+
+      if (dashboardConfigStrategy) {{
+        dashboardConfigStrategy.textContent = configStrategy;
       }}
 
       if (servedUrl) {{

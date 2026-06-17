@@ -76,6 +76,25 @@ def parse_known_runtime_strategy(argv: list[str]) -> tuple[str, str]:
     return runtime, strategy
 
 
+def active_env_name_from_argv(argv: list[str] | None = None) -> str:
+    runtime, strategy = parse_known_runtime_strategy(argv or sys.argv[1:])
+    mode = effective_runtime_mode(runtime, strategy)
+
+    if mode == "docker_host":
+        return "docker"
+
+    if mode in {"linux", "linux_systemd"}:
+        return "linux"
+
+    return "local"
+
+
+def active_env_config_path(argv: list[str] | None = None) -> Path:
+    from core.env_config_resolver import env_config_path
+
+    return PROJECT_ROOT / env_config_path(active_env_name_from_argv(argv))
+
+
 def delegate_to_legacy() -> int:
     if not LEGACY_UPDATE.exists():
         raise RuntimeError(f"Legacy local update entrypoint missing: {LEGACY_UPDATE}")
@@ -111,10 +130,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_config() -> dict[str, Any]:
-    if not CONFIG_PATH.exists():
-        raise RuntimeError(f"Config not found: {CONFIG_PATH}")
+    config_path = active_env_config_path()
 
-    return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    if not config_path.exists():
+        if CONFIG_PATH.exists():
+            return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        raise RuntimeError(f"Config not found: {config_path}")
+
+    return json.loads(config_path.read_text(encoding="utf-8"))
 
 
 def dangerous_route_mutation(prompt: str) -> list[str]:
@@ -463,6 +486,7 @@ def _guard_load_current_config():
     root = Path(__file__).resolve().parent
 
     candidates = [
+        active_env_config_path(),
         root / "generated-pingora-proxy" / "config.json",
         root / "active_config.json",
         root / "gateway_config.json",
@@ -815,7 +839,7 @@ def deploy_docker_bluegreen_update(args: argparse.Namespace) -> dict[str, Any]:
     # This blocks unsafe add/edit/remove/delete operations before generation/deploy.
     enforce_mutation_decision(
         prompt=prompt,
-        config=load_current_config(),
+        config=load_config(),
         confirmed=bool(getattr(args, "confirm_route_mutation", False)),
     )
 

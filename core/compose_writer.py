@@ -181,12 +181,30 @@ def route_upstreams(route: dict) -> list[str]:
     upstreams = route.get("upstreams")
 
     if isinstance(upstreams, list) and upstreams:
-        return [normalize_upstream(u) for u in upstreams if str(u).strip()]
+        normalized = []
+
+        for item in upstreams:
+            if isinstance(item, dict):
+                address = item.get("address") or item.get("upstream")
+            else:
+                address = item
+
+            if str(address or "").strip():
+                normalized.append(normalize_upstream(address))
+
+        return normalized
 
     upstream = route.get("upstream")
 
     if upstream:
         return [normalize_upstream(upstream)]
+
+    route_type = str(route.get("type") or route.get("route_type") or "").strip().lower()
+    route_path = str(route.get("path") or "").strip()
+
+    # Static route-directory homepage has no backend upstream by design.
+    if route_path == "/" or route_type == "static":
+        return []
 
     raise ValueError(f"Route has no upstream or upstreams[]: {route}")
 
@@ -228,6 +246,14 @@ def build_compose_routes(config: dict) -> list[dict]:
     for route in config["routes"]:
         original_upstreams = route_upstreams(route)
 
+        compose_route = dict(route)
+
+        # Static routes such as "/" are served by the generated dashboard/static
+        # webserver and do not have backend upstreams to rewrite.
+        if not original_upstreams:
+            compose_routes.append(compose_route)
+            continue
+
         compose_upstreams = []
 
         for upstream in original_upstreams:
@@ -235,7 +261,6 @@ def build_compose_routes(config: dict) -> list[dict]:
             service_name = backend_service_name(port)
             compose_upstreams.append(f"{service_name}:{port}")
 
-        compose_route = dict(route)
         compose_route["upstream"] = compose_upstreams[0]
         compose_route["upstreams"] = compose_upstreams
 

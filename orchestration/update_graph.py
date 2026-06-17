@@ -1100,6 +1100,10 @@ def _inactive_color(active_color: str) -> str:
 
 def _config_candidates(active_color: str) -> list[Path]:
     return [
+        # Local legacy update graph should prefer the local environment profile.
+        GENERATED_PROJECT_DIR / "config.local.json",
+
+        # Legacy/shared mirrors remain fallback only.
         GENERATED_PROJECT_DIR / "config.json",
         PROJECT_ROOT / "active_config.json",
         PROJECT_ROOT / "gateway_config.json",
@@ -1880,6 +1884,9 @@ def run_local_direct_deploy(
     # Lock the same config into every local config source BEFORE restart.
     # This prevents the local runtime from starting with stale active_config.json
     # while generated-pingora-proxy/config.json has the new routes.
+    _write_json(GENERATED_PROJECT_DIR / "config.local.json", config)
+
+    # config.json is only the local runtime mirror at this point.
     _write_json(GENERATED_PROJECT_DIR / "config.json", config)
     _save_latest_config(config, "local")
 
@@ -2173,7 +2180,10 @@ def run_update_graph(
             strategy=strategy,
         )
 
-        generated_config = _read_json(GENERATED_PROJECT_DIR / "config.json")
+        generated_config = _read_json(GENERATED_PROJECT_DIR / "config.local.json")
+
+        if not isinstance(generated_config, dict):
+            generated_config = _read_json(GENERATED_PROJECT_DIR / "config.json")
 
         if isinstance(generated_config, dict) and resolved_runtime == "local":
             active_config = generated_config
