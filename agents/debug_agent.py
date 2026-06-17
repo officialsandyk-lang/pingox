@@ -5,7 +5,16 @@ from langsmith import traceable
 from langsmith.wrappers import wrap_openai
 
 
-client = wrap_openai(OpenAI())
+client = None
+
+
+def get_debug_client():
+    global client
+
+    if client is None:
+        client = wrap_openai(OpenAI())
+
+    return client
 
 
 def clean_code(text: str) -> str:
@@ -55,7 +64,7 @@ Cargo error output:
 Return the corrected src/main.rs only.
 """
 
-    response = client.chat.completions.create(
+    response = get_debug_client().chat.completions.create(
         model="gpt-4.1-mini",
         messages=[
             {"role": "system", "content": system_prompt},

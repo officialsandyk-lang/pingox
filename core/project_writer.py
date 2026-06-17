@@ -995,8 +995,21 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
         const runtimeContext = params.get("runtime_context");
         const addressMode = params.get("address_mode");
 
+        let rewrittenEndpoint = endpoint;
+
+        if (
+          runtimeContext === "docker" ||
+          runtimeContext === "docker_host" ||
+          addressMode === "docker_host"
+        ) {{
+          rewrittenEndpoint = rewrittenEndpoint.replace(
+            "upstream=127.0.0.1:9101",
+            "upstream=host.docker.internal:9101"
+          );
+        }}
+
         if (!runtimeContext && !addressMode) {{
-          return endpoint;
+          return rewrittenEndpoint;
         }}
 
         const extra = new URLSearchParams();
@@ -1009,8 +1022,8 @@ def write_route_directory_homepage(config: dict[str, Any], project_dir: str | Pa
           extra.set("address_mode", addressMode);
         }}
 
-        const joiner = endpoint.includes("?") ? "&" : "?";
-        return endpoint + joiner + extra.toString();
+        const joiner = rewrittenEndpoint.includes("?") ? "&" : "?";
+        return rewrittenEndpoint + joiner + extra.toString();
       }}
 
       async function fetchControlApi(endpoint) {{

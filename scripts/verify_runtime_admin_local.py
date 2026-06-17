@@ -37,6 +37,12 @@ def backend_counts(n: int = 30) -> dict[str, int]:
         if not matches:
             matches = re.findall(r"Demo Backend\s+(\d+)", body)
 
+        if not matches:
+            matches = re.findall(r"MARKER_BACKEND_(\d+)", body)
+
+        if not matches:
+            matches = re.findall(r"NAME=backend-(\d+)", body)
+
         for port in matches:
             counts[port] = counts.get(port, 0) + 1
 

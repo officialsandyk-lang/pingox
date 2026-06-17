@@ -131,6 +131,37 @@ def _load_active_config() -> dict[str, Any]:
     except Exception:
         return {}
 
+def _config_path_for_runtime_context(runtime_context: str, address_mode: str) -> Path:
+    ctx = str(runtime_context or "").strip().lower()
+    mode = str(address_mode or "").strip().lower()
+
+    project = PROJECT_ROOT / "generated-pingora-proxy"
+
+    if ctx == "docker" or mode in {"docker", "docker_host", "bluegreen"}:
+        return project / "config.docker.json"
+
+    if ctx == "linux" or mode in {"linux", "bare_metal", "systemd"}:
+        return project / "config.linux.json"
+
+    if ctx == "local" or mode in {"local", "direct"}:
+        return project / "config.local.json"
+
+    return _active_config_path()
+
+
+def _load_config_for_runtime_context(runtime_context: str, address_mode: str) -> tuple[Path, dict[str, Any]]:
+    path = _config_path_for_runtime_context(runtime_context, address_mode)
+
+    if not path.exists():
+        return path, {}
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return path, data if isinstance(data, dict) else {}
+    except Exception:
+        return path, {}
+
+
 def _load_config() -> dict[str, Any]:
     if not CONFIG_PATH.exists():
         return {}
@@ -268,7 +299,7 @@ def control_status(
 
     runtime_context, address_mode, base_url = _resolve_runtime_context(runtime_context, address_mode)
 
-    config = _load_active_config()
+    config_path, config = _load_config_for_runtime_context(runtime_context, address_mode)
     routes = config.get("routes") or []
 
     docker_status_raw = _run(
@@ -323,7 +354,7 @@ def control_status(
     return {
         "ok": True,
         "mode": "read_only",
-        "config_path": str(_active_config_path()),
+        "config_path": str(config_path),
         "runtime_context": runtime_context,
         "address_mode": address_mode,
         "checked_base_url": base_url,
@@ -1273,6 +1304,33 @@ def control_upstream_promote_backup_dry_run(
 # Local phase only. These call the live local Pingora runtime admin API.
 # They require confirm=true and do not run Docker apply, Linux deploy, restart, or rollback.
 
+def _runtime_admin_blocked_non_local(
+    action: str,
+    route: str,
+    upstream: str,
+    runtime_context: str,
+    address_mode: str,
+) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "blocked": True,
+        "agent": "runtime_admin_agent",
+        "mode": "blocked_non_local_preview",
+        "action": action,
+        "route": route,
+        "upstream": upstream,
+        "runtime_context": runtime_context,
+        "address_mode": address_mode,
+        "decision": "blocked",
+        "reason": "Live runtime admin mutations are local-only in this preview",
+        "live_runtime_mutation": False,
+        "docker_apply": False,
+        "linux_deploy": False,
+        "restart": False,
+        "rollback": False,
+    }
+
+
 def _runtime_admin_agent_call_local(action: str, route: str, upstream: str, confirm: bool) -> dict[str, Any]:
     import json
     import urllib.parse
@@ -1387,6 +1445,9 @@ def control_runtime_admin_disable(
     address_mode: str = "local",
 ) -> dict[str, Any]:
     _require_token(x_pingora_control_token)
+    runtime_context, address_mode, _base_url = _resolve_runtime_context(runtime_context, address_mode)
+    if runtime_context != "local" or address_mode != "local":
+        return _runtime_admin_blocked_non_local("disable", route, upstream, runtime_context, address_mode)
     return _runtime_admin_agent_call_local("disable", route, upstream, confirm)
 
 
@@ -1400,6 +1461,9 @@ def control_runtime_admin_drain(
     address_mode: str = "local",
 ) -> dict[str, Any]:
     _require_token(x_pingora_control_token)
+    runtime_context, address_mode, _base_url = _resolve_runtime_context(runtime_context, address_mode)
+    if runtime_context != "local" or address_mode != "local":
+        return _runtime_admin_blocked_non_local("drain", route, upstream, runtime_context, address_mode)
     return _runtime_admin_agent_call_local("drain", route, upstream, confirm)
 
 
@@ -1413,6 +1477,9 @@ def control_runtime_admin_enable(
     address_mode: str = "local",
 ) -> dict[str, Any]:
     _require_token(x_pingora_control_token)
+    runtime_context, address_mode, _base_url = _resolve_runtime_context(runtime_context, address_mode)
+    if runtime_context != "local" or address_mode != "local":
+        return _runtime_admin_blocked_non_local("enable", route, upstream, runtime_context, address_mode)
     return _runtime_admin_agent_call_local("enable", route, upstream, confirm)
 
 
