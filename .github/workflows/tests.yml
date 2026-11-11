@@ -1,38 +1,48 @@
 name: Tests
-
 on:
   push:
-    branches:
-      - main
   pull_request:
-
+permissions:
+  contents: read
 jobs:
   pytest:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 10
     env:
-      ENABLE_LANGCHAIN_UPDATE_AGENT: "false"
+      AI_WORKER_BACKEND: disabled
       LANGSMITH_TRACING: "false"
-      RUN_LANGSMITH_SMOKE_TEST: "0"
-
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-          cache: "pip"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install pytest python-dotenv requests langsmith langchain langchain-openai openai
-          fi
-
-      - name: Run tests
-        run: pytest -q tests
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python -m pytest -q
+  runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      AI_WORKER_BACKEND: disabled
+      LANGSMITH_TRACING: "false"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: rustup toolchain install 1.95.0 --profile minimal && rustup default 1.95.0
+      - run: sudo apt-get update && sudo apt-get install -y cmake pkg-config libssl-dev
+      - run: pip install -r requirements.txt
+      - run: python scripts/verify_runtime.py
+  compose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      AI_WORKER_BACKEND: disabled
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: bash scripts/verify_compose.sh

@@ -1,5 +1,9 @@
 # AI Pingora Gateway
 
+> **New hardened deployment path:** use `gateway.py` and [the Linux Docker Compose runbook](docs/PRODUCTION.md).
+> AI calls now share a bounded worker interface with optional Codex support; see [workers](docs/WORKERS.md).
+> The historical local/development workflows below are retained for compatibility and are not the production entrypoint.
+
 AI Pingora Gateway is an AI-powered Pingora application gateway and load-balancer generator.
 
 It converts natural-language infrastructure prompts into a working Rust + Pingora gateway with static webserver routes, reverse-proxy routes, load-balancing algorithms, security controls, staged local updates, reliability reporting, and early self-healing workflows.

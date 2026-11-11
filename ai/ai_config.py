@@ -1,7 +1,5 @@
 import json
-from openai import OpenAI
-
-client = OpenAI()
+from workers.ai_worker import run_worker, json_object
 
 
 def extract_json(text: str) -> dict:
@@ -122,15 +120,4 @@ IMPORTANT:
 - The Security Agent will add safe defaults later.
 """
 
-    response = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0,
-    )
-
-    content = response.choices[0].message.content
-
-    return extract_json(content)
+    return json_object(run_worker(system_prompt, user_prompt, task="config"))

@@ -1,0 +1,18 @@
+{
+  "port": 8080,
+  "routes": [
+    {
+      "path": "/api",
+      "balancing": "round_robin",
+      "upstreams": [{"address": "api-backend:8000", "weight": 1}]
+    }
+  ],
+  "security": {
+    "blocked_paths": ["/.env", "/.git", "/api/internal"],
+    "allowed_methods": ["GET", "HEAD", "POST"],
+    "rate_limit_per_minute": 600,
+    "max_connections": 1000,
+    "max_request_body_bytes": 1048576,
+    "upstream_timeout_seconds": 30
+  }
+}

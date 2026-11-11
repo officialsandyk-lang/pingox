@@ -1,11 +1,11 @@
 import json
 
-from openai import OpenAI
+from workers.ai_worker import run_worker
 from langsmith import traceable
-from langsmith.wrappers import wrap_openai
 
 
-client = wrap_openai(OpenAI())
+
+
 
 
 def clean_code(text: str) -> str:
@@ -53,15 +53,4 @@ Cargo error output:
 Return the corrected src/main.rs only.
 """
 
-    response = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0,
-    )
-
-    fixed_code = response.choices[0].message.content or ""
-
-    return clean_code(fixed_code)
+    return clean_code(run_worker(system_prompt, user_prompt, task="repair"))

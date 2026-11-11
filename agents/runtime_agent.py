@@ -23,12 +23,7 @@ except Exception:
         return decorator
 
 
-try:
-    from langsmith.wrappers import wrap_openai
-    from openai import OpenAI
-except Exception:
-    wrap_openai = None
-    OpenAI = None
+from workers.ai_worker import run_worker, json_object
 
 
 VALID_METHODS = {
@@ -106,29 +101,6 @@ def run_best_effort(
         return result.stdout or ""
     except Exception as exc:
         return f"Failed to run {' '.join(cmd)}: {exc}"
-
-
-def _get_openai_client():
-    """
-    Lazy OpenAI client.
-
-    Keeps imports/tests working when OPENAI_API_KEY is not set.
-    AI repair is only attempted when the client can be created.
-    """
-
-    if OpenAI is None:
-        return None
-
-    try:
-        client = OpenAI()
-
-        if wrap_openai is not None:
-            client = wrap_openai(client)
-
-        return client
-
-    except Exception:
-        return None
 
 
 def clean_json(text: str) -> dict[str, Any]:
@@ -748,11 +720,6 @@ def fix_runtime_config_with_ai(
     runtime_error: str,
     main_rs: str,
 ) -> dict[str, Any]:
-    client = _get_openai_client()
-
-    if client is None:
-        return normalize_config(config)
-
     system_prompt = """
 You are an advanced Pingora runtime debugging agent.
 
@@ -791,23 +758,7 @@ Runtime failure:
 Return corrected JSON config only.
 """
 
-    response = client.chat.completions.create(
-        model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
-        messages=[
-            {
-                "role": "system",
-                "content": system_prompt,
-            },
-            {
-                "role": "user",
-                "content": user_prompt,
-            },
-        ],
-        temperature=0,
-    )
-
-    content = response.choices[0].message.content or ""
-    return clean_json(content)
+    return json_object(run_worker(system_prompt, user_prompt, task="config"))
 
 
 @traceable(name="runtime_agent_patch_main_rs_with_ai", run_type="chain")
@@ -818,11 +769,6 @@ def patch_main_rs_with_ai(
     runtime_error: str,
 ) -> bool:
     if not main_rs_path.exists():
-        return False
-
-    client = _get_openai_client()
-
-    if client is None:
         return False
 
     original = main_rs_path.read_text(encoding="utf-8", errors="replace")
@@ -863,22 +809,7 @@ Current src/main.rs:
 """
 
     try:
-        response = client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
-            messages=[
-                {
-                    "role": "system",
-                    "content": system_prompt,
-                },
-                {
-                    "role": "user",
-                    "content": user_prompt,
-                },
-            ],
-            temperature=0,
-        )
-
-        patched = clean_rust_code(response.choices[0].message.content or "")
+        patched = clean_rust_code(run_worker(system_prompt, user_prompt, task="repair"))
 
     except Exception:
         return False
