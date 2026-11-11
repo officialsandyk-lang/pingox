@@ -43,4 +43,8 @@ done
 curl --fail http://127.0.0.1:18088/api/ | grep backend-ok
 # Validate the actual edge configuration, without requesting public certificates.
 "${compose[@]}" run --rm --no-deps edge caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
-printf 'PASS: Linux container build, routing, policy, non-root runtime, restart, Caddy validation\n'
+# localhost uses Caddy's internal CA. This verifies TLS transport without ACME/DNS.
+"${compose[@]}" --profile production up -d --wait --wait-timeout 60 edge
+curl --insecure --fail --retry 10 --retry-all-errors --retry-delay 1 https://localhost/api/ | grep backend-ok
+test "$(curl --insecure -s -o /dev/null -w '%{http_code}' https://localhost/_gateway/health)" = 404
+printf 'PASS: Linux container build, routing, policy, non-root runtime, restart, TLS edge and private health endpoint\n' 

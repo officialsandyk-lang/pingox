@@ -9,7 +9,7 @@ those flows to operate production traffic.
 
 This is a hardened release candidate, not a blanket production certification.
 Python regression tests and a real local Pingora binary are tested by the supplied
-commands. Linux image build, Caddy TLS issuance, your real backends, load capacity,
+commands. Linux image build, public Caddy TLS issuance, your real backends, load capacity,
 backup restoration and rollback must pass in your environment before cutover.
 The GitHub workflow performs the Linux container smoke test on pushes/PRs.
 
