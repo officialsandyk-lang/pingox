@@ -1,5 +1,7 @@
 # AI Pingora Gateway
 
+For the NGINX-like local service and optional hosted product direction, see [local and hosted deployment](docs/LOCAL_AND_HOSTED.md). Native releases now support `gateway.py build` and `gateway.py run`.
+
 Start with [portable setup and provider configuration](docs/PORTABILITY.md) for Compose, containers, Kubernetes and Linux services.
 
 > **New hardened deployment path:** use `gateway.py` and [the Linux Docker Compose runbook](docs/PRODUCTION.md).

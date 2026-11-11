@@ -29,8 +29,22 @@ def main() -> None:
             sub.add_argument("--deployment", type=Path, help="Deployment profile JSON")
             sub.add_argument("--target", choices=TARGETS)
             sub.add_argument("--image")
+    build = commands.add_parser("build", help="Build a native gateway release (requires Rust)")
+    build.add_argument("--config", type=Path, required=True)
+    build.add_argument("--output", type=Path, required=True)
+    run = commands.add_parser("run", help="Run a built native release in the foreground")
+    run.add_argument("--release", type=Path, required=True)
+    run.add_argument("--bind", default="127.0.0.1", help="IPv4 listener address; defaults to loopback")
     args = parser.parse_args()
     try:
+        if args.command in {"build", "run"}:
+            from core.local_service import build_release, run_release
+            if args.command == "build":
+                output = build_release(args.config, args.output)
+                print(f"Native release built: {output}. Run with: python gateway.py run --release {output}")
+            else:
+                run_release(args.release, args.bind)
+            return
         if args.command == "doctor":
             import shutil
             requirements = {"compose": ["docker"], "container": ["docker"],
