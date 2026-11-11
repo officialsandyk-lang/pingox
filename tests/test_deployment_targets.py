@@ -65,3 +65,13 @@ def test_cli_validation_errors_do_not_print_secret_values(tmp_path):
     assert result.returncode != 0
     assert 'VERY_SECRET' not in result.stderr
     assert 'api_key' in result.stderr
+
+
+def test_compose_profile_image_is_used(tmp_path):
+    generate(config(), tmp_path, DeploymentOptions(target='compose', image='registry.example/gateway:v7'))
+    assert 'GATEWAY_IMAGE=registry.example/gateway:v7' in (tmp_path/'.env.example').read_text()
+
+
+def test_target_inapplicable_options_are_rejected():
+    with pytest.raises(ValidationError): DeploymentOptions(target='systemd', image='gateway:v1')
+    with pytest.raises(ValidationError): DeploymentOptions(target='compose', replicas=5)

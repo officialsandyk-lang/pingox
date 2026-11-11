@@ -206,5 +206,5 @@ GATEWAY_DOMAIN=api.example.com
 ACME_EMAIL=ops@example.com
 UPSTREAM_NETWORK=application-backends
 GATEWAY_NETWORK_CIDR=172.30.50.0/24
-''')
+'''.replace('ai-pingora-gateway:release-001', options.image or 'ai-pingora-gateway:release-001'))
     return output

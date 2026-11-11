@@ -49,6 +49,10 @@ class DeploymentOptions(StrictModel):
 
     @model_validator(mode="after")
     def target_requirements(self):
+        if self.target == "systemd" and self.image is not None:
+            raise ValueError("systemd runs a native binary, not a container image")
+        if self.target != "kubernetes" and (self.namespace != "ai-gateway" or self.replicas != 2):
+            raise ValueError("namespace and replica settings apply only to Kubernetes")
         if self.target == "kubernetes" and self.image is None:
             raise ValueError("Kubernetes requires a built image tag or digest")
         if self.target not in {"kubernetes", "systemd"} and self.trusted_proxy_cidrs:
