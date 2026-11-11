@@ -1923,7 +1923,9 @@ fn main() {{
     server.bootstrap();
 
     let mut service = http_proxy_service(&server.configuration, proxy);
-    service.add_tcp("0.0.0.0:{port}");
+    let host = std::env::var("GATEWAY_BIND_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let host: std::net::Ipv4Addr = host.parse().expect("invalid GATEWAY_BIND_HOST");
+    service.add_tcp(&format!("{{}}:{port}", host));
 
     server.add_service(service);
 

@@ -10,7 +10,7 @@ permissions:
   contents: read
 jobs:
   pytest:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 10
     env:
       AI_WORKER_BACKEND: disabled
@@ -24,7 +24,7 @@ jobs:
       - run: pip install -r requirements.txt
       - run: python -m pytest -q
   runtime:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 25
     env:
       AI_WORKER_BACKEND: disabled
@@ -35,11 +35,11 @@ jobs:
         with:
           python-version: "3.12"
       - run: rustup toolchain install 1.95.0 --profile minimal && rustup default 1.95.0
-      - run: sudo apt-get update && sudo apt-get install -y cmake pkg-config libssl-dev
+      - run: command -v cmake pkg-config cc && pkg-config --exists openssl
       - run: pip install -r requirements.txt
       - run: python scripts/verify_runtime.py
   compose:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
     env:
       AI_WORKER_BACKEND: disabled

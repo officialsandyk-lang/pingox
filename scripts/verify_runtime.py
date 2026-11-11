@@ -85,6 +85,7 @@ def main():
     if not link.is_symlink(): link.symlink_to(project / "secret.txt")
     env = dict(os.environ)
     env.pop("TRUSTED_PROXY_CIDRS", None)
+    env["GATEWAY_BIND_HOST"] = "127.0.0.1"
     env.setdefault("CARGO_TARGET_DIR", str(Path("tmp/cargo-target").resolve()))
     subprocess.run(["cargo", "build", "--manifest-path", str(project / "Cargo.toml")], env=env, check=True)
     binary = Path(env["CARGO_TARGET_DIR"]) / "debug/generated-pingora-proxy"
