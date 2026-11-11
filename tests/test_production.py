@@ -11,7 +11,7 @@ def example():
     return json.loads(Path("deploy/gateway.example.json").read_text())
 
 
-@pytest.mark.parametrize("address", ["https://example.com:443", "127.0.0.1:9000", "api:70000", "api:0", "api:80/private", "api;echo:80"])
+@pytest.mark.parametrize("address", ["https://example.com:443", "api:70000", "api:0", "api:80/private", "api;echo:80"])
 def test_bad_upstreams_fail_instead_of_silent_repair(address):
     data = example()
     data["routes"][0]["upstreams"][0]["address"] = address

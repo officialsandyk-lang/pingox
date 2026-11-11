@@ -1,5 +1,7 @@
 # Shared AI workers
 
+For additional AI protocols and infrastructure targets, see [PORTABILITY.md](PORTABILITY.md).
+
 The real model calls in `ai/ai_config.py`, `agents/debug_agent.py` and
 `agents/runtime_agent.py` now use `workers/ai_worker.py`. This removes independent
 import-time clients and hard-coded model calls. Legacy import names stay intact
@@ -52,8 +54,7 @@ before; they are not part of the production deployment path.
 
 For offline operation use `AI_WORKER_BACKEND=disabled` and leave
 `AI_REPAIR_BACKEND` unset or also disabled. Supply reviewed JSON to `gateway.py`.
-No worker is needed when serving requests. Unit tests mock both providers; live
-paid model calls and comparative model benchmarks have not been run.
+No worker is needed when serving requests. Unit tests mock both providers; provider quality and latency benchmarks have not been run. A Codex connectivity smoke test has passed.
 
 References: [Codex non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode),
 [Structured outputs](https://developers.openai.com/api/docs/guides/structured-outputs).

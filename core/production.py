@@ -37,8 +37,8 @@ class Upstream(StrictModel):
         match = re.fullmatch(r"([A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?):([0-9]{1,5})", value)
         if not match or not 1 <= int(match[2]) <= 65535:
             raise ValueError("upstream must be an HTTP host:port on a trusted private network; schemes and paths are unsupported")
-        if match[1] in {"0.0.0.0", "localhost", "127.0.0.1"}:
-            raise ValueError("use a reachable service DNS name or private IP, not container loopback")
+        if match[1] == "0.0.0.0":
+            raise ValueError("unspecified address is not an upstream")
         return value
 
 
@@ -86,8 +86,11 @@ class ProductionConfig(StrictModel):
         return self
 
 
-def generate(config: ProductionConfig, output: Path) -> Path:
+def generate(config: ProductionConfig, output: Path, options=None) -> Path:
     from core.project_writer import write_project
+    from core.deployment_targets import DeploymentOptions, write_target, validate_target
+    options = options or DeploymentOptions()
+    validate_target(config, options)
     output = output.resolve()
     if output.exists() and any(output.iterdir()):
         raise ValueError("output must be empty; create a new release directory")
@@ -114,6 +117,9 @@ STOPSIGNAL SIGTERM
 ENTRYPOINT ["/usr/local/bin/gateway"]
 ''')
     (output / ".dockerignore").write_text("*\n!Cargo.toml\n!Cargo.lock\n!src/\n!src/**\n!Dockerfile\n")
+    write_target(output, config.port, options)
+    if options.target != "compose":
+        return output
     (output / "compose.yaml").write_text(f'''services:
   gateway:
     image: ${{GATEWAY_IMAGE:?Set GATEWAY_IMAGE to an immutable release tag or digest}}

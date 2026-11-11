@@ -29,7 +29,7 @@ def run_worker(instructions: str, content: str, *, task: str = "config") -> str:
     """Return a proposal without applying it. Fail closed on incomplete output."""
     if task not in {"config", "repair"}:
         raise WorkerError("Unknown worker task")
-    if len(content.encode()) > 256_000:
+    if len((instructions + content).encode()) > 256_000:
         raise WorkerError("Worker input exceeds 256 KB")
     backend = os.getenv("AI_REPAIR_BACKEND" if task == "repair" else "AI_WORKER_BACKEND",
                         os.getenv("AI_WORKER_BACKEND", "responses"))
@@ -37,8 +37,17 @@ def run_worker(instructions: str, content: str, *, task: str = "config") -> str:
         raise WorkerError("AI workers are disabled; supply a reviewed configuration")
     if backend == "codex":
         return _codex(instructions, content)
+    if backend in {"openai-compatible", "anthropic", "ollama"}:
+        from workers.providers import request_text, ProviderError
+        model = os.getenv("AI_REPAIR_MODEL" if task == "repair" else "AI_CONFIG_MODEL") or os.getenv("AI_MODEL")
+        if not model:
+            raise WorkerError("Set AI_MODEL or the task-specific model for this provider")
+        try:
+            return request_text(backend, instructions, content, model=model, timeout=_timeout())
+        except (ProviderError, OSError) as exc:
+            raise WorkerError(str(exc) if isinstance(exc, ProviderError) else "Cannot read provider secret") from None
     if backend != "responses":
-        raise WorkerError("Worker backend must be responses, codex, or disabled")
+        raise WorkerError("Unknown worker backend: use responses, codex, openai-compatible, anthropic, ollama, or disabled")
     # No credentials or network access are needed just to import the project.
     from openai import OpenAI
 

@@ -50,3 +50,32 @@ jobs:
           python-version: "3.12"
       - run: pip install -r requirements.txt
       - run: bash scripts/verify_compose.sh
+  kubernetes:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      AI_WORKER_BACKEND: disabled
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - run: go install sigs.k8s.io/kind@v0.33.0
+      - run: pip install -r requirements.txt
+      - run: bash scripts/verify_kubernetes.sh
+  systemd:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    env:
+      AI_WORKER_BACKEND: disabled
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: rustup toolchain install 1.95.0 --profile minimal && rustup default 1.95.0
+      - run: pip install -r requirements.txt
+      - run: bash scripts/verify_systemd.sh

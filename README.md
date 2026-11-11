@@ -1,5 +1,7 @@
 # AI Pingora Gateway
 
+Start with [portable setup and provider configuration](docs/PORTABILITY.md) for Compose, containers, Kubernetes and Linux services.
+
 > **New hardened deployment path:** use `gateway.py` and [the Linux Docker Compose runbook](docs/PRODUCTION.md).
 > AI calls now share a bounded worker interface with optional Codex support; see [workers](docs/WORKERS.md).
 > The historical local/development workflows below are retained for compatibility and are not the production entrypoint.
