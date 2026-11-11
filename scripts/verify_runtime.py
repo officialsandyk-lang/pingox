@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import socket
 import subprocess
 import sys
@@ -87,7 +88,8 @@ def main():
     env.pop("TRUSTED_PROXY_CIDRS", None)
     env["GATEWAY_BIND_HOST"] = "127.0.0.1"
     env.setdefault("CARGO_TARGET_DIR", str(Path("tmp/cargo-target").resolve()))
-    subprocess.run(["cargo", "build", "--manifest-path", str(project / "Cargo.toml")], env=env, check=True)
+    shutil.copyfile(Path("deploy/Cargo.lock"), project / "Cargo.lock")
+    subprocess.run(["cargo", "build", "--locked", "--manifest-path", str(project / "Cargo.toml")], env=env, check=True)
     binary = Path(env["CARGO_TARGET_DIR"]) / "debug/generated-pingora-proxy"
     log = (project / "runtime.log").open("w")
     process = subprocess.Popen([str(binary)], cwd=project, env=env, stdout=log, stderr=log)
