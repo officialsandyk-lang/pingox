@@ -59,3 +59,23 @@ def test_secret_file_conflict_is_rejected(monkeypatch, tmp_path):
     monkeypatch.setenv('AI_API_KEY', 'env-key')
     with pytest.raises(ProviderError, match='only'):
         _secret('AI_API_KEY')
+
+
+@pytest.mark.parametrize('status,body,headers', [
+    (302, b'', {'location': 'https://another-provider.example/steal'}),
+    (401, b'private-api-key-do-not-print', {}),
+    (200, b'x' * 512001, {}),
+])
+def test_redirect_auth_and_oversized_failures_are_safe(monkeypatch, status, body, headers):
+    monkeypatch.setenv('AI_BASE_URL', 'https://models.example/v1')
+    monkeypatch.setenv('AI_API_KEY', 'test-only')
+    calls = []
+    def respond(request):
+        calls.append(request.url.host)
+        return httpx.Response(status, content=body, headers=headers)
+    client = httpx.Client
+    monkeypatch.setattr('workers.providers.httpx.Client', lambda **kwargs: client(transport=httpx.MockTransport(respond), **kwargs))
+    with pytest.raises(ProviderError) as error:
+        request_text('openai-compatible', 'rules', 'input', model='x', timeout=5)
+    assert calls == ['models.example']
+    assert 'private-api-key' not in str(error.value)

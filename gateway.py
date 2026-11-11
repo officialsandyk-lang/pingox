@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from pydantic import ValidationError
 from core.production import ProductionConfig, generate
 from core.deployment_targets import DeploymentOptions, TARGETS
 from workers.ai_worker import run_worker, json_object
@@ -70,6 +71,10 @@ def main() -> None:
             print("Build and test the release image using the included Cargo.lock. See docs/PRODUCTION.md.")
         else:
             print("Configuration is valid")
+    except ValidationError as exc:
+        details = "\n".join(".".join(str(v) for v in e["loc"]) + ": " + e["msg"]
+                            for e in exc.errors(include_input=False, include_url=False))
+        parser.exit(1, "Configuration invalid:\n" + details + "\n")
     except (ValueError, OSError, RuntimeError) as exc:
         parser.exit(1, f"Error: {exc}\n")
 

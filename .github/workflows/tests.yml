@@ -63,6 +63,7 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: stable
+          cache: false
       - run: go install sigs.k8s.io/kind@v0.33.0
       - run: pip install -r requirements.txt
       - run: bash scripts/verify_kubernetes.sh

@@ -54,3 +54,14 @@ def test_init_and_generate_cli(tmp_path):
     subprocess.run([sys.executable, 'gateway.py', 'init', '--directory', str(root), '--target', 'kubernetes', '--image', 'gateway:v1'], check=True)
     subprocess.run([sys.executable, 'gateway.py', 'generate', '--config', str(root/'gateway.json'), '--deployment', str(root/'deployment.json'), '--output', str(root/'release')], check=True)
     assert (root/'release/kubernetes.yaml').exists()
+
+
+def test_cli_validation_errors_do_not_print_secret_values(tmp_path):
+    path = tmp_path / 'invalid.json'
+    value = config().model_dump()
+    value['api_key'] = 'VERY_SECRET_MUST_NOT_APPEAR'
+    path.write_text(json.dumps(value))
+    result = subprocess.run([sys.executable, 'gateway.py', 'validate', '--config', str(path)], capture_output=True, text=True)
+    assert result.returncode != 0
+    assert 'VERY_SECRET' not in result.stderr
+    assert 'api_key' in result.stderr
