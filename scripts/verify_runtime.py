@@ -190,9 +190,10 @@ def main():
         missing = subprocess.run([str(binary)], cwd=project, env=missing_env, stdout=log, stderr=log, timeout=10)
         assert missing.returncode != 0, "authentication must fail closed without credentials"
         import secrets
-        key, rotated = secrets.token_hex(32), secrets.token_hex(32)
+        key, rotated, scoped = secrets.token_hex(32), secrets.token_hex(32), secrets.token_hex(32)
         keyfile = project / "api-keys.json"
-        keyfile.write_text(json.dumps([key, rotated]))
+        keyfile.write_text(json.dumps([key, rotated, {"id": "reader", "key": scoped,
+            "routes": ["/rr"], "methods": ["GET"], "rate_limit_per_minute": 2}]))
         keyfile.chmod(0o600)
         assert key not in (project / "src/main.rs").read_text()
         env["PINGOX_API_KEYS_FILE"] = str(keyfile)
@@ -209,6 +210,9 @@ def main():
         for token in [key, rotated]:
             status, body = request("/rr", headers={"X-Pingox-Api-Key": token})
             assert status == 200 and json.loads(body)["gateway_key"] is None
+        assert request("/weighted", headers={"X-Pingox-Api-Key": scoped})[0] == 403
+        assert request("/rr", "POST", b"", headers={"X-Pingox-Api-Key": scoped})[0] == 403
+        assert [request("/rr", headers={"X-Pingox-Api-Key": scoped})[0] for _ in range(3)] == [200, 200, 429]
         conn = http.client.HTTPConnection("127.0.0.1", gateway_port, timeout=4)
         conn.putrequest("GET", "/rr")
         conn.putheader("X-Pingox-Api-Key", key)

@@ -38,7 +38,7 @@ def build_release(config_path: Path, output: Path) -> Path:
     return release
 
 
-def run_release(release: Path, bind: str = '127.0.0.1') -> None:
+def run_release(release: Path, bind: str = '127.0.0.1', state_dir: Path | None = None) -> None:
     host = str(ipaddress.IPv4Address(bind))
     release = release.resolve(strict=True)
     manifest = json.loads((release / 'native-release.json').read_text())
@@ -49,4 +49,6 @@ def run_release(release: Path, bind: str = '127.0.0.1') -> None:
         raise ValueError('Release changed after build; build a new release before running')
     # Replace Python so SIGTERM and exit status belong directly to Pingora.
     env = dict(os.environ, GATEWAY_BIND_HOST=host)
+    if state_dir is not None:
+        env['PINGOX_CONFIG_FILE'] = str((state_dir / 'active.json').resolve(strict=True))
     os.execve(str(binary), [str(binary)], env)

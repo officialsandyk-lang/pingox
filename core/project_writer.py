@@ -221,6 +221,8 @@ def normalize_upstream_item(item: Any) -> dict[str, Any]:
         return {
             "address": normalize_upstream_address(address),
             "weight": weight,
+            **({"tls": bool(item["tls"])} if "tls" in item else {}),
+            **({"server_name": str(item["server_name"])} if "server_name" in item else {}),
         }
 
     return {
@@ -395,6 +397,8 @@ def merge_routes_for_generation(routes: list[dict[str, Any]]) -> list[dict[str, 
                     {
                         "address": address,
                         "weight": weight,
+                        **({"tls": upstream["tls"]} if "tls" in upstream else {}),
+                        **({"server_name": upstream["server_name"]} if "server_name" in upstream else {}),
                     }
                 )
             else:
@@ -1235,11 +1239,15 @@ edition = "2021"
 [dependencies]
 async-trait = "0.1"
 bytes = "1"
-pingora = { version = "=0.9.1", features = ["proxy"] }
+pingora = { version = "=0.9.1", features = ["proxy", "rustls"] }
 tokio = { version = "1", features = ["fs", "net"] }
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 ipnet = "2"
 subtle = "=2.6.1"
+rustls-pki-types = { version = "1", features = ["std"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+x509-parser = "=0.16.0"
 """
 
 
@@ -1272,6 +1280,8 @@ def render_route_configs(config: dict[str, Any]) -> str:
                 f"""UpstreamConfig {{
             address: {rust_string(address)}.to_string(),
             weight: {weight},
+            tls: {str(bool(upstream.get("tls", False))).lower()},
+            server_name: {rust_string(upstream.get("server_name", ""))}.to_string(),
         }}"""
             )
 
@@ -1332,7 +1342,7 @@ def render_main_rs(
     routes_rs = render_route_configs(config)
     security_rs = render_security_config(config)
 
-    return f"""use async_trait::async_trait;
+    source = f"""use async_trait::async_trait;
 use bytes::Bytes;
 use subtle::ConstantTimeEq;
 use pingora::http::ResponseHeader;
@@ -1343,10 +1353,16 @@ use std::sync::atomic::{{AtomicUsize, Ordering}};
 use std::sync::{{Arc, Mutex}};
 use std::time::{{Duration, Instant, SystemTime, UNIX_EPOCH}};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpstreamConfig {{
     address: String,
+    #[serde(default = "default_weight")]
     weight: usize,
+    #[serde(default)]
+    tls: bool,
+    #[serde(default)]
+    server_name: String,
 }}
 
 #[derive(Clone, Debug)]
@@ -1359,7 +1375,8 @@ struct RouteConfig {{
     upstreams: Vec<UpstreamConfig>,
 }}
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 struct SecurityConfig {{
     blocked_paths: Vec<String>,
     allowed_methods: Vec<String>,
@@ -1393,6 +1410,8 @@ struct RequestContext {{
     started: Instant,
     selected: Option<(usize, usize, usize)>,
     dns_failed: bool,
+    snapshot: Option<Arc<Runtime>>,
+    consumer: Option<String>,
 }}
 
 impl Drop for RequestContext {{
@@ -1402,8 +1421,8 @@ impl Drop for RequestContext {{
     }}
 }}
 
-#[derive(Clone)]
-struct GeneratedProxy {{
+#[derive(Clone, Debug)]
+struct Runtime {{
     routes: Arc<Vec<RouteConfig>>,
     counters: Arc<Vec<AtomicUsize>>,
     upstream_loads: Arc<Vec<Vec<Arc<AtomicUsize>>>>,
@@ -1411,7 +1430,8 @@ struct GeneratedProxy {{
     security: SecurityConfig,
     rate_limiter: Arc<Mutex<HashMap<String, RateBucket>>>,
     health: Arc<Mutex<Vec<Vec<BackendHealth>>>>,
-    api_keys: Arc<Vec<Vec<u8>>>,
+    api_keys: Arc<Vec<ApiCredential>>,
+    client_identity: Option<Arc<pingora::utils::tls::CertKey>>,
     completed: Arc<AtomicUsize>,
     failed: Arc<AtomicUsize>,
 }}
@@ -1447,8 +1467,14 @@ fn safe_static_path(root: &str, relative_path: &str, index: &str) -> Option<Path
     Some(canonical)
 }}
 
-impl GeneratedProxy {{
+impl Runtime {{
     fn new(routes: Vec<RouteConfig>, security: SecurityConfig) -> Self {{
+        let keys = load_api_keys(security.require_api_key).expect("invalid API key configuration");
+        let mut runtime = Self::with_keys(routes, security, keys);
+        runtime.client_identity = load_client_identity().expect("invalid client TLS identity");
+        runtime
+    }}
+    fn with_keys(routes: Vec<RouteConfig>, security: SecurityConfig, api_keys: Vec<ApiCredential>) -> Self {{
         let counters = routes
             .iter()
             .map(|_| AtomicUsize::new(0))
@@ -1465,12 +1491,12 @@ impl GeneratedProxy {{
             }})
             .collect::<Vec<_>>();
 
-        let api_keys = load_api_keys(security.require_api_key);
         let health = routes.iter().map(|r| r.upstreams.iter()
             .map(|_| BackendHealth::default()).collect()).collect();
         Self {{
             health: Arc::new(Mutex::new(health)),
             api_keys: Arc::new(api_keys),
+            client_identity: None,
             completed: Arc::new(AtomicUsize::new(0)),
             failed: Arc::new(AtomicUsize::new(0)),
             routes: Arc::new(routes),
@@ -1559,7 +1585,7 @@ impl GeneratedProxy {{
         Ok(true)
     }}
 
-    fn select_upstream(&self, route_index: usize, session: &Session, ctx: &mut RequestContext) -> Option<String> {{
+    fn select_upstream(&self, route_index: usize, session: &Session, ctx: &mut RequestContext) -> Option<UpstreamConfig> {{
         let route = self.routes.get(route_index)?;
 
         if route.upstreams.is_empty() {{
@@ -1602,7 +1628,7 @@ impl GeneratedProxy {{
         let counter = self.upstream_loads[route_index][selected].clone();
         counter.fetch_add(1, Ordering::Relaxed);
         ctx.upstream = Some(counter);
-        Some(route.upstreams[selected].address.clone())
+        Some(route.upstreams[selected].clone())
     }}
 
     fn select_round_robin_index(&self, route_index: usize, len: usize) -> usize {{
@@ -1688,7 +1714,9 @@ impl GeneratedProxy {{
     }}
 
     fn check_rate_limit(&self, client_key: &str) -> bool {{
-        let limit = self.security.rate_limit_per_minute;
+        self.check_quota(client_key, self.security.rate_limit_per_minute)
+    }}
+    fn check_quota(&self, client_key: &str, limit: usize) -> bool {{
 
         if limit == 0 {{
             return true;
@@ -1741,19 +1769,15 @@ fn parse_upstream(upstream: &str) -> (String, u16) {{
     (host.to_string(), port)
 }}
 
-fn load_api_keys(required: bool) -> Vec<Vec<u8>> {{
-    if !required {{ return Vec::new(); }}
-    let path = std::env::var("PINGOX_API_KEYS_FILE").expect("PINGOX_API_KEYS_FILE is required");
-    let file = std::fs::File::open(path).expect("cannot open API key file");
+fn load_api_keys(required: bool) -> std::result::Result<Vec<ApiCredential>, String> {{
+    if !required {{ return Ok(Vec::new()); }}
+    let path = std::env::var("PINGOX_API_KEYS_FILE").map_err(|_| "PINGOX_API_KEYS_FILE is required")?;
+    let file = std::fs::File::open(path).map_err(|_| "cannot open API key file")?;
     use std::io::Read;
     let mut bytes = Vec::new();
-    file.take(16385).read_to_end(&mut bytes).expect("cannot read API key file");
-    assert!(bytes.len() <= 16384, "API key file too large");
-    let keys: Vec<String> = serde_json::from_slice(&bytes).unwrap_or_else(|_| panic!("API key file must be a JSON array"));
-    assert!(!keys.is_empty() && keys.len() <= 64, "provide 1 to 64 API keys");
-    assert!(keys.iter().all(|key| key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit())),
-        "API keys must each be 64 hex characters");
-    keys.into_iter().map(|key| key.into_bytes()).collect()
+    file.take(16385).read_to_end(&mut bytes).map_err(|_| "cannot read API key file")?;
+    if bytes.len() > 16384 {{ return Err("API key file too large".into()); }}
+    parse_credentials(&bytes)
 }}
 
 fn trusted_proxy(session: &Session) -> bool {{
@@ -1778,11 +1802,11 @@ fn client_key(session: &Session) -> String {{
 }}
 
 #[async_trait]
-impl ProxyHttp for GeneratedProxy {{
+impl ProxyHttp for Runtime {{
     type CTX = RequestContext;
 
     fn new_ctx(&self) -> Self::CTX {{
-        RequestContext {{ body_bytes: 0, active: None, upstream: None, started: Instant::now(), selected: None, dns_failed: false }}
+        RequestContext {{ body_bytes: 0, active: None, upstream: None, started: Instant::now(), selected: None, dns_failed: false, snapshot: None, consumer: None }}
     }}
 
     async fn request_filter(
@@ -1877,9 +1901,25 @@ impl ProxyHttp for GeneratedProxy {{
             let supplied = values.next().map(|h| h.as_bytes()).unwrap_or(&[]);
             let duplicate = values.next().is_some();
             let mut valid = subtle::Choice::from(0);
-            for key in self.api_keys.iter() {{ valid |= key.as_slice().ct_eq(supplied); }}
+            let mut matched = None;
+            for (index, credential) in self.api_keys.iter().enumerate() {{
+                let equal = credential.key.as_slice().ct_eq(supplied);
+                valid |= equal;
+                if bool::from(equal) {{ matched = Some(index); }}
+            }}
             if duplicate || !bool::from(valid) {{
                 session.respond_error(401).await?;
+                return Ok(true);
+            }}
+            let credential = &self.api_keys[matched.expect("matched credential")];
+            ctx.consumer = Some(credential.id.clone());
+            if !credential.methods.contains(&method) || !credential.routes.iter().any(|prefix|
+                prefix == "/" || path == *prefix || path.starts_with(&format!("{{}}/", prefix))) {{
+                session.respond_error(403).await?;
+                return Ok(true);
+            }}
+            if !self.check_quota(&format!("consumer:{{}}", credential.id), credential.quota) {{
+                session.respond_error(429).await?;
                 return Ok(true);
             }}
         }}
@@ -1909,8 +1949,12 @@ impl ProxyHttp for GeneratedProxy {{
 
     async fn upstream_request_filter(
         &self, session: &mut Session, request: &mut pingora::http::RequestHeader,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> Result<()> {{
+        if let Some((route, backend, _)) = ctx.selected {{
+            let upstream = &self.routes[route].upstreams[backend];
+            if upstream.tls {{ request.insert_header("host", upstream.server_name.clone())?; }}
+        }}
         let ip = client_key(session);
         let proto = if trusted_proxy(session) && session.req_header().headers.get("x-forwarded-proto")
             .and_then(|h| h.to_str().ok()) == Some("https") {{ "https" }} else {{ "http" }};
@@ -1961,7 +2005,7 @@ impl ProxyHttp for GeneratedProxy {{
         }}
         // Do not log credentials, query strings, bodies, or backend error payloads.
         println!("{{}}", serde_json::json!({{
-            "event": "request", "method": session.req_header().method.as_str(),
+            "event": "request", "consumer": ctx.consumer, "method": session.req_header().method.as_str(),
             "status": session.response_written().map(|r| r.status.as_u16()),
             "duration_ms": ctx.started.elapsed().as_millis(), "failed": error.is_some(),
         }}));
@@ -1980,7 +2024,7 @@ impl ProxyHttp for GeneratedProxy {{
             .select_upstream(route_index, session, ctx)
             .ok_or_else(|| Error::new(ErrorType::HTTPStatus(503)))?;
 
-        let (host, port) = parse_upstream(upstream.as_str());
+        let (host, port) = parse_upstream(upstream.address.as_str());
 
         // Async DNS avoids blocking worker threads and HttpPeer's resolving constructor.
         let address = tokio::time::timeout(Duration::from_secs(self.security.upstream_timeout_seconds),
@@ -1988,7 +2032,8 @@ impl ProxyHttp for GeneratedProxy {{
             .map_err(|_| {{ ctx.dns_failed = true; Error::new(ErrorType::HTTPStatus(504)) }})?
             .map_err(|_| {{ ctx.dns_failed = true; Error::new(ErrorType::HTTPStatus(502)) }})?
             .next().ok_or_else(|| {{ ctx.dns_failed = true; Error::new(ErrorType::HTTPStatus(502)) }})?;
-        let mut peer = Box::new(HttpPeer::new(address, false, String::new()));
+        let mut peer = Box::new(HttpPeer::new(address, upstream.tls, upstream.server_name.clone()));
+        if upstream.tls {{ peer.client_cert_key = self.client_identity.clone(); }}
         let timeout = Some(Duration::from_secs(self.security.upstream_timeout_seconds));
         peer.options.connection_timeout = timeout;
         peer.options.total_connection_timeout = timeout;
@@ -2008,32 +2053,10 @@ fn build_security() -> SecurityConfig {{
     {security_rs}
 }}
 
-fn main() {{
-    let routes = build_routes();
-    let security = build_security();
 
-    let proxy = GeneratedProxy::new(routes, security);
-
-    let mut server = Server::new(None).unwrap();
-    let conf = Arc::get_mut(&mut server.configuration).expect("exclusive startup configuration");
-    conf.grace_period_seconds = Some(5);
-    conf.graceful_shutdown_timeout_seconds = Some(30);
-    conf.threads = 2;
-    conf.max_retries = 1; // No automatic replay of non-idempotent API requests.
-    server.bootstrap();
-
-    let mut service = http_proxy_service(&server.configuration, proxy);
-    let host = std::env::var("GATEWAY_BIND_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
-    let host: std::net::Ipv4Addr = host.parse().expect("invalid GATEWAY_BIND_HOST");
-    service.add_tcp(&format!("{{}}:{port}", host));
-
-    server.add_service(service);
-
-    println!("🚀 Starting Pingox gateway on port {port}");
-
-    server.run_forever();
-}}
 """
+
+    return source + Path(__file__).with_name("runtime_control.rs").read_text().replace("__PORT__", str(port))
 
 
 def write_project(

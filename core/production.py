@@ -30,13 +30,24 @@ def checked_path(value: str) -> str:
 class Upstream(StrictModel):
     address: str
     weight: int = Field(default=1, ge=1, le=1000)
+    tls: bool = False
+    server_name: str = ""
+
+    @model_validator(mode="after")
+    def check_tls(self):
+        if self.tls:
+            if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?", self.server_name):
+                raise ValueError("TLS requires a valid server_name for certificate verification")
+        elif self.server_name:
+            raise ValueError("server_name requires TLS")
+        return self
 
     @field_validator("address")
     @classmethod
     def valid_address(cls, value: str) -> str:
         match = re.fullmatch(r"([A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?):([0-9]{1,5})", value)
         if not match or not 1 <= int(match[2]) <= 65535:
-            raise ValueError("upstream must be an HTTP host:port on a trusted private network; schemes and paths are unsupported")
+            raise ValueError("upstream must be host:port; configure TLS separately, schemes and paths are unsupported")
         if match[1] == "0.0.0.0":
             raise ValueError("unspecified address is not an upstream")
         return value
@@ -76,6 +87,7 @@ class Security(StrictModel):
 
 
 class ProductionConfig(StrictModel):
+    revision: int = Field(default=1, ge=1, le=9007199254740991)
     port: int = Field(default=8080, ge=1024, le=65535)
     routes: list[Route] = Field(min_length=1, max_length=1024)
     security: Security = Field(default_factory=Security)
@@ -91,6 +103,7 @@ class ProductionConfig(StrictModel):
 
 def generate(config: ProductionConfig, output: Path, options=None) -> Path:
     from core.project_writer import write_project
+    from core.runtime_deployment import write_runtime
     from core.deployment_targets import DeploymentOptions, write_target, validate_target
     options = options or DeploymentOptions()
     validate_target(config, options)
@@ -114,17 +127,20 @@ RUN cargo build --locked --release
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 curl && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
+COPY runtime/active.json /etc/pingox/runtime/active.json
+ENV PINGOX_CONFIG_FILE=/etc/pingox/runtime/active.json
 COPY --from=build /build/target/release/generated-pingora-proxy /usr/local/bin/gateway
 USER 65532:65532
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/usr/local/bin/gateway"]
 ''')
-    (output / ".dockerignore").write_text("*\n!Cargo.toml\n!Cargo.lock\n!src/\n!src/**\n!Dockerfile\n")
+    (output / ".dockerignore").write_text("*\n!Cargo.toml\n!Cargo.lock\n!src/\n!src/**\n!runtime/\n!runtime/active.json\n!Dockerfile\n")
     write_target(output, config.port, options)
     if options.target != "compose":
         if config.security.require_api_key:
             from core.credentials import write_credentials
             write_credentials(output, options.target)
+        write_runtime(output, config, options)
         return output
     (output / "compose.yaml").write_text(f'''services:
   gateway:
@@ -216,4 +232,5 @@ GATEWAY_NETWORK_CIDR=172.30.50.0/24
     if config.security.require_api_key:
         from core.credentials import write_credentials
         write_credentials(output, options.target)
+    write_runtime(output, config, options)
     return output

@@ -34,8 +34,9 @@ cp deploy/gateway.example.json gateway-production.json
 ```
 
 Edit `gateway-production.json`: use the actual backend service DNS names and ports
-on your backend network. Upstreams are HTTP on a trusted private network. HTTPS
-upstreams, IPv6 destinations, WebSockets, encoded URL paths and static sites are
+on your backend network. Upstreams can use HTTP on a trusted private network or verified HTTPS with
+`tls` and `server_name` (see ENTERPRISE_DEPLOYMENT.md). IPv6 destinations,
+WebSockets, encoded URL paths and static sites are
 not supported by the strict production configuration. Unsupported inputs fail
 instead of being silently rewritten. Query strings are forwarded unchanged.
 

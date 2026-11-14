@@ -35,15 +35,66 @@ def main() -> None:
     run = commands.add_parser("run", help="Run a built native release in the foreground")
     run.add_argument("--release", type=Path, required=True)
     run.add_argument("--bind", default="127.0.0.1", help="IPv4 listener address; defaults to loopback")
+    run.add_argument("--state-dir", type=Path, help="Watch this directory's active.json at runtime")
+    for name in ("apply", "rollback"):
+        sub = commands.add_parser(name, help="Publish or roll back local runtime configuration")
+        sub.add_argument("--state-dir", type=Path, required=True)
+        sub.add_argument("--expect-revision", type=int, required=True)
+        if name == "apply":
+            sub.add_argument("--config", type=Path, required=True)
+    status = commands.add_parser("status", help="Read local runtime configuration status")
+    status.add_argument("--port", type=int, default=8080)
+    bundle = commands.add_parser("package", help="Sign and package a native release")
+    bundle.add_argument("--release", type=Path, required=True)
+    bundle.add_argument("--output", type=Path, required=True)
+    bundle.add_argument("--signing-key", type=Path, required=True)
+    bundle.add_argument("--version", required=True)
+    for name in ("install", "rollback-release"):
+        sub = commands.add_parser(name, help="Verify and select a native release; service restart is separate")
+        sub.add_argument("--root", type=Path, required=True)
+        sub.add_argument("--public-key", type=Path, required=True)
+        if name == "install":
+            sub.add_argument("--bundle", type=Path, required=True)
     args = parser.parse_args()
     try:
+        if args.command == "package":
+            from core.release_bundle import package
+            package(args.release, args.output, args.signing_key, args.version)
+            print(f"Signed bundle created: {args.output}")
+            return
+        if args.command in {"install", "rollback-release"}:
+            from core.release_bundle import install, rollback
+            version = (install(args.bundle, args.root, args.public_key) if args.command == "install"
+                       else rollback(args.root, args.public_key))
+            print(f"Verified release {version} selected. Restart your managed service and verify health.")
+            return
+        if args.command == "status":
+            import http.client
+            if not 1024 <= args.port <= 65535:
+                raise ValueError("invalid port")
+            conn = http.client.HTTPConnection("127.0.0.1", args.port, timeout=3)
+            try:
+                conn.request("GET", "/_gateway/config")
+                response = conn.getresponse()
+                if response.status != 200:
+                    raise RuntimeError("gateway status unavailable")
+                print(json.dumps(json.loads(response.read(4096)), indent=2))
+            finally:
+                conn.close()
+            return
+        if args.command in {"apply", "rollback"}:
+            from core.config_store import publish, read_config
+            config = read_config(args.config) if args.command == "apply" else None
+            result = publish(args.state_dir, config, args.expect_revision)
+            print(f"Published revision {result.revision}. Use 'pingox.py status --port {result.port}' to verify runtime acceptance.")
+            return
         if args.command in {"build", "run"}:
             from core.local_service import build_release, run_release
             if args.command == "build":
                 output = build_release(args.config, args.output)
                 print(f"Native release built: {output}. Run with: python pingox.py run --release {output}")
             else:
-                run_release(args.release, args.bind)
+                run_release(args.release, args.bind, args.state_dir)
             return
         if args.command == "doctor":
             import shutil

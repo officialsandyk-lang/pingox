@@ -12,8 +12,9 @@ Keep the file outside this release/build directory, with restricted permissions.
 Send a key in `X-Pingox-Api-Key` over HTTPS. The gateway strips that header before
 proxying. Keys are loaded at startup; restart after rotating the file. Keep old
 and new keys during a planned overlap, then remove the old key and restart.
-Do not commit keys. This provides shared-key admission, not user identities,
-scopes, JWT validation, per-consumer quotas or application authorization.
+Do not commit keys. Scoped records also support credential IDs, route/method restrictions and
+per-process quotas; see docs/ENTERPRISE_DEPLOYMENT.md. JWT and application
+authorization remain external.
 Health/readiness/metrics remain internal unauthenticated endpoints: block the
 entire /_gateway path at public ingress, as the generated Caddy config does.
 

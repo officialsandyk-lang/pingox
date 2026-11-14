@@ -7,6 +7,7 @@ without Python, an AI provider or a hosted account.
 **Status: hardened release candidate for staged evaluation.** Production suitability
 must be validated against your traffic, security requirements and operating model.
 
+- [Enterprise deployment: live config, TLS/mTLS, scoped keys and signed releases](docs/ENTERPRISE_DEPLOYMENT.md)
 - [Operations, API keys, failure isolation and monitoring](docs/PINGOX_OPERATIONS.md)
 - [Portable deployment: Docker Compose, Kubernetes, containers and Linux services](docs/PORTABILITY.md)
 - [Production Compose runbook](docs/PRODUCTION.md)
@@ -22,8 +23,9 @@ python pingox.py run --release releases/v1
 ```
 
 Install the Python requirements and native build prerequisites first; see the guides.
-The default native listener is loopback. Routes are currently compiled into each
-release; changes require a rebuild and restart. The previous `gateway.py` command
+The default native listener is loopback. Set `PINGOX_CONFIG_FILE` or use
+`run --state-dir` for validated live updates; generated deployments enable runtime
+configuration. Binary upgrades and listener port changes require a managed restart. The previous `gateway.py` command
 and internal artifact/service names remain compatible.
 
 The material below describes historical development workflows. Use the strict

@@ -80,3 +80,36 @@ jobs:
       - run: rustup toolchain install 1.95.0 --profile minimal && rustup default 1.95.0
       - run: pip install -r requirements.txt
       - run: bash scripts/verify_systemd.sh
+
+  enterprise:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    env:
+      AI_WORKER_BACKEND: disabled
+      LANGSMITH_TRACING: "false"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: rustup toolchain install 1.95.0 --profile minimal && rustup default 1.95.0
+      - run: command -v cmake pkg-config cc openssl
+      - run: pip install -r requirements.txt
+      - run: python scripts/verify_enterprise.py
+  security:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install pip-audit==2.10.1
+      - run: pip-audit -r requirements.txt --no-deps --disable-pip
+      - run: rustup toolchain install 1.95.0 --profile minimal && rustup default 1.95.0
+      - run: cargo install cargo-audit --locked --version 0.22.2
+      - run: cargo audit --file deploy/Cargo.lock

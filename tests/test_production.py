@@ -33,7 +33,7 @@ def test_weighted_pool_preserved_and_deploy_has_no_demo(tmp_path):
     data["routes"][0]["upstreams"] = [{"address": "api-a:8000", "weight": 5}, {"address": "api-b:8000", "weight": 2}]
     generate(ProductionConfig.model_validate(data), tmp_path)
     config = json.loads((tmp_path / "config.json").read_text())
-    assert config["routes"][0]["upstreams"] == data["routes"][0]["upstreams"]
+    assert config["routes"][0]["upstreams"] == ProductionConfig.model_validate(data).model_dump()["routes"][0]["upstreams"]
     compose = yaml.safe_load((tmp_path / "compose.yaml").read_text())
     assert set(compose["services"]) == {"gateway", "edge"}
     gateway = compose["services"]["gateway"]

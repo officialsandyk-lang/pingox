@@ -31,6 +31,7 @@ python gateway.py generate --config "$release_dir/config.json" --target systemd 
 cargo build --locked --manifest-path "$release_dir/release/Cargo.toml"
 sudo install -D "$release_dir/release/target/debug/generated-pingora-proxy" /opt/ai-pingora-gateway/current/gateway
 sudo install -m 644 "$release_dir/release/ai-pingora-gateway.service" /etc/systemd/system/ai-pingora-gateway.service
+sudo install -D -m 644 "$release_dir/release/runtime/active.json" /opt/ai-pingora-gateway/current/runtime/active.json
 sudo systemd-analyze verify /etc/systemd/system/ai-pingora-gateway.service
 mkdir -p "$release_dir/backend/api"
 echo backend-ok > "$release_dir/backend/api/index.html"

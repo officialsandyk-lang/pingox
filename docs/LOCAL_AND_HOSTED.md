@@ -60,14 +60,11 @@ restart, logs and shutdown. No existing Docker workloads are modified.
 
 ## Remaining product work
 
-This is a native service foundation, not a finished hosted product. Configuration
-is still compiled into releases: edit, build a new version, deploy and restart.
-A single instance restart can interrupt service. No `reload` command or zero-downtime
-promise is made. Runtime configuration with atomic validation/rollback should
-precede automatic remote updates. Signed release artifacts, installers, package
-repositories, upgrade/rollback integration tests and ARM64 CI are still needed
-for a one-command public install. The hosted dashboard and enrollment agent are
-not implemented yet.
+The native service now supports live configuration, verified TLS/mTLS, scoped API
+keys, signed bundles and reversible installation. See ENTERPRISE_DEPLOYMENT.md for
+exact commands and tested boundaries. The hosted dashboard and enrollment agent
+remain separate, unimplemented products. OS package repositories and automatic
+fleet-wide software upgrades are not supplied.
 
 AI worker provider support means configuration-generation integrations. It does
 not yet mean that the proxy translates or normalizes every AI provider's inference

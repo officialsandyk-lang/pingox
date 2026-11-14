@@ -61,8 +61,9 @@ are JSON arrays of 64-character random hex strings, read from
 `X-Pingox-Api-Key` is checked using constant-time comparison and removed before
 forwarding; duplicate headers are rejected. The separate backend Authorization
 header is preserved. Use HTTPS at ingress. Rotate with overlapping keys and a
-rolling restart. API keys are shared admission credentials, not per-user policy,
-JWT/OIDC validation, tenant isolation or per-key quotas.
+rolling restart or a new runtime revision, depending on the secret mount. Scoped
+credential records support route/method restrictions and per-process quotas; see
+ENTERPRISE_DEPLOYMENT.md. JWT/OIDC and application authorization remain external.
 
 ## Release acceptance
 
@@ -77,6 +78,6 @@ Before customer cutover: run application-specific integration and sustained load
 tests, restore a backup and roll back a release, validate real TLS/secret rotation,
 scan the final image and dependencies, and agree incident ownership. No throughput
 number, uptime SLA or universal-provider compatibility is established by smoke tests.
-HTTPS upstreams, runtime configuration reload, active health probing, JWT/OIDC,
-WebSockets, distributed quotas, audited releases and the hosted dashboard remain
+Active health probing, JWT/OIDC, WebSockets, distributed quotas, independent
+security certification and the hosted dashboard remain
 outside this release's supported feature set.
