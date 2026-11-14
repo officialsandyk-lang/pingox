@@ -1,4 +1,6 @@
-# Portable deployment and AI providers
+# Pingox: portable deployment and AI providers
+
+See [operations](PINGOX_OPERATIONS.md) for API keys, passive failure isolation and monitoring.
 
 Portability is a set of tested contracts, not a guarantee that every provider or
 platform implements the same API. The gateway data plane requires no AI provider

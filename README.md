@@ -1,19 +1,34 @@
-# AI Pingora Gateway
+# Pingox
 
-For the NGINX-like local service and optional hosted product direction, see [local and hosted deployment](docs/LOCAL_AND_HOSTED.md). Native releases now support `gateway.py build` and `gateway.py run`.
+An open-source load balancer and API gateway built on Cloudflare Pingora, with
+optional AI-assisted configuration. Apache-2.0 licensed. The data plane runs
+without Python, an AI provider or a hosted account.
 
-Start with [portable setup and provider configuration](docs/PORTABILITY.md) for Compose, containers, Kubernetes and Linux services.
+**Status: hardened release candidate for staged evaluation.** Production suitability
+must be validated against your traffic, security requirements and operating model.
 
-> **New hardened deployment path:** use `gateway.py` and [the Linux Docker Compose runbook](docs/PRODUCTION.md).
-> AI calls now share a bounded worker interface with optional Codex support; see [workers](docs/WORKERS.md).
-> The historical local/development workflows below are retained for compatibility and are not the production entrypoint.
+- [Operations, API keys, failure isolation and monitoring](docs/PINGOX_OPERATIONS.md)
+- [Portable deployment: Docker Compose, Kubernetes, containers and Linux services](docs/PORTABILITY.md)
+- [Production Compose runbook](docs/PRODUCTION.md)
+- [Local service and optional hosted management](docs/LOCAL_AND_HOSTED.md)
+- [AI providers and Codex workers](docs/WORKERS.md)
 
-AI Pingora Gateway is an AI-powered Pingora application gateway and load-balancer generator.
+```sh
+python pingox.py init --directory my-gateway --target systemd
+# Edit my-gateway/gateway.json with your actual backend addresses.
+python pingox.py validate --config my-gateway/gateway.json
+python pingox.py build --config my-gateway/gateway.json --output releases/v1
+python pingox.py run --release releases/v1
+```
 
-It converts natural-language infrastructure prompts into a working Rust + Pingora gateway with static webserver routes, reverse-proxy routes, load-balancing algorithms, security controls, staged local updates, reliability reporting, and early self-healing workflows.
+Install the Python requirements and native build prerequisites first; see the guides.
+The default native listener is loopback. Routes are currently compiled into each
+release; changes require a rebuild and restart. The previous `gateway.py` command
+and internal artifact/service names remain compatible.
 
-> Status: private production-stage development.  
-> Local runtime and staged local updates are stable. Docker, Docker Compose, blue/green deployment, and production deployment testing are the next phase.
+The material below describes historical development workflows. Use the strict
+Pingox CLI and deployment guides above for evaluated releases; the legacy
+self-healing scripts can start demos or rewrite generated code.
 
 ---
 

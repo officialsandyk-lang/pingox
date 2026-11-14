@@ -1,4 +1,4 @@
-"""Production CLI: propose -> review -> validate -> generate. Never auto-deploy."""
+"""Pingox: propose, validate, build and run a Pingora-powered gateway."""
 from __future__ import annotations
 import argparse
 import json
@@ -41,7 +41,7 @@ def main() -> None:
             from core.local_service import build_release, run_release
             if args.command == "build":
                 output = build_release(args.config, args.output)
-                print(f"Native release built: {output}. Run with: python gateway.py run --release {output}")
+                print(f"Native release built: {output}. Run with: python pingox.py run --release {output}")
             else:
                 run_release(args.release, args.bind)
             return

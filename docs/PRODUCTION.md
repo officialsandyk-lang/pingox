@@ -74,7 +74,7 @@ release pipeline if bit-for-bit base-image reproducibility is required.
 
 Open TCP 80/443 to clients, keep administrative access restricted, and ensure the
 server can reach the certificate authority. Your backend must authenticate and
-authorize application requests; this gateway does not implement JWT or API keys.
+authorize application requests; optional gateway API keys provide admission only; JWT and application authorization remain your backend’s responsibility. See PINGOX_OPERATIONS.md.
 
 ```sh
 docker compose -p ai-gateway config --quiet

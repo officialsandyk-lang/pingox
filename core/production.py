@@ -65,6 +65,9 @@ class Security(StrictModel):
     max_connections: int = Field(default=1000, ge=1, le=100000)
     max_request_body_bytes: int = Field(default=1048576, ge=1, le=1073741824)
     upstream_timeout_seconds: int = Field(default=30, ge=1, le=300)
+    require_api_key: bool = False
+    failure_threshold: int = Field(default=3, ge=1, le=100)
+    failure_cooldown_seconds: int = Field(default=10, ge=1, le=300)
 
     @field_validator("blocked_paths")
     @classmethod
@@ -119,6 +122,9 @@ ENTRYPOINT ["/usr/local/bin/gateway"]
     (output / ".dockerignore").write_text("*\n!Cargo.toml\n!Cargo.lock\n!src/\n!src/**\n!Dockerfile\n")
     write_target(output, config.port, options)
     if options.target != "compose":
+        if config.security.require_api_key:
+            from core.credentials import write_credentials
+            write_credentials(output, options.target)
         return output
     (output / "compose.yaml").write_text(f'''services:
   gateway:
@@ -207,4 +213,7 @@ ACME_EMAIL=ops@example.com
 UPSTREAM_NETWORK=application-backends
 GATEWAY_NETWORK_CIDR=172.30.50.0/24
 '''.replace('ai-pingora-gateway:release-001', options.image or 'ai-pingora-gateway:release-001'))
+    if config.security.require_api_key:
+        from core.credentials import write_credentials
+        write_credentials(output, options.target)
     return output

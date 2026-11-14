@@ -125,7 +125,7 @@ WantedBy=multi-user.target
                          "resources": {"requests": {"cpu": "100m", "memory": "64Mi"},
                                        "limits": {"cpu": "2", "memory": "512Mi"}},
                          "startupProbe": {**probe, "periodSeconds": 2, "failureThreshold": 30},
-                         "readinessProbe": {**probe, "periodSeconds": 5, "failureThreshold": 2},
+                         "readinessProbe": {**probe, "httpGet": {"path": "/_gateway/ready", "port": "http"}, "periodSeconds": 5, "failureThreshold": 2},
                          "livenessProbe": {**probe, "periodSeconds": 10, "failureThreshold": 3}}]}}}},
         {"apiVersion": "v1", "kind": "Service", "metadata": meta,
          "spec": {"type": "ClusterIP", "selector": labels, "ports": [{"name": "http", "port": port, "targetPort": "http"}]}},
