@@ -123,6 +123,7 @@ python pingox.py install --bundle pingox-0.2.0.tar.gz --public-key /trusted/rele
 
 Run installation as an administrator for /opt. The installer rejects untrusted
 signatures, modified files, archive traversal, links and unexpected members. It
+includes the project license, collected dependency notices and Cargo.lock, and
 checks the current configuration using the verified new binary before selecting
 it, preserves operator configuration, and generates `/opt/pingox/pingox.service`.
 It does not modify systemd or stop/start a running process. Review and install the
@@ -152,6 +153,11 @@ separate command. Install/rollback must be serialized by operators with service
 activation; current/previous pointers are local release selections, not a fleet
 controller. A single-instance binary restart can interrupt requests. Use two or
 more instances with drained rolling replacement for software availability.
+
+Native and container builds collect notices from the locked native dependency
+graph; missing packaged notices fail the build unless a pinned source override is
+provided. Container notices are under /usr/share/licenses/pingox. Review licenses
+for your own extensions and redistribution model before publishing.
 
 The manual release workflow builds Linux x86_64 and ARM64 artifacts on their native
 runners, with tests and dependency audits before signing. Configure the protected

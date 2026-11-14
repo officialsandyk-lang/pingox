@@ -113,20 +113,29 @@ def generate(config: ProductionConfig, output: Path, options=None) -> Path:
     canonical = config.model_dump()
     runtime = {**canonical, "demo_backend": {"enabled": False, "generate_placeholder_files": False}}
     write_project(runtime, output)
+    shutil.copyfile(Path(__file__).resolve().parents[1] / "LICENSE", output / "LICENSE")
     shutil.copyfile(Path(__file__).resolve().parents[1] / "deploy" / "Cargo.lock", output / "Cargo.lock")
     (output / "production.json").write_text(json.dumps(canonical, indent=2) + "\n")
+    tooling = output / "tooling"
+    tooling.mkdir(exist_ok=True)
+    shutil.copyfile(Path(__file__).with_name("license_notices.py"), tooling / "license_notices.py")
+    shutil.copytree(Path(__file__).resolve().parents[1] / "deploy/license-overrides", output / "deploy/license-overrides")
     # Copy only explicit build inputs. Credentials, runtime reports and the AI
     # control plane never enter the gateway image.
     (output / "Dockerfile").write_text('''FROM rust:1.95-bookworm AS build
-RUN apt-get update && apt-get install -y --no-install-recommends cmake pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends cmake pkg-config libssl-dev python3 && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --locked --release
+COPY tooling ./tooling
+COPY deploy/license-overrides ./deploy/license-overrides
+RUN cargo build --locked --release && python3 tooling/license_notices.py /build
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 curl && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
+COPY LICENSE /usr/share/licenses/pingox/LICENSE
+COPY --from=build /build/THIRD_PARTY_NOTICES.txt /usr/share/licenses/pingox/THIRD_PARTY_NOTICES.txt
 COPY runtime/active.json /etc/pingox/runtime/active.json
 ENV PINGOX_CONFIG_FILE=/etc/pingox/runtime/active.json
 COPY --from=build /build/target/release/generated-pingora-proxy /usr/local/bin/gateway
@@ -134,7 +143,7 @@ USER 65532:65532
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/usr/local/bin/gateway"]
 ''')
-    (output / ".dockerignore").write_text("*\n!Cargo.toml\n!Cargo.lock\n!src/\n!src/**\n!runtime/\n!runtime/active.json\n!Dockerfile\n")
+    (output / ".dockerignore").write_text("*\n!Cargo.toml\n!Cargo.lock\n!src/\n!src/**\n!runtime/\n!runtime/active.json\n!LICENSE\n!tooling/\n!tooling/license_notices.py\n!deploy/\n!deploy/license-overrides/\n!deploy/license-overrides/**\n!Dockerfile\n")
     write_target(output, config.port, options)
     if options.target != "compose":
         if config.security.require_api_key:

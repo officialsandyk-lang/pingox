@@ -180,6 +180,8 @@ def main():
             (project / 'native-release.json').write_text(json.dumps({
                 'binary_sha256': digest(project / 'gateway'),
                 'config_sha256': digest(project / 'production.json')}))
+            from core.license_notices import write_notices
+            write_notices(project)
             openssl('genpkey', '-algorithm', 'ED25519', '-out', 'signing.key')
             openssl('pkey', '-in', 'signing.key', '-pubout', '-out', 'signing.pub')
             installed = root / 'installed'

@@ -26,6 +26,9 @@ def release(path, marker='one'):
     (path / 'native-release.json').write_text(json.dumps({
         'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
         'config_sha256': hashlib.sha256(config.read_bytes()).hexdigest()}))
+    (path / 'LICENSE').write_text('Test fixture license')
+    (path / 'THIRD_PARTY_NOTICES.txt').write_text('Test fixture notices')
+    (path / 'Cargo.lock').write_text('Test fixture inventory')
     return path
 
 

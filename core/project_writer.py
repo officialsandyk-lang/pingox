@@ -1233,7 +1233,8 @@ def write_demo_backend_files(
 def render_cargo_toml() -> str:
     return """[package]
 name = "generated-pingora-proxy"
-version = "0.1.0"
+version = "0.2.0"
+license = "Apache-2.0"
 edition = "2021"
 
 [dependencies]

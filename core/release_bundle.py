@@ -13,7 +13,7 @@ import tempfile
 from core.config_store import atomic_write, locked, publish, read_config
 from core.local_service import digest
 
-FILES = {'gateway', 'runtime/active.json'}
+FILES = {'gateway', 'runtime/active.json', 'LICENSE', 'THIRD_PARTY_NOTICES.txt', 'Cargo.lock'}
 METADATA = {'manifest.json', 'manifest.sig'}
 MAX_FILE = 256 * 1024 * 1024
 
@@ -37,7 +37,9 @@ def package(release: Path, output: Path, key: Path, version: str) -> None:
     config = read_config(release / 'production.json')
     data = {'gateway': (release / 'gateway').read_bytes(),
             'runtime/active.json': (config.model_dump_json(indent=2) + '\n').encode()}
-    if any(len(value) > MAX_FILE for value in data.values()):
+    for name in ('LICENSE', 'THIRD_PARTY_NOTICES.txt', 'Cargo.lock'):
+        data[name] = (release / name).read_bytes()
+    if any(len(value) > (MAX_FILE if name == 'gateway' else 4 * 1024 * 1024) for name, value in data.items()):
         raise ValueError('release file too large')
     manifest = {'format': 1, 'version': version,
                 'files': {name: hashlib.sha256(value).hexdigest() for name, value in data.items()}}

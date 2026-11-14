@@ -32,6 +32,8 @@ def build_release(config_path: Path, output: Path) -> Path:
     binary = release / 'gateway'
     shutil.copy2(release / 'target/release/generated-pingora-proxy', binary)
     binary.chmod(0o755)
+    from core.license_notices import write_notices
+    write_notices(release)
     manifest = {'version': 1, 'binary_sha256': digest(binary),
                 'config_sha256': digest(release / 'production.json')}
     (release / 'native-release.json').write_text(json.dumps(manifest, indent=2) + '\n')
