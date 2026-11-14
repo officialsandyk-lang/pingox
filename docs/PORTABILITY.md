@@ -54,6 +54,7 @@ python pingox.py init --directory my-k8s-gateway --target kubernetes --image reg
 python pingox.py generate --config my-k8s-gateway/gateway.json --deployment my-k8s-gateway/deployment.json --output releases/k8s-v1
 docker build -t registry.example.com/team/gateway:v1 releases/k8s-v1
 docker push registry.example.com/team/gateway:v1
+kubectl create namespace ai-gateway --dry-run=client -o yaml | kubectl apply -f -
 kubectl apply --dry-run=server -f releases/k8s-v1/kubernetes.yaml
 kubectl apply -f releases/k8s-v1/kubernetes.yaml
 kubectl -n ai-gateway rollout status deployment/ai-pingora-gateway

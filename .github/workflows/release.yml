@@ -9,7 +9,7 @@ permissions:
   contents: read
 jobs:
   build:
-    if: github.ref == 'refs/heads/private-main' || github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main'
     environment: release-signing
     strategy:
       fail-fast: false

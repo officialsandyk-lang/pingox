@@ -55,8 +55,8 @@ billing records. No request bodies, API keys or query strings are logged.
 ## Optional gateway API keys
 
 Set `security.require_api_key` to true before generating/building. Generated
-AUTHENTICATION.md gives deployment-specific secret mounting instructions. Keys
-are JSON arrays of 64-character random hex strings, read from
+AUTHENTICATION.md gives deployment-specific secret mounting instructions. Credentials
+are JSON arrays of 64-character random hex keys or scoped records, read from
 `PINGOX_API_KEYS_FILE` at startup. Missing or malformed credentials prevent startup.
 `X-Pingox-Api-Key` is checked using constant-time comparison and removed before
 forwarding; duplicate headers are rejected. The separate backend Authorization

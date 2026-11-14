@@ -162,7 +162,7 @@ for your own extensions and redistribution model before publishing.
 The manual release workflow builds Linux x86_64 and ARM64 artifacts on their native
 runners, with tests and dependency audits before signing. Configure the protected
 release-signing environment and PINGOX_RELEASE_SIGNING_KEY, restrict who can approve
-it, and run only from a reviewed main/private-main commit. No public release or
+it, and run only from a reviewed main commit. No public release or
 production signing key is created automatically. Linux glibc compatibility follows
 the build runner (Ubuntu 22.04 x86_64, Ubuntu 24.04 ARM64); do not assume portability
 to Alpine/musl or older distributions.
