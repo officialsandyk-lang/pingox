@@ -1,13 +1,13 @@
 # Linux Docker Compose deployment
 
-This branch adds a production deployment path through `gateway.py`. The old
+Pingox provides a production deployment path through `pingox.py`. The old
 `main.py`, `update.py`, self-healing and blue/green flows remain development tools;
 they can launch demo backends and automatically repair generated code. Do not use
 those flows to operate production traffic.
 
 ## Release status
 
-This is a hardened release candidate, not a blanket production certification.
+This is a pre-1.0 release with tested deployment paths, not a blanket production certification.
 Python regression tests and a real local Pingora binary are tested by the supplied
 commands. Linux image build, public Caddy TLS issuance, your real backends, load capacity,
 backup restoration and rollback must pass in your environment before cutover.
@@ -44,15 +44,15 @@ For an optional AI proposal, configure `OPENAI_API_KEY` or the Codex backend as
 explained in `WORKERS.md`, then run:
 
 ```sh
-python gateway.py plan 'Listen on 8080 and route /api to api-backend:8000; allow GET HEAD POST' --output proposed.json
+python pingox.py plan 'Listen on 8080 and route /api to api-backend:8000; allow GET HEAD POST' --output proposed.json
 ```
 
 Review the JSON before using it. This command never deploys or overwrites a file.
 All validation and generation also work with `AI_WORKER_BACKEND=disabled`.
 
 ```sh
-python gateway.py validate --config gateway-production.json
-python gateway.py generate --config gateway-production.json --output releases/release-001
+python pingox.py validate --config gateway-production.json
+python pingox.py generate --config gateway-production.json --output releases/release-001
 cd releases/release-001
 cp .env.example .env
 ```

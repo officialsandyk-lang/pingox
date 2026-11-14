@@ -12,16 +12,16 @@ at runtime. Select the deployment target independently of the optional AI worker
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
-python gateway.py init --directory my-gateway --target compose
+python pingox.py init --directory my-gateway --target compose
 ```
 
 Edit `my-gateway/gateway.json` with actual routes and reachable backend addresses.
 The init command refuses to overwrite a nonempty directory.
 
 ```sh
-python gateway.py validate --config my-gateway/gateway.json
-python gateway.py doctor --target compose
-python gateway.py generate --config my-gateway/gateway.json --deployment my-gateway/deployment.json --output releases/v1
+python pingox.py validate --config my-gateway/gateway.json
+python pingox.py doctor --target compose
+python pingox.py generate --config my-gateway/gateway.json --deployment my-gateway/deployment.json --output releases/v1
 ```
 
 `doctor` only checks local executables. It does not contact cloud accounts or prove
@@ -34,7 +34,7 @@ Keep a separate reviewed release directory and immutable image per version.
 |---|---|---|---|
 | compose | Linux VM on any host with Docker Compose v2 | Dockerfile, lockfile, Compose, Caddy | domain, approved edge image, backend network, unused edge CIDR |
 | container | OCI-compatible container host | Dockerfile, lockfile, generated source | image registry, resources, private networking, TLS ingress and health probe |
-| kubernetes | Kubernetes supporting apps/v1, policy/v1 and security contexts | OCI build files, Namespace, Deployment, ClusterIP Service, PDB | built/pushed image, cluster, ingress/TLS, image-pull access and network policy |
+| kubernetes | Kubernetes supporting apps/v1, policy/v1 and security contexts | OCI build files, Namespace, ConfigMap, Deployment, ClusterIP Service, PDB | built/pushed image, cluster, ingress/TLS, image-pull access and network policy |
 | systemd | Linux host with systemd and a compatible native binary | source, lockfile, hardened service unit | native build, release installation, existing reverse proxy/TLS |
 
 These contracts avoid cloud-vendor SDK dependencies. They do not provision cloud
@@ -43,14 +43,15 @@ GCP, Vultr and other hosts can use an applicable contract; each managed service'
 networking and identity requirements still need configuration. Windows services,
 Lambda-style request functions, and browser/edge-isolate runtimes are not targets.
 ARM64 and AMD64 images must be built for the host architecture; a successful
-AMD64 CI run does not certify every architecture.
+AMD64 CI run does not certify every architecture. Native integration tests also run
+on Linux ARM64; container images still need the appropriate architecture build.
 
 ### Kubernetes
 
 ```sh
-python gateway.py init --directory my-k8s-gateway --target kubernetes --image registry.example.com/team/gateway:v1
+python pingox.py init --directory my-k8s-gateway --target kubernetes --image registry.example.com/team/gateway:v1
 # Edit gateway.json and deployment.json.
-python gateway.py generate --config my-k8s-gateway/gateway.json --deployment my-k8s-gateway/deployment.json --output releases/k8s-v1
+python pingox.py generate --config my-k8s-gateway/gateway.json --deployment my-k8s-gateway/deployment.json --output releases/k8s-v1
 docker build -t registry.example.com/team/gateway:v1 releases/k8s-v1
 docker push registry.example.com/team/gateway:v1
 kubectl apply --dry-run=server -f releases/k8s-v1/kubernetes.yaml
@@ -69,26 +70,28 @@ policies and egress allowlists before exposing it.
 
 Two replicas, startup/readiness/liveness probes, resource limits, non-root and
 read-only containers, disabled API-token mounting, and rolling updates are the
-defaults. Probes test gateway process health, not backend readiness. The PDB blocks
+defaults. Liveness tests process health. Readiness checks whether each upstream
+pool has an eligible backend; it is not an active reachability probe. The PDB blocks
 voluntary disruption of the last available pod; a single-replica configuration can
 therefore block node drains. Ensure cluster headroom for surge pods.
 
 For rollback, reapply the previous release manifest with its retained image or
 use `kubectl rollout undo deployment/ai-pingora-gateway -n ai-gateway`, then verify
 a real API request. Per-process rate limits are not a shared cluster quota. This
-package does not claim distributed rate limiting, backend health-based failover,
-or cross-region consistency.
+package does not provide distributed rate limiting, active backend probes or
+cross-region consistency. Passive failure isolation is described in PINGOX_OPERATIONS.md.
 
 ### Linux service
 
 ```sh
-python gateway.py generate --config gateway.json --target systemd --output releases/linux-v1
+python pingox.py generate --config gateway.json --target systemd --output releases/linux-v1
 cargo build --locked --release --manifest-path releases/linux-v1/Cargo.toml
 ```
 
 Build on a Linux distribution compatible with the destination's libc and CPU.
 Install the resulting `target/release/generated-pingora-proxy` as
-`/opt/ai-pingora-gateway/releases/v1/gateway`. Point
+`/opt/ai-pingora-gateway/releases/v1/gateway`. Also copy the generated `runtime`
+directory into that release directory; the unit reads `current/runtime/active.json`. Point
 `/opt/ai-pingora-gateway/current` at that version. Install the generated
 `ai-pingora-gateway.service` under `/etc/systemd/system`, validate it with
 `systemd-analyze verify`, then reload systemd and start that specific unit.
@@ -132,7 +135,7 @@ export AI_WORKER_BACKEND=openai-compatible
 export AI_BASE_URL=https://your-provider.example/v1
 export AI_API_KEY_FILE=/run/secrets/model-api-key
 export AI_MODEL=your-available-model-id
-python gateway.py plan 'Route /api to api-backend:8000 on port 8080' --output proposed.json
+python pingox.py plan 'Route /api to api-backend:8000 on port 8080' --output proposed.json
 ```
 
 Anthropic defaults to the documented compatibility API version `2023-06-01`; set
@@ -158,6 +161,7 @@ timeout is an operation/inactivity timeout, not a guarantee of total model laten
 ```sh
 python -m pytest -q
 python scripts/verify_runtime.py
+python scripts/verify_enterprise.py
 bash scripts/verify_compose.sh
 bash scripts/verify_kubernetes.sh
 ```

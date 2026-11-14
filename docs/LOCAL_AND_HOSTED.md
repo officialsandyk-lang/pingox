@@ -4,8 +4,8 @@
 
 Keep the existing Apache-2.0 license. Offer the gateway and management server as
 open-source software; sell the convenience of hosted management, backups,
-monitoring retention, upgrades and support. Publishing the current private
-repository is a separate release decision after a history/secret review.
+monitoring retention, upgrades and support. The gateway source is published on GitHub. The management server and hosted
+offering described here are proposals, not shipped features.
 
 The installed gateway is a background server like NGINX, not a desktop app.
 Rust/Pingora handles requests locally. Python and optional AI workers are build
@@ -36,11 +36,11 @@ From the repository's Python environment, with Rust and its native build
 prerequisites installed (see PORTABILITY.md):
 
 ```sh
-python gateway.py init --directory my-gateway --target systemd
+python pingox.py init --directory my-gateway --target systemd
 # Edit my-gateway/gateway.json to use your actual backend host and port.
-python gateway.py validate --config my-gateway/gateway.json
-python gateway.py build --config my-gateway/gateway.json --output releases/v1
-python gateway.py run --release releases/v1
+python pingox.py validate --config my-gateway/gateway.json
+python pingox.py build --config my-gateway/gateway.json --output releases/v1
+python pingox.py run --release releases/v1
 ```
 
 `build` generates a fresh native release and compiles locked dependencies.

@@ -44,8 +44,7 @@ the result as free of all security risks.
 
 ## Reporting
 
-Until a public security intake is configured, report suspected vulnerabilities
-privately to the repository owner through GitHub's private security reporting if
-enabled, or the agreed private customer support channel. Do not post secrets,
-exploit details or customer traffic in public issues. Establish a monitored intake,
-response ownership and patch policy before onboarding production customers.
+Use [GitHub private vulnerability reporting](https://github.com/officialsandyk-lang/pingox/security/advisories/new)
+to report suspected vulnerabilities to the repository maintainers. Do not post
+secrets, exploit details or customer traffic in public issues. This community
+project does not promise a contractual response time or security SLA.
