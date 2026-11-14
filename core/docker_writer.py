@@ -4,14 +4,8 @@ PROJECT_DIR = Path("generated-pingora-proxy")
 
 
 def get_backend_ports(config: dict) -> list[int]:
-    ports = []
-
-    for route in config["routes"]:
-        upstream = route["upstream"]
-        port = int(upstream.split(":")[1])
-        ports.append(port)
-
-    return sorted(set(ports))
+    from core.compose_writer import get_backend_ports as collect_ports
+    return collect_ports(config)
 
 
 def write_docker_files(config: dict):

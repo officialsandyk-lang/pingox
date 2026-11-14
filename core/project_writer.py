@@ -221,6 +221,8 @@ def normalize_upstream_item(item: Any) -> dict[str, Any]:
         return {
             "address": normalize_upstream_address(address),
             "weight": weight,
+            **({"tls": bool(item["tls"])} if "tls" in item else {}),
+            **({"server_name": str(item["server_name"])} if "server_name" in item else {}),
         }
 
     return {
@@ -395,6 +397,8 @@ def merge_routes_for_generation(routes: list[dict[str, Any]]) -> list[dict[str, 
                     {
                         "address": address,
                         "weight": weight,
+                        **({"tls": upstream["tls"]} if "tls" in upstream else {}),
+                        **({"server_name": upstream["server_name"]} if "server_name" in upstream else {}),
                     }
                 )
             else:
@@ -1098,6 +1102,14 @@ def write_json_if_allowed(path: Path, data: dict[str, Any], *, overwrite: bool) 
     return True
 
 
+def contained_path(project_path: Path, *parts: str) -> Path:
+    base = project_path.resolve()
+    target = base.joinpath(*parts).resolve()
+    if not target.is_relative_to(base):
+        raise ValueError("Generated file path escapes the project directory")
+    return target
+
+
 def write_default_public_files(project_path: Path, config: dict[str, Any]) -> None:
     routes = config.get("routes") or []
 
@@ -1113,10 +1125,9 @@ def write_default_public_files(project_path: Path, config: dict[str, Any]) -> No
         root = str(route.get("root") or "public")
         index = str(route.get("index") or "index.html")
 
-        public_dir = project_path / root
+        public_dir = contained_path(project_path, root)
+        index_path = contained_path(project_path, root, index)
         public_dir.mkdir(parents=True, exist_ok=True)
-
-        index_path = public_dir / index
 
         # Always refresh homepage so it shows the latest route directory.
         index_path.write_text(
@@ -1168,10 +1179,10 @@ def write_demo_backend_files(
         upstream = get_route_upstreams_display(route)
 
         dirname = route_path_to_dirname(route_path)
-        target_dir = project_path / dirname if dirname else project_path
+        target_dir = contained_path(project_path, dirname)
 
-        index_path = target_dir / "index.html"
-        metadata_path = target_dir / "route.json"
+        index_path = contained_path(project_path, dirname, "index.html")
+        metadata_path = contained_path(project_path, dirname, "route.json")
 
         if route_path == "/":
             index_html = render_demo_home_index_html(
@@ -1222,13 +1233,22 @@ def write_demo_backend_files(
 def render_cargo_toml() -> str:
     return """[package]
 name = "generated-pingora-proxy"
-version = "0.1.0"
+version = "0.2.0"
+license = "Apache-2.0"
 edition = "2021"
 
 [dependencies]
 async-trait = "0.1"
 bytes = "1"
-pingora = { version = "0.8.0", features = ["proxy"] }
+pingora = { version = "=0.9.1", features = ["proxy", "rustls"] }
+tokio = { version = "1", features = ["fs", "net"] }
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+ipnet = "2"
+subtle = "=2.6.1"
+rustls-pki-types = { version = "1", features = ["std"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+x509-parser = "=0.16.0"
 """
 
 
@@ -1261,6 +1281,8 @@ def render_route_configs(config: dict[str, Any]) -> str:
                 f"""UpstreamConfig {{
             address: {rust_string(address)}.to_string(),
             weight: {weight},
+            tls: {str(bool(upstream.get("tls", False))).lower()},
+            server_name: {rust_string(upstream.get("server_name", ""))}.to_string(),
         }}"""
             )
 
@@ -1300,6 +1322,9 @@ def render_security_config(config: dict[str, Any]) -> str:
         max_connections: {int(security.get("max_connections", 1000))},
         max_request_body_bytes: {int(security.get("max_request_body_bytes", 1048576))},
         upstream_timeout_seconds: {int(security.get("upstream_timeout_seconds", 30))},
+        require_api_key: {str(bool(security.get("require_api_key", False))).lower()},
+        failure_threshold: {max(1, int(security.get("failure_threshold", 3)))},
+        failure_cooldown_seconds: {max(1, int(security.get("failure_cooldown_seconds", 10)))},
     }}"""
 
 
@@ -1318,8 +1343,9 @@ def render_main_rs(
     routes_rs = render_route_configs(config)
     security_rs = render_security_config(config)
 
-    return f"""use async_trait::async_trait;
+    source = f"""use async_trait::async_trait;
 use bytes::Bytes;
+use subtle::ConstantTimeEq;
 use pingora::http::ResponseHeader;
 use pingora::prelude::*;
 use std::collections::HashMap;
@@ -1328,10 +1354,16 @@ use std::sync::atomic::{{AtomicUsize, Ordering}};
 use std::sync::{{Arc, Mutex}};
 use std::time::{{Duration, Instant, SystemTime, UNIX_EPOCH}};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpstreamConfig {{
     address: String,
+    #[serde(default = "default_weight")]
     weight: usize,
+    #[serde(default)]
+    tls: bool,
+    #[serde(default)]
+    server_name: String,
 }}
 
 #[derive(Clone, Debug)]
@@ -1344,7 +1376,8 @@ struct RouteConfig {{
     upstreams: Vec<UpstreamConfig>,
 }}
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 struct SecurityConfig {{
     blocked_paths: Vec<String>,
     allowed_methods: Vec<String>,
@@ -1352,6 +1385,9 @@ struct SecurityConfig {{
     max_connections: usize,
     max_request_body_bytes: usize,
     upstream_timeout_seconds: u64,
+    require_api_key: bool,
+    failure_threshold: usize,
+    failure_cooldown_seconds: u64,
 }}
 
 #[derive(Debug)]
@@ -1360,16 +1396,45 @@ struct RateBucket {{
     count: usize,
 }}
 
-#[derive(Debug)]
-struct RequestContext {{}}
+#[derive(Debug, Default)]
+struct BackendHealth {{
+    failures: usize,
+    until: Option<Instant>,
+    generation: usize,
+}}
 
-#[derive(Clone)]
-struct GeneratedProxy {{
+#[derive(Debug)]
+struct RequestContext {{
+    body_bytes: usize,
+    active: Option<Arc<AtomicUsize>>,
+    upstream: Option<Arc<AtomicUsize>>,
+    started: Instant,
+    selected: Option<(usize, usize, usize)>,
+    dns_failed: bool,
+    snapshot: Option<Arc<Runtime>>,
+    consumer: Option<String>,
+}}
+
+impl Drop for RequestContext {{
+    fn drop(&mut self) {{
+        if let Some(counter) = self.active.take() {{ counter.fetch_sub(1, Ordering::Relaxed); }}
+        if let Some(counter) = self.upstream.take() {{ counter.fetch_sub(1, Ordering::Relaxed); }}
+    }}
+}}
+
+#[derive(Clone, Debug)]
+struct Runtime {{
     routes: Arc<Vec<RouteConfig>>,
     counters: Arc<Vec<AtomicUsize>>,
-    upstream_loads: Arc<Vec<Vec<AtomicUsize>>>,
+    upstream_loads: Arc<Vec<Vec<Arc<AtomicUsize>>>>,
+    active: Arc<AtomicUsize>,
     security: SecurityConfig,
     rate_limiter: Arc<Mutex<HashMap<String, RateBucket>>>,
+    health: Arc<Mutex<Vec<Vec<BackendHealth>>>>,
+    api_keys: Arc<Vec<ApiCredential>>,
+    client_identity: Option<Arc<pingora::utils::tls::CertKey>>,
+    completed: Arc<AtomicUsize>,
+    failed: Arc<AtomicUsize>,
 }}
 
 fn content_type_for_path(path: &PathBuf) -> &'static str {{
@@ -1389,36 +1454,28 @@ fn content_type_for_path(path: &PathBuf) -> &'static str {{
 }}
 
 fn safe_static_path(root: &str, relative_path: &str, index: &str) -> Option<PathBuf> {{
-    let mut path = PathBuf::from(root);
-
+    let root_path = std::fs::canonicalize(root).ok()?;
+    let mut path = root_path.clone();
     let clean_relative = relative_path.trim_start_matches('/');
-
-    if clean_relative.is_empty() {{
-        path.push(index);
-        return Some(path);
-    }}
-
     for part in clean_relative.split('/') {{
-        if part.is_empty() {{
-            continue;
-        }}
-
-        if part == "." || part == ".." || part.contains('\\\\') {{
-            return None;
-        }}
-
+        if part.is_empty() {{ continue; }}
+        if part.starts_with('.') || part.contains('\\\\') || part.contains('%') {{ return None; }}
         path.push(part);
     }}
-
-    if relative_path.ends_with('/') {{
-        path.push(index);
-    }}
-
-    Some(path)
+    if clean_relative.is_empty() || relative_path.ends_with('/') {{ path.push(index); }}
+    let canonical = std::fs::canonicalize(path).ok()?;
+    if !canonical.starts_with(&root_path) || !canonical.is_file() {{ return None; }}
+    Some(canonical)
 }}
 
-impl GeneratedProxy {{
+impl Runtime {{
     fn new(routes: Vec<RouteConfig>, security: SecurityConfig) -> Self {{
+        let keys = load_api_keys(security.require_api_key).expect("invalid API key configuration");
+        let mut runtime = Self::with_keys(routes, security, keys);
+        runtime.client_identity = load_client_identity().expect("invalid client TLS identity");
+        runtime
+    }}
+    fn with_keys(routes: Vec<RouteConfig>, security: SecurityConfig, api_keys: Vec<ApiCredential>) -> Self {{
         let counters = routes
             .iter()
             .map(|_| AtomicUsize::new(0))
@@ -1430,15 +1487,23 @@ impl GeneratedProxy {{
                 route
                     .upstreams
                     .iter()
-                    .map(|_| AtomicUsize::new(0))
+                    .map(|_| Arc::new(AtomicUsize::new(0)))
                     .collect::<Vec<_>>()
             }})
             .collect::<Vec<_>>();
 
+        let health = routes.iter().map(|r| r.upstreams.iter()
+            .map(|_| BackendHealth::default()).collect()).collect();
         Self {{
+            health: Arc::new(Mutex::new(health)),
+            api_keys: Arc::new(api_keys),
+            client_identity: None,
+            completed: Arc::new(AtomicUsize::new(0)),
+            failed: Arc::new(AtomicUsize::new(0)),
             routes: Arc::new(routes),
             counters: Arc::new(counters),
             upstream_loads: Arc::new(upstream_loads),
+            active: Arc::new(AtomicUsize::new(0)),
             security,
             rate_limiter: Arc::new(Mutex::new(HashMap::new())),
         }}
@@ -1491,7 +1556,12 @@ impl GeneratedProxy {{
             }}
         }};
 
-        let body = match std::fs::read(&file_path) {{
+        // Static roots must be immutable at runtime (the container is read-only).
+        if tokio::fs::metadata(&file_path).await.map(|m| m.len()).unwrap_or(u64::MAX) > 8 * 1024 * 1024 {{
+            session.respond_error(413).await?;
+            return Ok(true);
+        }}
+        let body = match tokio::fs::read(&file_path).await {{
             Ok(value) => value,
             Err(_) => {{
                 session.respond_error(404).await?;
@@ -1516,24 +1586,50 @@ impl GeneratedProxy {{
         Ok(true)
     }}
 
-    fn select_upstream(&self, route_index: usize, session: &Session) -> Option<String> {{
+    fn select_upstream(&self, route_index: usize, session: &Session, ctx: &mut RequestContext) -> Option<UpstreamConfig> {{
         let route = self.routes.get(route_index)?;
 
         if route.upstreams.is_empty() {{
             return None;
         }}
 
-        let len = route.upstreams.len();
-
-        let selected = match route.balancing.as_str() {{
+        let mut health = self.health.lock().ok()?;
+        let states = health.get_mut(route_index)?;
+        let now = Instant::now();
+        for state in states.iter_mut() {{
+            if state.until.is_some_and(|until| now >= until) {{
+                state.until = None;
+                state.failures = 0;
+                state.generation = state.generation.wrapping_add(1);
+            }}
+        }}
+        let eligible: Vec<usize> = states.iter().enumerate()
+            .filter(|(_, state)| state.until.is_none()).map(|(i, _)| i).collect();
+        if eligible.is_empty() {{ return None; }}
+        let len = eligible.len();
+        let index = match route.balancing.as_str() {{
             "random" => self.select_random_index(route_index, len),
-            "weighted_round_robin" => self.select_weighted_round_robin_index(route_index, route),
-            "least_connections" => self.select_least_connections_index(route_index, len),
+            "weighted_round_robin" => {{
+                let mut available = route.clone();
+                available.upstreams = eligible.iter().map(|i| route.upstreams[*i].clone()).collect();
+                self.select_weighted_round_robin_index(route_index, &available)
+            }},
+            "least_connections" => {{
+                let start = self.select_round_robin_index(route_index, len);
+                (0..len).map(|offset| (start + offset) % len)
+                    .min_by_key(|i| self.upstream_loads[route_index][eligible[*i]].load(Ordering::Relaxed)).unwrap()
+            }},
             "ip_hash" => self.select_ip_hash_index(session, len),
             _ => self.select_round_robin_index(route_index, len),
         }};
+        let selected = eligible[index];
+        ctx.selected = Some((route_index, selected, states[selected].generation));
 
-        Some(route.upstreams[selected].address.clone())
+        if let Some(previous) = ctx.upstream.take() {{ previous.fetch_sub(1, Ordering::Relaxed); }}
+        let counter = self.upstream_loads[route_index][selected].clone();
+        counter.fetch_add(1, Ordering::Relaxed);
+        ctx.upstream = Some(counter);
+        Some(route.upstreams[selected].clone())
     }}
 
     fn select_round_robin_index(&self, route_index: usize, len: usize) -> usize {{
@@ -1585,34 +1681,6 @@ impl GeneratedProxy {{
         0
     }}
 
-    fn select_least_connections_index(&self, route_index: usize, len: usize) -> usize {{
-        let loads = match self.upstream_loads.get(route_index) {{
-            Some(value) => value,
-            None => return self.select_round_robin_index(route_index, len),
-        }};
-
-        let mut best_index = 0usize;
-        let mut best_load = usize::MAX;
-
-        for index in 0..len {{
-            let load = loads
-                .get(index)
-                .map(|counter| counter.load(Ordering::Relaxed))
-                .unwrap_or(usize::MAX);
-
-            if load < best_load {{
-                best_load = load;
-                best_index = index;
-            }}
-        }}
-
-        if let Some(counter) = loads.get(best_index) {{
-            counter.fetch_add(1, Ordering::Relaxed);
-        }}
-
-        best_index
-    }}
-
     fn select_ip_hash_index(&self, session: &Session, len: usize) -> usize {{
         let key = client_key(session);
         let mut hash: usize = 2_166_136_261usize;
@@ -1647,7 +1715,9 @@ impl GeneratedProxy {{
     }}
 
     fn check_rate_limit(&self, client_key: &str) -> bool {{
-        let limit = self.security.rate_limit_per_minute;
+        self.check_quota(client_key, self.security.rate_limit_per_minute)
+    }}
+    fn check_quota(&self, client_key: &str, limit: usize) -> bool {{
 
         if limit == 0 {{
             return true;
@@ -1655,11 +1725,15 @@ impl GeneratedProxy {{
 
         let mut limiter = match self.rate_limiter.lock() {{
             Ok(guard) => guard,
-            Err(_) => return true,
+            Err(_) => return false,
         }};
 
         let now = Instant::now();
 
+        if limiter.len() >= 10000 {{
+            limiter.retain(|_, bucket| now.duration_since(bucket.window_start) < Duration::from_secs(60));
+            if limiter.len() >= 10000 && !limiter.contains_key(client_key) {{ return false; }}
+        }}
         let bucket = limiter.entry(client_key.to_string()).or_insert(RateBucket {{
             window_start: now,
             count: 0,
@@ -1696,43 +1770,99 @@ fn parse_upstream(upstream: &str) -> (String, u16) {{
     (host.to_string(), port)
 }}
 
-fn client_key(session: &Session) -> String {{
-    match session.client_addr() {{
-        Some(addr) => {{
-            let raw = format!("{{:?}}", addr);
+fn load_api_keys(required: bool) -> std::result::Result<Vec<ApiCredential>, String> {{
+    if !required {{ return Ok(Vec::new()); }}
+    let path = std::env::var("PINGOX_API_KEYS_FILE").map_err(|_| "PINGOX_API_KEYS_FILE is required")?;
+    let file = std::fs::File::open(path).map_err(|_| "cannot open API key file")?;
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    file.take(16385).read_to_end(&mut bytes).map_err(|_| "cannot read API key file")?;
+    if bytes.len() > 16384 {{ return Err("API key file too large".into()); }}
+    parse_credentials(&bytes)
+}}
 
-            if raw.starts_with('[') {{
-                match raw.rfind("]:") {{
-                    Some(index) => raw[..index + 1].to_string(),
-                    None => raw,
-                }}
-            }} else {{
-                match raw.rfind(':') {{
-                    Some(index) => raw[..index].to_string(),
-                    None => raw,
-                }}
-            }}
+fn trusted_proxy(session: &Session) -> bool {{
+    static NETWORKS: std::sync::OnceLock<Vec<ipnet::IpNet>> = std::sync::OnceLock::new();
+    let networks = NETWORKS.get_or_init(|| {{
+        std::env::var("TRUSTED_PROXY_CIDRS").unwrap_or_default().split(',')
+            .filter(|s| !s.trim().is_empty()).map(|s| s.trim().parse().expect("invalid TRUSTED_PROXY_CIDRS")).collect()
+    }});
+    session.client_addr().and_then(|a| a.as_inet())
+        .map(|a| networks.iter().any(|n| n.contains(&a.ip()))).unwrap_or(false)
+}}
+
+fn client_key(session: &Session) -> String {{
+    if trusted_proxy(session) {{
+        if let Some(ip) = session.req_header().headers.get("x-real-ip")
+            .and_then(|h| h.to_str().ok()).and_then(|s| s.parse::<std::net::IpAddr>().ok()) {{
+            return ip.to_string();
         }}
-        None => "unknown".to_string(),
     }}
+    session.client_addr().and_then(|a| a.as_inet()).map(|a| a.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }}
 
 #[async_trait]
-impl ProxyHttp for GeneratedProxy {{
+impl ProxyHttp for Runtime {{
     type CTX = RequestContext;
 
     fn new_ctx(&self) -> Self::CTX {{
-        RequestContext {{}}
+        RequestContext {{ body_bytes: 0, active: None, upstream: None, started: Instant::now(), selected: None, dns_failed: false, snapshot: None, consumer: None }}
     }}
 
     async fn request_filter(
         &self,
         session: &mut Session,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> Result<bool> {{
         let path = session.req_header().uri.path().to_string();
         let method = session.req_header().method.as_str().to_uppercase();
 
+        // Reject ambiguous encodings instead of enforcing policy on one path and
+        // forwarding another interpretation to an upstream.
+        if path.contains('%') || path.contains('\\\\') || path.contains("//")
+            || path.split('/').any(|part| part == "." || part == "..") {{
+            session.respond_error(400).await?;
+            return Ok(true);
+        }}
+        if path == "/_gateway/health" && (method == "GET" || method == "HEAD") {{
+            let mut header = ResponseHeader::build(200, None)?;
+            header.insert_header("content-length", "0")?;
+            session.write_response_header(Box::new(header), true).await?;
+            return Ok(true);
+        }}
+        if (path == "/_gateway/ready" || path == "/_gateway/metrics") && (method == "GET" || method == "HEAD") {{
+            let (unavailable, ready) = {{
+            let health = self.health.lock().expect("health state");
+            let now = Instant::now();
+            let unavailable = health.iter().flatten().filter(|s| s.until.is_some_and(|t| t > now)).count();
+            let ready = health.iter().all(|pool| pool.is_empty() || pool.iter().any(|s| s.until.is_none_or(|t| t <= now)));
+            (unavailable, ready)
+            }};
+            let body = if path.ends_with("metrics") {{ format!(
+                "# TYPE pingox_requests_completed_total counter\npingox_requests_completed_total {{}}\n# TYPE pingox_requests_failed_total counter\npingox_requests_failed_total {{}}\n# TYPE pingox_active_requests gauge\npingox_active_requests {{}}\n# TYPE pingox_unavailable_backends gauge\npingox_unavailable_backends {{}}\n",
+                self.completed.load(Ordering::Relaxed), self.failed.load(Ordering::Relaxed),
+                self.active.load(Ordering::Relaxed), unavailable) }} else {{ String::new() }};
+            let status = if path.ends_with("ready") && !ready {{ 503 }} else {{ 200 }};
+            let mut header = ResponseHeader::build(status, None)?;
+            header.insert_header("content-type", "text/plain; version=0.0.4")?;
+            header.insert_header("content-length", body.len().to_string())?;
+            session.write_response_header(Box::new(header), method == "HEAD" || body.is_empty()).await?;
+            if method != "HEAD" && !body.is_empty() {{ session.write_response_body(Some(Bytes::from(body)), true).await?; }}
+            return Ok(true);
+        }}
+        if path == "/_gateway" || path.starts_with("/_gateway/") {{
+            session.respond_error(404).await?;
+            return Ok(true);
+        }}
+        if self.active.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {{
+            if count < self.security.max_connections {{ Some(count + 1) }} else {{ None }}
+        }}).is_err() {{
+            session.respond_error(503).await?;
+            return Ok(true);
+        }}
+        ctx.active = Some(self.active.clone());
+        session.set_read_timeout(Some(Duration::from_secs(self.security.upstream_timeout_seconds)));
         if !self.method_allowed(&method) {{
             session.respond_error(405).await?;
             return Ok(true);
@@ -1766,6 +1896,35 @@ impl ProxyHttp for GeneratedProxy {{
             return Ok(true);
         }}
 
+        if self.security.require_api_key {{
+            let values = session.req_header().headers.get_all("x-pingox-api-key");
+            let mut values = values.iter();
+            let supplied = values.next().map(|h| h.as_bytes()).unwrap_or(&[]);
+            let duplicate = values.next().is_some();
+            let mut valid = subtle::Choice::from(0);
+            let mut matched = None;
+            for (index, credential) in self.api_keys.iter().enumerate() {{
+                let equal = credential.key.as_slice().ct_eq(supplied);
+                valid |= equal;
+                if bool::from(equal) {{ matched = Some(index); }}
+            }}
+            if duplicate || !bool::from(valid) {{
+                session.respond_error(401).await?;
+                return Ok(true);
+            }}
+            let credential = &self.api_keys[matched.expect("matched credential")];
+            ctx.consumer = Some(credential.id.clone());
+            if !credential.methods.contains(&method) || !credential.routes.iter().any(|prefix|
+                prefix == "/" || path == *prefix || path.starts_with(&format!("{{}}/", prefix))) {{
+                session.respond_error(403).await?;
+                return Ok(true);
+            }}
+            if !self.check_quota(&format!("consumer:{{}}", credential.id), credential.quota) {{
+                session.respond_error(429).await?;
+                return Ok(true);
+            }}
+        }}
+
         let route_index = match self.match_route_index(&path) {{
             Some(index) => index,
             None => {{
@@ -1789,27 +1948,98 @@ impl ProxyHttp for GeneratedProxy {{
         Ok(false)
     }}
 
+    async fn upstream_request_filter(
+        &self, session: &mut Session, request: &mut pingora::http::RequestHeader,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {{
+        if let Some((route, backend, _)) = ctx.selected {{
+            let upstream = &self.routes[route].upstreams[backend];
+            if upstream.tls {{ request.insert_header("host", upstream.server_name.clone())?; }}
+        }}
+        let ip = client_key(session);
+        let proto = if trusted_proxy(session) && session.req_header().headers.get("x-forwarded-proto")
+            .and_then(|h| h.to_str().ok()) == Some("https") {{ "https" }} else {{ "http" }};
+        request.remove_header("x-pingox-api-key");
+        request.remove_header("forwarded");
+        request.insert_header("x-forwarded-for", ip.clone())?;
+        request.insert_header("x-real-ip", ip)?;
+        request.insert_header("x-forwarded-proto", proto)?;
+        Ok(())
+    }}
+
+    async fn request_body_filter(
+        &self, _session: &mut Session, body: &mut Option<Bytes>,
+        _end_of_stream: bool, ctx: &mut Self::CTX,
+    ) -> Result<()> {{
+        ctx.body_bytes = ctx.body_bytes.saturating_add(body.as_ref().map_or(0, |b| b.len()));
+        if ctx.body_bytes > self.security.max_request_body_bytes {{
+            return Err(Error::new(ErrorType::HTTPStatus(413)));
+        }}
+        Ok(())
+    }}
+
+    async fn logging(&self, session: &mut Session, error: Option<&Error>, ctx: &mut Self::CTX) {{
+        if let Some(counter) = ctx.active.take() {{ counter.fetch_sub(1, Ordering::Relaxed); }}
+        if let Some(counter) = ctx.upstream.take() {{ counter.fetch_sub(1, Ordering::Relaxed); }}
+        let status = session.response_written().map(|r| r.status.as_u16()).unwrap_or(0);
+        let internal = session.req_header().uri.path().starts_with("/_gateway/");
+        if !internal {{
+            self.completed.fetch_add(1, Ordering::Relaxed);
+            if error.is_some() || status >= 500 {{ self.failed.fetch_add(1, Ordering::Relaxed); }}
+        }}
+        if let Some((route, backend, generation)) = ctx.selected.take() {{
+            let failure = ctx.dns_failed || error.is_some_and(|e| *e.esource() == pingora::ErrorSource::Upstream)
+                || (error.is_none() && status >= 500);
+            let success = error.is_none() && (200..500).contains(&status);
+            if let Ok(mut health) = self.health.lock() {{
+                let state = &mut health[route][backend];
+                if state.generation == generation && state.until.is_none() {{
+                    if failure {{
+                        state.failures = state.failures.saturating_add(1);
+                        if state.failures >= self.security.failure_threshold {{
+                            state.until = Some(Instant::now() + Duration::from_secs(self.security.failure_cooldown_seconds));
+                            state.generation = state.generation.wrapping_add(1);
+                        }}
+                    }} else if success {{ state.failures = 0; }}
+                }}
+            }}
+        }}
+        // Do not log credentials, query strings, bodies, or backend error payloads.
+        println!("{{}}", serde_json::json!({{
+            "event": "request", "consumer": ctx.consumer, "method": session.req_header().method.as_str(),
+            "status": session.response_written().map(|r| r.status.as_u16()),
+            "duration_ms": ctx.started.elapsed().as_millis(), "failed": error.is_some(),
+        }}));
+    }}
+
     async fn upstream_peer(
         &self,
         session: &mut Session,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {{
         let path = session.req_header().uri.path();
 
-        let route_index = self.match_route_index(path).unwrap_or(0);
+        let route_index = self.match_route_index(path).ok_or_else(|| Error::new(ErrorType::HTTPStatus(404)))?;
 
         let upstream = self
-            .select_upstream(route_index, session)
-            .unwrap_or_else(|| "127.0.0.1:3000".to_string());
+            .select_upstream(route_index, session, ctx)
+            .ok_or_else(|| Error::new(ErrorType::HTTPStatus(503)))?;
 
-        let (host, port) = parse_upstream(upstream.as_str());
+        let (host, port) = parse_upstream(upstream.address.as_str());
 
-        let peer = Box::new(HttpPeer::new(
-            (host.as_str(), port),
-            false,
-            String::new(),
-        ));
-
+        // Async DNS avoids blocking worker threads and HttpPeer's resolving constructor.
+        let address = tokio::time::timeout(Duration::from_secs(self.security.upstream_timeout_seconds),
+            tokio::net::lookup_host((host.as_str(), port))).await
+            .map_err(|_| {{ ctx.dns_failed = true; Error::new(ErrorType::HTTPStatus(504)) }})?
+            .map_err(|_| {{ ctx.dns_failed = true; Error::new(ErrorType::HTTPStatus(502)) }})?
+            .next().ok_or_else(|| {{ ctx.dns_failed = true; Error::new(ErrorType::HTTPStatus(502)) }})?;
+        let mut peer = Box::new(HttpPeer::new(address, upstream.tls, upstream.server_name.clone()));
+        if upstream.tls {{ peer.client_cert_key = self.client_identity.clone(); }}
+        let timeout = Some(Duration::from_secs(self.security.upstream_timeout_seconds));
+        peer.options.connection_timeout = timeout;
+        peer.options.total_connection_timeout = timeout;
+        peer.options.read_timeout = timeout;
+        peer.options.write_timeout = timeout;
         Ok(peer)
     }}
 }}
@@ -1824,25 +2054,10 @@ fn build_security() -> SecurityConfig {{
     {security_rs}
 }}
 
-fn main() {{
-    let routes = build_routes();
-    let security = build_security();
 
-    let proxy = GeneratedProxy::new(routes, security);
-
-    let mut server = Server::new(None).unwrap();
-    server.bootstrap();
-
-    let mut service = http_proxy_service(&server.configuration, proxy);
-    service.add_tcp("0.0.0.0:{port}");
-
-    server.add_service(service);
-
-    println!("🚀 Starting Pingora proxy on port {port}");
-
-    server.run_forever();
-}}
 """
+
+    return source + Path(__file__).with_name("runtime_control.rs").read_text().replace("__PORT__", str(port))
 
 
 def write_project(

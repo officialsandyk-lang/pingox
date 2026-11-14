@@ -1,648 +1,120 @@
-# AI Pingora Gateway
+# Pingox
 
-AI Pingora Gateway is an AI-powered Pingora application gateway and load-balancer generator.
+[![Tests](https://github.com/officialsandyk-lang/pingox/actions/workflows/tests.yml/badge.svg)](https://github.com/officialsandyk-lang/pingox/actions/workflows/tests.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-It converts natural-language infrastructure prompts into a working Rust + Pingora gateway with static webserver routes, reverse-proxy routes, load-balancing algorithms, security controls, staged local updates, reliability reporting, and early self-healing workflows.
+**An open-source load balancer and API gateway built on [Cloudflare Pingora](https://github.com/cloudflare/pingora).**
 
-> Status: private production-stage development.  
-> Local runtime and staged local updates are stable. Docker, Docker Compose, blue/green deployment, and production deployment testing are the next phase.
+Run Pingox on your infrastructure. Its Rust data plane handles traffic without
+Python, an AI provider or a hosted account. Optional AI workers help propose
+configuration; reviewed JSON works on its own.
 
----
+Pingox 0.2 is a pre-1.0, self-hosted HTTP gateway release. APIs and configuration
+may evolve. Passing tests establish the behavior described below, not an uptime
+SLA, throughput guarantee or independent security certification.
 
-## Current milestone
+## Features
 
-```text
-stable_extensive_local_update_baseline_before_docker_bluegreen
-```
+- Round robin, weighted round robin, least active requests, IP hash and random balancing.
+- Passive backend failure isolation, cooldown recovery and fail-closed unavailable pools.
+- Live, revision-checked configuration with in-flight request snapshots and rollback.
+- Scoped API keys, route/method restrictions and per-process quotas.
+- Verified HTTPS and optional mutual TLS to backends.
+- Request/body limits, timeouts, graceful shutdown and trusted-proxy handling.
+- Internal readiness, health and Prometheus counters.
+- Docker Compose, OCI container, Kubernetes and Linux systemd deployment generation.
+- Signed native bundle tooling with verified installation and previous-release selection.
 
-The project has reached a stable local baseline with:
+## Quick start
 
-- Built-in Pingora static webserver
-- Route-directory homepage
-- Dynamic reverse-proxy routes
-- Random load balancing
-- Round robin
-- Weighted round robin
-- IP hash sticky routing
-- Least connections
-- Single-backend routing
-- User-defined rate limiting from natural-language prompt
-- Staged local direct updates
-- Root-cause/reliability reporting
-- Early local self-healing for config/routing failures
+Use Python 3.12 or newer. Native builds also need Rust 1.95 and native build tools;
+see the [deployment guide](docs/ENTERPRISE_DEPLOYMENT.md). Linux x86-64 and ARM64
+have integration coverage. Windows services and serverless edge runtimes are not
+supported targets.
 
----
-
-## Architecture overview
-
-```text
-Natural-language prompt
-        |
-        v
-Prompt/config agent
-        |
-        v
-Config repair + route intent locking
-        |
-        v
-Validator + security enforcement
-        |
-        v
-Runtime addressing
-        |
-        v
-Rust + Pingora project writer
-        |
-        v
-Cargo check
-        |
-        v
-Local runner / Docker / blue-green deployer
-        |
-        v
-Smoke tests + reliability report + self-healing records
-```
-
----
-
-## Core project rule
-
-```text
-main.py
-    Fresh gateway creation/regeneration from a full prompt.
-
-orchestration/update_graph.py
-    Additive updates to an existing gateway.
-
-core/self_healing.py
-    Failure classification, repair, regeneration, restart, retest, and persistence.
-
-agents/root_cause_agent.py
-    Root-cause classification and MTTR knowledge.
-```
-
-Use `main.py` when creating a gateway from scratch.
-
-Use `update_graph.py` when adding or modifying routes on an existing gateway.
-
----
-
-## Verified local route set
-
-Current verified route set:
-
-```text
-/              static webserver + route directory
-/api           random
-/users         round_robin
-/orders        weighted_round_robin 5:2:1
-/payments      ip_hash
-/reports       least_connections
-/inventory     single backend
-/search        random
-/billing       weighted_round_robin 3:1
-/auth          ip_hash
-/logs          least_connections
-/metrics       least_connections
-/checkout      weighted_round_robin 4:2:1
-/profile       round_robin
-/notifications random
-/audit         ip_hash
-```
-
----
-
-## Verified algorithms
-
-| Algorithm | Status | Example route |
-|---|---:|---|
-| Static webserver | Verified | `/` |
-| Random | Verified | `/api`, `/search`, `/notifications` |
-| Round robin | Verified | `/users`, `/profile` |
-| Weighted round robin | Verified | `/orders`, `/billing`, `/checkout` |
-| IP hash sticky routing | Verified | `/payments`, `/auth`, `/audit` |
-| Least connections | Verified | `/reports`, `/logs`, `/metrics` |
-| Single backend | Verified | `/inventory` |
-
----
-
-## Latest verified local stress results
-
-The local stress test verified:
-
-```text
-/static homepage        HTTP 200
-/api random             9101 / 9102 / 9103 all used
-/search random          9601 / 9602 / 9603 all used
-/users round_robin      exact cycle
-/orders weighted        50 / 20 / 10
-/billing weighted       30 / 10
-/payments ip_hash       sticky to one backend
-/auth ip_hash           sticky to one backend
-/reports least_conn     even backend use
-/logs least_conn        even backend use
-/inventory single       always 9401
-```
-
-Concurrent checks also passed:
-
-```text
-100 concurrent requests per route returned HTTP 200
-```
-
----
-
-## Latest verified staged update results
-
-The staged local update flow successfully added these routes:
-
-```text
-/metrics        least_connections
-/checkout       weighted_round_robin 4:2:1
-/profile        round_robin
-/notifications  random
-/audit          ip_hash
-```
-
-The update flow:
-
-```text
-generated staged project
-ran cargo check
-promoted staged project to live project
-started new demo backends
-restarted local gateway at final step
-ran smoke checks
-returned success true
-```
-
-Current direct local update mode is staged and safe for development, but it still has a short restart window because two local processes cannot bind to the same port.
-
-True zero-downtime requires blue/green traffic switching.
-
----
-
-## Installation
-
-### Python
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
+```sh
+git clone https://github.com/officialsandyk-lang/pingox.git
+cd pingox
+python3 -m venv .venv
+. .venv/bin/activate
 pip install -r requirements.txt
+
+python pingox.py init --directory my-gateway --target systemd
+# Edit my-gateway/gateway.json with your real backend addresses.
+python pingox.py validate --config my-gateway/gateway.json
+python pingox.py build --config my-gateway/gateway.json --output releases/v1
+python pingox.py apply --config my-gateway/gateway.json --state-dir my-gateway/runtime --expect-revision 0
+python pingox.py run --release releases/v1 --state-dir my-gateway/runtime
 ```
 
-### Rust
+The native launcher binds to `127.0.0.1` by default. Use a reviewed HTTPS ingress
+before exposing traffic. In another terminal, activate the same Python environment
+and inspect the running configuration with `python pingox.py status --port 8080`.
 
-```bash
-rustc --version
-cargo --version
+For Docker Compose:
+
+```sh
+python pingox.py generate --config my-gateway/gateway.json --target compose --output releases/compose-v1
 ```
 
-On Ubuntu/WSL:
+Follow the [Compose runbook](docs/PRODUCTION.md) to configure the domain, backend
+network, approved images and TLS. Generation does not provision or deploy anything.
+Use backend DNS/IP addresses reachable from the chosen deployment target.
 
-```bash
-sudo apt update
-sudo apt install -y build-essential cmake pkg-config libssl-dev
-```
+## Documentation
 
----
-
-## Fresh local gateway creation
-
-Use `main.py` for full gateway creation.
-
-```bash
-python main.py --runtime local --strategy direct "create webserver on port 8090 serving public at /; load balance /api across 127.0.0.1:9101, 127.0.0.1:9102, and 127.0.0.1:9103 using random; load balance /users across 127.0.0.1:9101, 127.0.0.1:9102, and 127.0.0.1:9103 using round robin; create /orders using weighted round robin across 127.0.0.1:9201 weight 5, 127.0.0.1:9202 weight 2, and 127.0.0.1:9203 weight 1; create /payments balanced across 127.0.0.1:9301 and 127.0.0.1:9302 using ip hash; create /reports balanced across 127.0.0.1:9501, 127.0.0.1:9502, and 127.0.0.1:9503 using least connections; route /inventory to backend 127.0.0.1:9401; load balance /search across 127.0.0.1:9601, 127.0.0.1:9602, and 127.0.0.1:9603 using random; create /billing using weighted round robin across 127.0.0.1:9701 weight 3 and 127.0.0.1:9702 weight 1; create /auth balanced across 127.0.0.1:9801 and 127.0.0.1:9802 using ip hash; create /logs balanced across 127.0.0.1:9901, 127.0.0.1:9902, and 127.0.0.1:9903 using least connections; set rate limit to 10000 requests per minute"
-```
-
-Live URL:
-
-```text
-http://127.0.0.1:8090/
-```
-
----
-
-## Start demo backends
-
-For local testing:
-
-```bash
-python scripts/demo_backends.py start generated-pingora-proxy/config.json
-```
-
-Check backend status:
-
-```bash
-python scripts/demo_backends.py status generated-pingora-proxy/config.json
-```
-
-Demo backends respond to any path and return the backend port in the response body.
-
-Example:
-
-```text
-Demo Backend 9101
-```
-
----
-
-## Add routes to an existing gateway
-
-Use `orchestration/update_graph.py` for additive updates.
-
-Example:
-
-```bash
-python - <<'PY'
-from orchestration.update_graph import run_update_graph
-
-result = run_update_graph(
-    "add /metrics balanced across 127.0.0.1:10001, 127.0.0.1:10002, and 127.0.0.1:10003 using least connections; "
-    "add /checkout using weighted round robin across 127.0.0.1:10101 weight 4, 127.0.0.1:10102 weight 2, and 127.0.0.1:10103 weight 1; "
-    "add /profile balanced across 127.0.0.1:10201, 127.0.0.1:10202, and 127.0.0.1:10203 using round robin; "
-    "add /notifications balanced across 127.0.0.1:10301, 127.0.0.1:10302, and 127.0.0.1:10303 using random; "
-    "add /audit balanced across 127.0.0.1:10401 and 127.0.0.1:10402 using ip hash; "
-    "set rate limit to 10000 requests per minute; direct update"
-)
-
-print(result)
-PY
-```
-
-Local direct updates perform these steps:
-
-```text
-load current generated-pingora-proxy/config.json
-parse update prompt
-merge only requested route additions/changes
-preserve untouched existing routes
-repair config
-validate config
-apply security
-write staged project
-run cargo check
-promote staged project
-start new demo backends
-restart local gateway at final step
-run smoke checks
-store reliability metadata
-```
-
----
-
-## Important update safety rule
-
-The update flow must only change routes mentioned in the update prompt.
-
-Untouched routes must preserve:
-
-```text
-path
-type
-root/index
-upstream
-backend
-upstreams
-weights
-balancing algorithm
-security unless explicitly changed
-```
-
-This protects against regressions such as:
-
-```text
-/api random becoming round_robin
-/orders weights 5/2/1 becoming 1/1/1
-/payments ip_hash becoming round_robin
-/reports least_connections becoming round_robin
-```
-
----
-
-## Local stress test
-
-Run:
-
-```bash
-python tmp/stress_test_local_gateway.py
-```
-
-Expected:
-
-```text
-ALL LOCAL STRESS TESTS PASSED ✅
-```
-
-This test verifies:
-
-```text
-static homepage
-homepage route directory
-random balancing
-round robin
-weighted round robin
-IP hash sticky routing
-least connections
-single backend
-100 concurrent requests per route
-```
-
----
-
-## Pytest tests
-
-Run unit/regression tests with:
-
-```bash
-python -m pytest -q
-```
-
-`pytest.ini` should keep runtime scripts out of pytest collection:
-
-```ini
-[pytest]
-testpaths = tests
-python_files = test_*.py
-norecursedirs =
-    .git
-    .venv
-    target
-    generated-pingora-proxy
-    generated-projects
-    tmp
-    data
-    runtime
-    .runtime
-```
-
-Live stress scripts belong in:
-
-```text
-tmp/
-```
-
-Pytest regression tests belong in:
-
-```text
-tests/
-```
-
----
-
-## Regression test: update route preservation
-
-The project includes a regression test for route preservation:
-
-```text
-tests/test_update_graph_route_preservation.py
-```
-
-It verifies that when a new route is added, existing routes keep their original algorithms, upstreams, and weights.
-
-Run:
-
-```bash
-python -m pytest -q tests/test_update_graph_route_preservation.py
-```
-
-Expected:
-
-```text
-passed
-```
-
----
-
-## Rate limiting
-
-Rate limits can be defined from the natural-language prompt.
-
-Examples:
-
-```text
-set rate limit to 600 requests per minute
-set rate limit to 10000 requests per minute
-set rate limit to 0 requests per minute
-```
-
-For local stress testing, use:
-
-```text
-set rate limit to 10000 requests per minute
-```
-
-A previous false failure was caused by the default rate limit of `120` requests per minute returning `429 Too Many Requests` during algorithm tests. The load-balancing algorithms were working correctly.
-
----
-
-## Runtime addressing
-
-For local runtime:
-
-```text
-127.0.0.1:PORT
-```
-
-For Docker-host runtime:
-
-```text
-host.docker.internal:PORT
-```
-
-Do not mix local runtime with Docker-host upstreams.
-
-Bad:
-
-```json
-{
-  "runtime": "local",
-  "upstream": "host.docker.internal:9000"
-}
-```
-
-Good:
-
-```json
-{
-  "runtime": "local",
-  "upstream": "127.0.0.1:9000"
-}
-```
-
----
-
-## Root-cause and reliability reporting
-
-Reliability reports are stored in SQLite:
-
-```text
-data/reliability_reports.sqlite3
-```
-
-The system can classify known failures, format reports, and persist incident metadata.
-
-Known root-cause patterns include:
-
-| Root cause | Meaning |
+| Guide | Contents |
 |---|---|
-| `nlp_route_algorithm_leak` | One route algorithm leaked into unrelated routes |
-| `stale_active_config_loaded` | Update flow loaded stale config instead of current generated config |
-| `update_prompt_route_addition_not_detected` | Add-route intent was missed |
-| `route_update_mutated_existing_algorithms` | Update changed existing route algorithms unexpectedly |
-| `weighted_route_weights_reset_to_1` | Weighted upstreams lost their original weights |
-| `local_readiness_timeout_due_to_stale_docker_host_config` | Local gateway readiness failed because stale Docker-host config was used |
+| [Deployment and release lifecycle](docs/ENTERPRISE_DEPLOYMENT.md) | Live configuration, TLS/mTLS, scoped keys, signing, installation and rollback |
+| [Gateway operations](docs/PINGOX_OPERATIONS.md) | Balancing, failure isolation, health and monitoring |
+| [Portable deployment and providers](docs/PORTABILITY.md) | Deployment targets and optional AI provider protocols |
+| [Docker Compose runbook](docs/PRODUCTION.md) | TLS ingress and Linux container operations |
+| [AI workers](docs/WORKERS.md) | Bounded model calls, Codex and credential handling |
+| [Hosted management direction](docs/LOCAL_AND_HOSTED.md) | Proposed hosted product; not an implemented service |
+| [Security](SECURITY.md) | Trust boundaries, advisory checks and private reporting |
+| [Changelog](CHANGELOG.md) | Release changes |
 
----
+## Supported boundaries
 
-## Self-healing status
+The public release provides source code and build/deployment tooling. It does not
+include a hosted dashboard, published container registry or prebuilt native binaries.
+The signed-native workflow requires a maintainer-controlled signing key; a checksum
+alone is not a publisher signature.
 
-Local config/routing self-healing has been verified.
+Live updates are local to each process; Kubernetes ConfigMap propagation is eventual.
+Quotas are per process, not distributed. Listener port changes and binary upgrades
+require a managed restart. A single-instance restart may interrupt traffic.
+Keep all `/_gateway` endpoints private at ingress. Startup requires valid on-disk
+configuration; an in-memory last-known-good snapshot is not a persistent backup.
 
-The self-healing flow can:
+JWT/OIDC validation, active health probes, distributed quotas, WebSockets and native
+IPv6 upstream address literals are outside this release. Encoded URL paths are
+rejected; query strings are forwarded. API-key admission does not replace backend
+business authorization. Supported AI-worker protocols do not imply universal
+translation between inference APIs.
 
-```text
-classify failure
-repair config
-validate repaired config
-regenerate Pingora project
-write locked config
-run cargo check
-restart local gateway
-start demo backends
-run smoke checks
-store before/after result in SQLite
-```
+The previous `gateway.py` entry point and existing generated service/resource names
+remain compatible. Legacy `main.py`, `update.py` and self-healing workflows are
+experimental development tools, not production supervisors. Older tags and
+`legacy-*` branches retain historical development work.
 
-Verified local self-healing case:
+## Verification and contributions
 
-```text
-nlp_route_algorithm_leak
-```
-
-Docker/blue-green self-healing is not yet verified.
-
----
-
-## Current limitations
-
-Verified:
-
-```text
-local direct runtime
-built-in static webserver
-route-directory homepage
-all implemented load-balancing algorithms
-staged local direct updates
-local reliability reporting
-local config/routing self-healing
-```
-
-Not yet fully verified:
-
-```text
-Docker production runtime
-Docker Compose blue/green
-Kubernetes deployment
-production traffic switching
-TLS/cert automation
-distributed rate limiting
-production observability stack
-blue/green self-healing
-```
-
----
-
-## Next phase
-
-The next phase is:
-
-```text
-Docker / Docker Compose / blue-green deployment testing
-```
-
-The intended blue/green model is:
-
-```text
-stable public URL / traffic switcher
-        |
-        ├── blue gateway
-        └── green gateway
-```
-
-Update flow:
-
-```text
-current live = blue
-generate update into green
-start green on separate port/container
-run cargo/build checks
-run smoke checks
-switch traffic if healthy
-keep old color as rollback
-```
-
----
-
-## Git safety
-
-Do not commit:
-
-```text
-.env
-.venv/
-target/
-generated-pingora-proxy/target/
-generated-projects/
-.runtime/
-runtime/
-tmp/
-data/
-logs.jsonl
-*.log
-__pycache__/
-.pytest_cache/
-*.pyc
-```
-
-Before committing or pushing:
-
-```bash
-git status
-
-grep -R "sk-" -n . --exclude-dir=.git --exclude-dir=.venv --exclude-dir=target --exclude-dir=__pycache__ || true
-grep -R "OPENAI_API_KEY\|LANGCHAIN_API_KEY\|LANGSMITH_API_KEY\|GITHUB_TOKEN" -n . --exclude-dir=.git --exclude-dir=.venv --exclude-dir=target --exclude-dir=__pycache__ || true
-grep -R "password\|secret\|token\|api_key" -n . --exclude-dir=.git --exclude-dir=.venv --exclude-dir=target --exclude-dir=__pycache__ || true
-```
-
-This repository should remain private while production deployment, Docker/blue-green, and self-healing workflows are developed.
-
----
-
-## Recommended commit flow
-
-```bash
+```sh
 python -m pytest -q
-python -m py_compile agents/root_cause_agent.py core/project_writer.py core/reliability.py orchestration/update_graph.py update.py
-
-git status
-git diff --cached --name-only
-git commit -m "Stabilize local gateway update flow and documentation"
+python scripts/verify_runtime.py
+python scripts/verify_enterprise.py
 ```
 
-Push production-stage work to the private remote only:
+CI covers Linux x86-64/ARM64, native runtime behavior, Compose, Kubernetes, systemd
+and Python/Rust advisory checks. The concurrency check is functional testing, not
+a capacity benchmark. Validate real workloads, secrets, TLS, backups and rollback
+before customer cutover. See [CONTRIBUTING.md](CONTRIBUTING.md) for test isolation
+and [SECURITY.md](SECURITY.md) for remaining upstream maintenance warnings.
 
-```bash
-git push private main
-```
+## License and attribution
 
-Do not push production-stage logic to a public remote unless intentionally publishing it.
-
----
-
-## License
-
-This project is currently intended for private production-stage development.
-
-Review licensing before public release.
+[Apache License 2.0](LICENSE). Pingox is an independent project built on Pingora;
+it is not an official Cloudflare product. Native bundles and container images
+include collected dependency notices. Review the applicable licenses for your
+extensions and redistribution model.

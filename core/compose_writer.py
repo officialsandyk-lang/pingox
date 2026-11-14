@@ -1,7 +1,7 @@
 from pathlib import Path
 from urllib.parse import urlparse
 
-from core.project_writer import render_main_rs
+from core.project_writer import render_main_rs, normalize_route, is_static_route
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_DIR = PROJECT_ROOT / "generated-pingora-proxy"
@@ -178,17 +178,10 @@ def route_upstreams(route: dict) -> list[str]:
     route["upstream"] is only a compatibility fallback / first backend.
     """
 
-    upstreams = route.get("upstreams")
-
-    if isinstance(upstreams, list) and upstreams:
-        return [normalize_upstream(u) for u in upstreams if str(u).strip()]
-
-    upstream = route.get("upstream")
-
-    if upstream:
-        return [normalize_upstream(upstream)]
-
-    raise ValueError(f"Route has no upstream or upstreams[]: {route}")
+    if is_static_route(route):
+        return []
+    normalized = normalize_route(route)
+    return [item["address"] for item in normalized["upstreams"]]
 
 
 def get_backend_ports(config: dict) -> list[int]:
@@ -226,22 +219,17 @@ def build_compose_routes(config: dict) -> list[dict]:
     compose_routes = []
 
     for route in config["routes"]:
-        original_upstreams = route_upstreams(route)
-
+        compose_route = normalize_route(route)
+        if is_static_route(compose_route):
+            compose_routes.append(compose_route)
+            continue
         compose_upstreams = []
-
-        for upstream in original_upstreams:
-            port = upstream_port(upstream)
-            service_name = backend_service_name(port)
-            compose_upstreams.append(f"{service_name}:{port}")
-
-        compose_route = dict(route)
-        compose_route["upstream"] = compose_upstreams[0]
+        for upstream in compose_route["upstreams"]:
+            port = upstream_port(upstream["address"])
+            compose_upstreams.append({**upstream, "address": f"{backend_service_name(port)}:{port}"})
+        compose_route["upstream"] = compose_upstreams[0]["address"]
+        compose_route["backend"] = compose_upstreams[0]["address"]
         compose_route["upstreams"] = compose_upstreams
-
-        if len(compose_upstreams) > 1:
-            compose_route["balancing"] = route.get("balancing", "round_robin")
-
         compose_routes.append(compose_route)
 
     return compose_routes

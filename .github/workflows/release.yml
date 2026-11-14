@@ -1,0 +1,60 @@
+name: Signed native release artifacts
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Semantic version, for example 0.2.0
+        required: true
+permissions:
+  contents: read
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    environment: release-signing
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      AI_WORKER_BACKEND: disabled
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: rustup toolchain install 1.95.0 --profile minimal && rustup default 1.95.0
+      - run: pip install -r requirements.txt
+      - run: pip install pip-audit==2.10.1
+      - run: pip-audit -r requirements.txt --no-deps --disable-pip
+      - run: cargo install cargo-audit --locked --version 0.22.2
+      - run: cargo audit --file deploy/Cargo.lock
+      - run: python -m pytest -q
+      - run: python pingox.py build --config deploy/gateway.example.json --output build/native
+      - name: Sign with operator-controlled release key
+        env:
+          SIGNING_KEY: ${{ secrets.PINGOX_RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          keyfile=$(mktemp)
+          export PINGOX_SIGNING_FILE="$keyfile"
+          trap 'rm -f "$keyfile"' EXIT
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          key = os.environ.get('SIGNING_KEY', '')
+          if not key:
+              raise SystemExit('Configure PINGOX_RELEASE_SIGNING_KEY in the release-signing environment')
+          Path(os.environ['PINGOX_SIGNING_FILE']).write_text(key)
+          PY
+          python pingox.py package --release build/native --signing-key "$keyfile" --version "$VERSION" --output "dist/pingox-${VERSION}-linux-${RUNNER_ARCH}.tar.gz"
+          cp deploy/Cargo.lock requirements.txt dist/
+          (cd dist && sha256sum * > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pingox-linux-${{ runner.arch }}
+          path: dist/
+          if-no-files-found: error
